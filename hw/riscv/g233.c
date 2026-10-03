@@ -30,6 +30,7 @@
 #include "hw/char/serial-mm.h"
 #include "hw/char/pl011.h"
 #include "hw/gpio/g233_gpio.h"
+#include "hw/timer/g233_pwm.h"
 #include "target/riscv/cpu.h"
 #include "hw/core/sysbus-fdt.h"
 #include "target/riscv/pmu.h"
@@ -1149,6 +1150,7 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
         int irq;
     } devices[] = {
         { "gpio", "gevico,g233-gpio", G233_DEV_GPIO, G233_GPIO_IRQ },
+        { "pwm", "gevico,g233-pwm", G233_DEV_PWM, G233_PWM_IRQ },
     };
 
     for (int i = 0; i < ARRAY_SIZE(devices); i++) {
@@ -1171,6 +1173,9 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
         if (devices[i].map == G233_DEV_GPIO) {
             qemu_fdt_setprop(ms->fdt, name, "gpio-controller", NULL, 0);
             qemu_fdt_setprop_cell(ms->fdt, name, "#gpio-cells", 2);
+        } else if (devices[i].map == G233_DEV_PWM ||
+                   devices[i].map == G233_DEV_WDT) {
+            qemu_fdt_setprop_cell(ms->fdt, name, "clock-frequency", 1000000);
         }
     }
 }
@@ -1575,6 +1580,8 @@ static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
 {
     sysbus_create_simple(TYPE_G233_GPIO, s->memmap[G233_DEV_GPIO].base,
                          qdev_get_gpio_in(irqchip, G233_GPIO_IRQ));
+    sysbus_create_simple(TYPE_G233_PWM, s->memmap[G233_DEV_PWM].base,
+                         qdev_get_gpio_in(irqchip, G233_PWM_IRQ));
 }
 
 static void virt_machine_init(MachineState *machine)
