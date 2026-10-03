@@ -18,7 +18,9 @@
 
 #define CR1_SPE    (1U << 0)
 #define CR1_MSTR   (1U << 2)
-#define CR1_MASK   (CR1_SPE | CR1_MSTR)
+#define CR1_RXNEIE (1U << 6)
+#define CR1_TXEIE  (1U << 7)
+#define CR1_MASK   (CR1_SPE | CR1_MSTR | CR1_RXNEIE | CR1_TXEIE)
 
 #define SR_RXNE    (1U << 0)
 #define SR_TXE     (1U << 1)
@@ -26,6 +28,14 @@
 static bool g233_spi_enabled(G233SPIState *s)
 {
     return (s->cr1 & (CR1_SPE | CR1_MSTR)) == (CR1_SPE | CR1_MSTR);
+}
+
+static void g233_spi_update_irq(G233SPIState *s)
+{
+    bool pending = ((s->cr1 & CR1_TXEIE) && (s->sr & SR_TXE)) ||
+                   ((s->cr1 & CR1_RXNEIE) && (s->sr & SR_RXNE));
+
+    qemu_set_irq(s->irq, g233_spi_enabled(s) && pending);
 }
 
 static void g233_spi_update_cs(G233SPIState *s)
@@ -60,6 +70,7 @@ static uint64_t g233_spi_read(void *opaque, hwaddr offset, unsigned size)
         return s->sr;
     case SPI_DR:
         s->sr &= ~SR_RXNE;
+        g233_spi_update_irq(s);
         return s->rx_data;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -101,6 +112,7 @@ static void g233_spi_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
+    g233_spi_update_irq(s);
 }
 
 static const MemoryRegionOps g233_spi_ops = {
@@ -130,7 +142,7 @@ static void g233_spi_reset(DeviceState *dev)
     for (i = 0; i < G233_SPI_NUM_CS; i++) {
         qemu_set_irq(s->cs[i], 1);
     }
-    qemu_set_irq(s->irq, 0);
+    g233_spi_update_irq(s);
 }
 
 static int g233_spi_post_load(void *opaque, int version_id)
@@ -148,7 +160,7 @@ static int g233_spi_post_load(void *opaque, int version_id)
     for (i = 0; i < G233_SPI_NUM_CS; i++) {
         qemu_set_irq(s->cs[i], i != s->active_cs);
     }
-    qemu_set_irq(s->irq, 0);
+    g233_spi_update_irq(s);
     return 0;
 }
 
