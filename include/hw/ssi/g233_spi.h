@@ -14,7 +14,7 @@
 #define TYPE_G233_SPI "g233-spi"
 OBJECT_DECLARE_SIMPLE_TYPE(G233SPIState, G233_SPI)
 
-#define G233_SPI_NUM_CS 1
+#define G233_SPI_NUM_CS 4
 #define G233_SPI_CS "cs"
 
 struct G233SPIState {
