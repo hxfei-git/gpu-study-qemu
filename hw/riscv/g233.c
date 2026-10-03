@@ -29,6 +29,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/char/serial-mm.h"
 #include "hw/char/pl011.h"
+#include "hw/gpio/g233_gpio.h"
 #include "target/riscv/cpu.h"
 #include "hw/core/sysbus-fdt.h"
 #include "target/riscv/pmu.h"
@@ -1137,6 +1138,43 @@ static void create_fdt_iommu(RISCVG233State *s, uint16_t bdf)
     s->pci_iommu_bdf = bdf;
 }
 
+static void create_fdt_g233_peripherals(RISCVG233State *s,
+                                        uint32_t irq_phandle)
+{
+    MachineState *ms = MACHINE(s);
+    const struct {
+        const char *name;
+        const char *compatible;
+        int map;
+        int irq;
+    } devices[] = {
+        { "gpio", "gevico,g233-gpio", G233_DEV_GPIO, G233_GPIO_IRQ },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(devices); i++) {
+        const MemMapEntry *entry = &s->memmap[devices[i].map];
+        g_autofree char *name = g_strdup_printf("/soc/%s@%" HWADDR_PRIx,
+                                               devices[i].name, entry->base);
+
+        qemu_fdt_add_subnode(ms->fdt, name);
+        qemu_fdt_setprop_string(ms->fdt, name, "compatible",
+                               devices[i].compatible);
+        qemu_fdt_setprop_sized_cells(ms->fdt, name, "reg",
+                                    2, entry->base, 2, entry->size);
+        qemu_fdt_setprop_cell(ms->fdt, name, "interrupt-parent", irq_phandle);
+        if (s->aia_type == G233_AIA_TYPE_NONE) {
+            qemu_fdt_setprop_cell(ms->fdt, name, "interrupts", devices[i].irq);
+        } else {
+            qemu_fdt_setprop_cells(ms->fdt, name, "interrupts",
+                                  devices[i].irq, 0x4);
+        }
+        if (devices[i].map == G233_DEV_GPIO) {
+            qemu_fdt_setprop(ms->fdt, name, "gpio-controller", NULL, 0);
+            qemu_fdt_setprop_cell(ms->fdt, name, "#gpio-cells", 2);
+        }
+    }
+}
+
 static void finalize_fdt(RISCVG233State *s)
 {
     uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
@@ -1161,6 +1199,7 @@ static void finalize_fdt(RISCVG233State *s)
     create_fdt_uart(s, irq_mmio_phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
+    create_fdt_g233_peripherals(s, irq_mmio_phandle);
 }
 
 static void create_fdt(RISCVG233State *s)
@@ -1532,6 +1571,12 @@ static void virt_machine_done(Notifier *notifier, void *data)
 
 }
 
+static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
+{
+    sysbus_create_simple(TYPE_G233_GPIO, s->memmap[G233_DEV_GPIO].base,
+                         NULL);
+}
+
 static void virt_machine_init(MachineState *machine)
 {
     RISCVG233State *s = RISCV_G233_MACHINE(machine);
@@ -1696,6 +1741,8 @@ static void virt_machine_init(MachineState *machine)
 
     /* SiFive Test MMIO device */
     sifive_test_create(s->memmap[VIRT_TEST].base);
+
+    g233_create_peripherals(s, mmio_irqchip);
 
     /* VirtIO MMIO devices */
     for (i = 0; i < VIRTIO_COUNT; i++) {
