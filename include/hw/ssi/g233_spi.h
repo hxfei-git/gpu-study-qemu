@@ -30,7 +30,7 @@ struct G233SPIState {
     uint32_t sr;
     uint8_t rx_data;
 
-    /* Derived output state, reconstructed from CR1 on migration. */
+    /* Derived output state, reconstructed from CR1 and CR2 on migration. */
     int active_cs;
 };
 

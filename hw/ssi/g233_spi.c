@@ -30,7 +30,7 @@ static bool g233_spi_enabled(G233SPIState *s)
 
 static void g233_spi_update_cs(G233SPIState *s)
 {
-    int new_cs = g233_spi_enabled(s) ? 0 : -1;
+    int new_cs = g233_spi_enabled(s) && s->cr2 == 0 ? 0 : -1;
 
     /* Rewriting the selected CS must not split an ongoing transaction. */
     if (new_cs == s->active_cs) {
@@ -81,6 +81,7 @@ static void g233_spi_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case SPI_CR2:
         s->cr2 = value & 0x3;
+        g233_spi_update_cs(s);
         break;
     case SPI_SR:
         break;
@@ -142,7 +143,7 @@ static int g233_spi_post_load(void *opaque, int version_id)
         return -EINVAL;
     }
 
-    s->active_cs = g233_spi_enabled(s) ? 0 : -1;
+    s->active_cs = g233_spi_enabled(s) && s->cr2 == 0 ? 0 : -1;
     /* Restore levels without pulsing the selected peripheral's CS. */
     for (i = 0; i < G233_SPI_NUM_CS; i++) {
         qemu_set_irq(s->cs[i], i != s->active_cs);
