@@ -1181,7 +1181,7 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
                    devices[i].map == G233_DEV_WDT) {
             qemu_fdt_setprop_cell(ms->fdt, name, "clock-frequency", 1000000);
         } else if (devices[i].map == G233_DEV_SPI) {
-            const char *models[] = { "winbond,w25x16" };
+            const char *models[] = { "winbond,w25x16", "winbond,w25x32" };
 
             qemu_fdt_setprop_cell(ms->fdt, name, "#address-cells", 1);
             qemu_fdt_setprop_cell(ms->fdt, name, "#size-cells", 0);
@@ -1598,7 +1598,7 @@ static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
 {
     DeviceState *spi_dev;
     G233SPIState *spi;
-    const char *flash_types[] = { "w25x16" };
+    const char *flash_types[] = { "w25x16", "w25x32" };
 
     sysbus_create_simple(TYPE_G233_GPIO, s->memmap[G233_DEV_GPIO].base,
                          qdev_get_gpio_in(irqchip, G233_GPIO_IRQ));
