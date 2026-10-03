@@ -32,6 +32,7 @@
 #include "hw/gpio/g233_gpio.h"
 #include "hw/timer/g233_pwm.h"
 #include "hw/watchdog/g233_wdt.h"
+#include "hw/ssi/g233_spi.h"
 #include "target/riscv/cpu.h"
 #include "hw/core/sysbus-fdt.h"
 #include "target/riscv/pmu.h"
@@ -1153,6 +1154,7 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
         { "gpio", "gevico,g233-gpio", G233_DEV_GPIO, G233_GPIO_IRQ },
         { "pwm", "gevico,g233-pwm", G233_DEV_PWM, G233_PWM_IRQ },
         { "watchdog", "gevico,g233-wdt", G233_DEV_WDT, G233_WDT_IRQ },
+        { "spi", "gevico,g233-spi", G233_DEV_SPI, G233_SPI_IRQ },
     };
 
     for (int i = 0; i < ARRAY_SIZE(devices); i++) {
@@ -1178,6 +1180,20 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
         } else if (devices[i].map == G233_DEV_PWM ||
                    devices[i].map == G233_DEV_WDT) {
             qemu_fdt_setprop_cell(ms->fdt, name, "clock-frequency", 1000000);
+        } else if (devices[i].map == G233_DEV_SPI) {
+            const char *models[] = { "winbond,w25x16" };
+
+            qemu_fdt_setprop_cell(ms->fdt, name, "#address-cells", 1);
+            qemu_fdt_setprop_cell(ms->fdt, name, "#size-cells", 0);
+            for (int cs = 0; cs < ARRAY_SIZE(models); cs++) {
+                g_autofree char *flash = g_strdup_printf("%s/flash@%d", name,
+                                                        cs);
+
+                qemu_fdt_add_subnode(ms->fdt, flash);
+                qemu_fdt_setprop_string(ms->fdt, flash, "compatible",
+                                       models[cs]);
+                qemu_fdt_setprop_cell(ms->fdt, flash, "reg", cs);
+            }
         }
     }
 }
@@ -1580,12 +1596,30 @@ static void virt_machine_done(Notifier *notifier, void *data)
 
 static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
 {
+    DeviceState *spi_dev;
+    G233SPIState *spi;
+    const char *flash_types[] = { "w25x16" };
+
     sysbus_create_simple(TYPE_G233_GPIO, s->memmap[G233_DEV_GPIO].base,
                          qdev_get_gpio_in(irqchip, G233_GPIO_IRQ));
     sysbus_create_simple(TYPE_G233_PWM, s->memmap[G233_DEV_PWM].base,
                          qdev_get_gpio_in(irqchip, G233_PWM_IRQ));
     sysbus_create_simple(TYPE_G233_WDT, s->memmap[G233_DEV_WDT].base,
                          qdev_get_gpio_in(irqchip, G233_WDT_IRQ));
+    spi_dev = sysbus_create_simple(TYPE_G233_SPI,
+                                  s->memmap[G233_DEV_SPI].base,
+                                  qdev_get_gpio_in(irqchip, G233_SPI_IRQ));
+    spi = G233_SPI(spi_dev);
+
+    for (int i = 0; i < ARRAY_SIZE(flash_types); i++) {
+        DeviceState *flash = qdev_new(flash_types[i]);
+
+        qdev_prop_set_uint8(flash, "cs", i);
+        ssi_realize_and_unref(flash, spi->spi, &error_fatal);
+        qdev_connect_gpio_out_named(spi_dev, G233_SPI_CS, i,
+                                   qdev_get_gpio_in_named(flash,
+                                                         SSI_GPIO_CS, 0));
+    }
 }
 
 static void virt_machine_init(MachineState *machine)
