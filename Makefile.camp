@@ -106,16 +106,26 @@ SOC_TESTS := test-board-g233 test-gpio-basic test-gpio-int \
 
 .PHONY: test-soc
 test-soc: build
-	@passed=0; total=0; \
+	@mkdir -p $(BUILD_DIR)/soc-logs
+	@passed=0; total=0; count=$(words $(SOC_TESTS)); \
 	for t in $(SOC_TESTS); do \
-	    total=$$((total + 1)); \
+	    total=$$((total + 1)); label=$$t; \
+	    if [ "$$t" = test-flash-read-interrupt ]; then \
+	        label=test-flash-read-int; \
+	    fi; \
 	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
-	        "qtest-riscv64/$$t" 2>/dev/null; then \
+	        "qtest-riscv64/$$t" > "$(BUILD_DIR)/soc-logs/$$t.log" 2>&1; then \
 	        passed=$$((passed + 1)); \
+	        printf '  TEST    %-42s %2d/%d\n' "qtest-riscv64/$$label" \
+	            "$$total" "$$count"; \
+	    else \
+	        printf '  FAIL    %s\n' "qtest-riscv64/$$label"; \
+	        cat "$(BUILD_DIR)/soc-logs/$$t.log"; \
 	    fi; \
 	done; \
 	echo "$$passed" > $(BUILD_DIR)/soc-result.log; \
-	echo "--- SoC experiment: $$passed/$$total tests passed ---"
+	echo "--- SoC experiment: $$passed/$$total tests passed ---"; \
+	[ "$$passed" -eq "$$total" ]
 
 # ─── GPGPU experiment (QTest via QOS) ─────────────────────────────────
 # 17 subtests inside qos-test, run individually for scoring.
