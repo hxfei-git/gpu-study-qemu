@@ -18,12 +18,14 @@
 
 #define CR1_SPE    (1U << 0)
 #define CR1_MSTR   (1U << 2)
+#define CR1_ERRIE  (1U << 5)
 #define CR1_RXNEIE (1U << 6)
 #define CR1_TXEIE  (1U << 7)
-#define CR1_MASK   (CR1_SPE | CR1_MSTR | CR1_RXNEIE | CR1_TXEIE)
+#define CR1_MASK   (CR1_SPE | CR1_MSTR | CR1_ERRIE | CR1_RXNEIE | CR1_TXEIE)
 
 #define SR_RXNE    (1U << 0)
 #define SR_TXE     (1U << 1)
+#define SR_OVERRUN (1U << 4)
 
 static bool g233_spi_enabled(G233SPIState *s)
 {
@@ -33,7 +35,8 @@ static bool g233_spi_enabled(G233SPIState *s)
 static void g233_spi_update_irq(G233SPIState *s)
 {
     bool pending = ((s->cr1 & CR1_TXEIE) && (s->sr & SR_TXE)) ||
-                   ((s->cr1 & CR1_RXNEIE) && (s->sr & SR_RXNE));
+                   ((s->cr1 & CR1_RXNEIE) && (s->sr & SR_RXNE)) ||
+                   ((s->cr1 & CR1_ERRIE) && (s->sr & SR_OVERRUN));
 
     qemu_set_irq(s->irq, g233_spi_enabled(s) && pending);
 }
@@ -84,6 +87,7 @@ static void g233_spi_write(void *opaque, hwaddr offset, uint64_t value,
                            unsigned size)
 {
     G233SPIState *s = opaque;
+    uint8_t rx;
 
     switch (offset) {
     case SPI_CR1:
@@ -95,15 +99,25 @@ static void g233_spi_write(void *opaque, hwaddr offset, uint64_t value,
         g233_spi_update_cs(s);
         break;
     case SPI_SR:
+        s->sr &= ~(value & SR_OVERRUN);
         break;
     case SPI_DR:
         if (!g233_spi_enabled(s)) {
             break;
         }
 
-        /* Transfers finish synchronously: TXE remains set. */
-        s->rx_data = ssi_transfer(s->spi, value & 0xff);
-        s->sr |= SR_RXNE;
+        /*
+         * Transfers finish synchronously: TXE is always visible as set.
+         * A full receive latch preserves its unread byte and drops the new
+         * byte, while the SSI peripheral still observes the transmitted byte.
+         */
+        rx = ssi_transfer(s->spi, value & 0xff);
+        if (s->sr & SR_RXNE) {
+            s->sr |= SR_OVERRUN;
+        } else {
+            s->rx_data = rx;
+            s->sr |= SR_RXNE;
+        }
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -151,7 +165,7 @@ static int g233_spi_post_load(void *opaque, int version_id)
     int i;
 
     if ((s->cr1 & ~CR1_MASK) || s->cr2 >= G233_SPI_NUM_CS ||
-        (s->sr & ~(SR_TXE | SR_RXNE)) || !(s->sr & SR_TXE)) {
+        (s->sr & ~(SR_TXE | SR_RXNE | SR_OVERRUN)) || !(s->sr & SR_TXE)) {
         return -EINVAL;
     }
 
