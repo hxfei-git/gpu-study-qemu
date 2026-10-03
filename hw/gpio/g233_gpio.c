@@ -26,6 +26,21 @@ static uint32_t g233_gpio_input(G233GPIOState *s)
     return (s->out & s->dir) | (s->input & ~s->dir);
 }
 
+static void g233_gpio_update_irq(G233GPIOState *s, uint32_t previous)
+{
+    uint32_t input = g233_gpio_input(s);
+    uint32_t rising = ~previous & input;
+    uint32_t falling = previous & ~input;
+    uint32_t edges = (rising & s->pol) | (falling & ~s->pol);
+    uint32_t levels = ~(input ^ s->pol);
+
+    /* Edge events latch; level events follow the enabled trigger condition. */
+    s->status = (s->status & ~s->trig) |
+                (edges & ~s->trig & s->ie) |
+                (levels & s->trig & s->ie);
+    qemu_set_irq(s->irq, (s->status & s->ie) != 0);
+}
+
 static void g233_gpio_update_outputs(G233GPIOState *s)
 {
     uint32_t output = s->dir & s->out;
@@ -47,11 +62,13 @@ static uint64_t g233_gpio_read(void *opaque, hwaddr offset, unsigned int size)
     case GPIO_IN:
         return g233_gpio_input(s);
     case GPIO_IE:
+        return s->ie;
     case GPIO_IS:
+        return s->status;
     case GPIO_TRIG:
+        return s->trig;
     case GPIO_POL:
-        /* Reserved until interrupt support is enabled. */
-        return 0;
+        return s->pol;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: invalid read offset 0x%" HWADDR_PRIx "\n",
@@ -64,6 +81,7 @@ static void g233_gpio_write(void *opaque, hwaddr offset, uint64_t value,
                             unsigned int size)
 {
     G233GPIOState *s = G233_GPIO(opaque);
+    uint32_t previous = g233_gpio_input(s);
 
     switch (offset) {
     case GPIO_DIR:
@@ -75,6 +93,18 @@ static void g233_gpio_write(void *opaque, hwaddr offset, uint64_t value,
     case GPIO_IN:
         /* The input register is read-only. */
         return;
+    case GPIO_IE:
+        s->ie = value;
+        break;
+    case GPIO_IS:
+        s->status &= ~value;
+        break;
+    case GPIO_TRIG:
+        s->trig = value;
+        break;
+    case GPIO_POL:
+        s->pol = value;
+        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: invalid write offset 0x%" HWADDR_PRIx "\n",
@@ -82,6 +112,7 @@ static void g233_gpio_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
+    g233_gpio_update_irq(s, previous);
     if (offset == GPIO_DIR || offset == GPIO_OUT) {
         g233_gpio_update_outputs(s);
     }
@@ -104,6 +135,7 @@ static const MemoryRegionOps g233_gpio_ops = {
 static void g233_gpio_set_input(void *opaque, int line, int level)
 {
     G233GPIOState *s = G233_GPIO(opaque);
+    uint32_t previous = g233_gpio_input(s);
     uint32_t mask = 1U << line;
 
     if (level > 0) {
@@ -111,6 +143,7 @@ static void g233_gpio_set_input(void *opaque, int line, int level)
     } else {
         s->input &= ~mask;
     }
+    g233_gpio_update_irq(s, previous);
 }
 
 static void g233_gpio_reset_hold(Object *obj, ResetType type)
@@ -120,7 +153,12 @@ static void g233_gpio_reset_hold(Object *obj, ResetType type)
     s->dir = 0;
     s->out = 0;
     s->input = 0;
+    s->ie = 0;
+    s->status = 0;
+    s->trig = 0;
+    s->pol = 0;
 
+    g233_gpio_update_irq(s, 0);
     g233_gpio_update_outputs(s);
 }
 
@@ -128,6 +166,8 @@ static int g233_gpio_post_load(void *opaque, int version_id)
 {
     G233GPIOState *s = G233_GPIO(opaque);
 
+    /* Restore signal levels without synthesizing a new edge event. */
+    g233_gpio_update_irq(s, g233_gpio_input(s));
     g233_gpio_update_outputs(s);
     return 0;
 }
@@ -141,6 +181,10 @@ static const VMStateDescription vmstate_g233_gpio = {
         VMSTATE_UINT32(dir, G233GPIOState),
         VMSTATE_UINT32(out, G233GPIOState),
         VMSTATE_UINT32(input, G233GPIOState),
+        VMSTATE_UINT32(ie, G233GPIOState),
+        VMSTATE_UINT32(status, G233GPIOState),
+        VMSTATE_UINT32(trig, G233GPIOState),
+        VMSTATE_UINT32(pol, G233GPIOState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -153,6 +197,7 @@ static void g233_gpio_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &g233_gpio_ops, s,
                           TYPE_G233_GPIO, G233_GPIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
+    sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_in(DEVICE(obj), g233_gpio_set_input, G233_GPIO_PINS);
     qdev_init_gpio_out_named(DEVICE(obj), s->output, "gpio", G233_GPIO_PINS);
 }

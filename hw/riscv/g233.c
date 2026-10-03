@@ -1574,7 +1574,7 @@ static void virt_machine_done(Notifier *notifier, void *data)
 static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
 {
     sysbus_create_simple(TYPE_G233_GPIO, s->memmap[G233_DEV_GPIO].base,
-                         NULL);
+                         qdev_get_gpio_in(irqchip, G233_GPIO_IRQ));
 }
 
 static void virt_machine_init(MachineState *machine)
