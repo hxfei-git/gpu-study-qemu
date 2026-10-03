@@ -90,12 +90,20 @@ enum {
     VIRT_PLATFORM_BUS,
     VIRT_PCIE_ECAM,
     VIRT_IOMMU_SYS,
+    G233_DEV_WDT,
+    G233_DEV_GPIO,
+    G233_DEV_PWM,
+    G233_DEV_SPI,
 };
 
 enum {
-    UART0_IRQ = 10,
+    UART0_IRQ = 1,
+    G233_GPIO_IRQ = 2,
+    G233_PWM_IRQ = 3,
+    G233_WDT_IRQ = 4,
+    G233_SPI_IRQ = 5,
     RTC_IRQ = 11,
-    VIRTIO_IRQ = 1, /* 1 to 8 */
+    VIRTIO_IRQ = 16, /* 16 to 23; IRQ 1 to 5 belong to G233 peripherals. */
     VIRTIO_COUNT = 8,
     PCIE_IRQ = 0x20, /* 32 to 35 */
     IOMMU_SYS_IRQ = 0x24, /* 36-39 */
