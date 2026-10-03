@@ -31,6 +31,7 @@
 #include "hw/char/pl011.h"
 #include "hw/gpio/g233_gpio.h"
 #include "hw/timer/g233_pwm.h"
+#include "hw/watchdog/g233_wdt.h"
 #include "target/riscv/cpu.h"
 #include "hw/core/sysbus-fdt.h"
 #include "target/riscv/pmu.h"
@@ -1151,6 +1152,7 @@ static void create_fdt_g233_peripherals(RISCVG233State *s,
     } devices[] = {
         { "gpio", "gevico,g233-gpio", G233_DEV_GPIO, G233_GPIO_IRQ },
         { "pwm", "gevico,g233-pwm", G233_DEV_PWM, G233_PWM_IRQ },
+        { "watchdog", "gevico,g233-wdt", G233_DEV_WDT, G233_WDT_IRQ },
     };
 
     for (int i = 0; i < ARRAY_SIZE(devices); i++) {
@@ -1582,6 +1584,8 @@ static void g233_create_peripherals(RISCVG233State *s, DeviceState *irqchip)
                          qdev_get_gpio_in(irqchip, G233_GPIO_IRQ));
     sysbus_create_simple(TYPE_G233_PWM, s->memmap[G233_DEV_PWM].base,
                          qdev_get_gpio_in(irqchip, G233_PWM_IRQ));
+    sysbus_create_simple(TYPE_G233_WDT, s->memmap[G233_DEV_WDT].base,
+                         qdev_get_gpio_in(irqchip, G233_WDT_IRQ));
 }
 
 static void virt_machine_init(MachineState *machine)
