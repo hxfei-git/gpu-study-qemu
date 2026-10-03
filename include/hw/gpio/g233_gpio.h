@@ -20,11 +20,16 @@ struct G233GPIOState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
+    qemu_irq irq;
     qemu_irq output[G233_GPIO_PINS];
 
     uint32_t dir;
     uint32_t out;
     uint32_t input;
+    uint32_t ie;
+    uint32_t status;
+    uint32_t trig;
+    uint32_t pol;
 };
 
 #endif /* HW_GPIO_G233_GPIO_H */
