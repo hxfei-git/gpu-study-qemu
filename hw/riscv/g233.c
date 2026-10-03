@@ -93,7 +93,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_PLIC] =         {  0xc000000, VIRT_PLIC_SIZE(VIRT_CPUS_MAX * 2) },
     [VIRT_APLIC_M] =      {  0xc000000, APLIC_SIZE(VIRT_CPUS_MAX) },
     [VIRT_APLIC_S] =      {  0xd000000, APLIC_SIZE(VIRT_CPUS_MAX) },
-    [VIRT_UART0] =        { 0x10000000,         0x100 },
+    [VIRT_UART0] =        { 0x10000000,        0x1000 },
     [VIRT_VIRTIO] =       { 0x10001000,        0x1000 },
     [VIRT_FW_CFG] =       { 0x10100000,          0x18 },
     [VIRT_FLASH] =        { 0x20000000,     0x4000000 },
@@ -102,6 +102,10 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_PCIE_ECAM] =    { 0x30000000,    0x10000000 },
     [VIRT_PCIE_MMIO] =    { 0x40000000,    0x40000000 },
     [VIRT_DRAM] =         { 0x80000000,           0x0 },
+    [G233_DEV_WDT] =          { 0x10010000,        0x1000 },
+    [G233_DEV_GPIO] =         { 0x10012000,        0x1000 },
+    [G233_DEV_PWM] =          { 0x10015000,        0x1000 },
+    [G233_DEV_SPI] =          { 0x10018000,        0x1000 },
 };
 
 /* PCIe high mmio is fixed for RV32 */
@@ -971,8 +975,7 @@ static void create_fdt_uart(RISCVG233State *s,
     name = g_strdup_printf("/soc/serial@%"HWADDR_PRIx,
                            s->memmap[VIRT_UART0].base);
     qemu_fdt_add_subnode(ms->fdt, name);
-    //qemu_fdt_setprop_string(ms->fdt, name, "compatible", "ns16550a");
-    qemu_fdt_setprop_string(ms->fdt, name, "compatible", "pl011");
+    qemu_fdt_setprop_string(ms->fdt, name, "compatible", "arm,pl011");
     qemu_fdt_setprop_sized_cells(ms->fdt, name, "reg",
                                  2, s->memmap[VIRT_UART0].base,
                                  2, s->memmap[VIRT_UART0].size);
@@ -1611,8 +1614,8 @@ static void virt_machine_init(MachineState *machine)
                             i * s->memmap[VIRT_ACLINT_SSWI].size,
                         base_hartid, hart_count, true);
             }
-        } else if (tcg_enabled()) {
-            /* Per-socket SiFive CLINT */
+        } else if (virt_aclint_allowed()) {
+            /* Per-socket SiFive CLINT, also accessible through QTest. */
             riscv_aclint_swi_create(
                     s->memmap[VIRT_CLINT].base + i * s->memmap[VIRT_CLINT].size,
                     base_hartid, hart_count, false);
@@ -1897,7 +1900,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
 
-    mc->desc = "RISC-V VirtIO board";
+    mc->desc = "G233 RISC-V development board";
     mc->init = virt_machine_init;
     mc->max_cpus = VIRT_CPUS_MAX;
     mc->default_cpu_type = TYPE_RISCV_CPU_GEVICO_CV1;
