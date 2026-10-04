@@ -61,6 +61,18 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->global_status;
     case GPGPU_REG_ERROR_STATUS:
         return s->error_status;
+    case GPGPU_REG_GRID_DIM_X:
+        return s->kernel.grid_dim[0];
+    case GPGPU_REG_GRID_DIM_Y:
+        return s->kernel.grid_dim[1];
+    case GPGPU_REG_GRID_DIM_Z:
+        return s->kernel.grid_dim[2];
+    case GPGPU_REG_BLOCK_DIM_X:
+        return s->kernel.block_dim[0];
+    case GPGPU_REG_BLOCK_DIM_Y:
+        return s->kernel.block_dim[1];
+    case GPGPU_REG_BLOCK_DIM_Z:
+        return s->kernel.block_dim[2];
     default:
         return 0;
     }
@@ -86,6 +98,24 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         if (!s->error_status) {
             s->global_status &= ~GPGPU_STATUS_ERROR;
         }
+        break;
+    case GPGPU_REG_GRID_DIM_X:
+        s->kernel.grid_dim[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_GRID_DIM_Y:
+        s->kernel.grid_dim[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_GRID_DIM_Z:
+        s->kernel.grid_dim[2] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_X:
+        s->kernel.block_dim[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_Y:
+        s->kernel.block_dim[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_BLOCK_DIM_Z:
+        s->kernel.block_dim[2] = (uint32_t)val;
         break;
     default:
         break;
