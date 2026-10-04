@@ -22,13 +22,28 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
-/* TODO: Implement MMIO control register read */
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
+    GPGPUState *s = opaque;
+
     (void)size;
-    return 0;
+
+    switch (addr) {
+    case GPGPU_REG_DEV_ID:
+        return GPGPU_DEV_ID_VALUE;
+    case GPGPU_REG_DEV_VERSION:
+        return GPGPU_DEV_VERSION_VALUE;
+    case GPGPU_REG_DEV_CAPS:
+        return (s->num_cus & 0xff) |
+               ((s->warps_per_cu & 0xff) << 8) |
+               ((s->warp_size & 0xff) << 16);
+    case GPGPU_REG_VRAM_SIZE_LO:
+        return (uint32_t)s->vram_size;
+    case GPGPU_REG_VRAM_SIZE_HI:
+        return (uint32_t)(s->vram_size >> 32);
+    default:
+        return 0;
+    }
 }
 
 /* TODO: Implement MMIO control register write */
