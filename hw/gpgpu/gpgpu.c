@@ -22,6 +22,20 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
+static void gpgpu_reset_state(GPGPUState *s)
+{
+    s->global_ctrl = 0;
+    s->global_status = GPGPU_STATUS_READY;
+    s->error_status = 0;
+    s->irq_enable = 0;
+    s->irq_status = 0;
+    memset(&s->kernel, 0, sizeof(s->kernel));
+    memset(&s->dma, 0, sizeof(s->dma));
+    memset(&s->simt, 0, sizeof(s->simt));
+    timer_del(s->dma_timer);
+    timer_del(s->kernel_timer);
+}
+
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     GPGPUState *s = opaque;
@@ -41,19 +55,41 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)s->vram_size;
     case GPGPU_REG_VRAM_SIZE_HI:
         return (uint32_t)(s->vram_size >> 32);
+    case GPGPU_REG_GLOBAL_CTRL:
+        return s->global_ctrl;
+    case GPGPU_REG_GLOBAL_STATUS:
+        return s->global_status;
+    case GPGPU_REG_ERROR_STATUS:
+        return s->error_status;
     default:
         return 0;
     }
 }
 
-/* TODO: Implement MMIO control register write */
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
+    GPGPUState *s = opaque;
+
     (void)size;
+
+    switch (addr) {
+    case GPGPU_REG_GLOBAL_CTRL:
+        if (val & GPGPU_CTRL_RESET) {
+            gpgpu_reset_state(s);
+        } else {
+            s->global_ctrl = val & GPGPU_CTRL_ENABLE;
+        }
+        break;
+    case GPGPU_REG_ERROR_STATUS:
+        s->error_status &= ~(uint32_t)val;
+        if (!s->error_status) {
+            s->global_status &= ~GPGPU_STATUS_ERROR;
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static const MemoryRegionOps gpgpu_ctrl_ops = {
@@ -203,16 +239,7 @@ static void gpgpu_reset(DeviceState *dev)
 {
     GPGPUState *s = GPGPU(dev);
 
-    s->global_ctrl = 0;
-    s->global_status = GPGPU_STATUS_READY;
-    s->error_status = 0;
-    s->irq_enable = 0;
-    s->irq_status = 0;
-    memset(&s->kernel, 0, sizeof(s->kernel));
-    memset(&s->dma, 0, sizeof(s->dma));
-    memset(&s->simt, 0, sizeof(s->simt));
-    timer_del(s->dma_timer);
-    timer_del(s->kernel_timer);
+    gpgpu_reset_state(s);
     if (s->vram_ptr) {
         memset(s->vram_ptr, 0, s->vram_size);
     }
