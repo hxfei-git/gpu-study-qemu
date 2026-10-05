@@ -62,6 +62,10 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->global_status;
     case GPGPU_REG_ERROR_STATUS:
         return s->error_status;
+    case GPGPU_REG_IRQ_ENABLE:
+        return s->irq_enable;
+    case GPGPU_REG_IRQ_STATUS:
+        return s->irq_status;
     case GPGPU_REG_GRID_DIM_X:
         return s->kernel.grid_dim[0];
     case GPGPU_REG_GRID_DIM_Y:
@@ -109,6 +113,14 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         if (!s->error_status) {
             s->global_status &= ~GPGPU_STATUS_ERROR;
         }
+        break;
+    case GPGPU_REG_IRQ_ENABLE:
+        s->irq_enable = val & (GPGPU_IRQ_KERNEL_DONE |
+                              GPGPU_IRQ_DMA_DONE |
+                              GPGPU_IRQ_ERROR);
+        break;
+    case GPGPU_REG_IRQ_ACK:
+        s->irq_status &= ~(uint32_t)val;
         break;
     case GPGPU_REG_GRID_DIM_X:
         s->kernel.grid_dim[0] = (uint32_t)val;
