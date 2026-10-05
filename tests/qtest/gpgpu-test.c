@@ -498,6 +498,64 @@ static void gpgpu_test_simt_reset(void *obj, void *data, QGuestAllocator *alloc)
     qpci_iounmap(pdev, bar0);
 }
 
+static void gpgpu_test_simt_reset_all(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    static const struct {
+        uint32_t offset;
+        uint32_t before;
+        uint32_t after;
+    } registers[] = {
+        { GPGPU_REG_THREAD_ID_X, 15, 11 },
+        { GPGPU_REG_THREAD_ID_Y, 7, 5 },
+        { GPGPU_REG_THREAD_ID_Z, 3, 1 },
+        { GPGPU_REG_BLOCK_ID_X, 63, 31 },
+        { GPGPU_REG_BLOCK_ID_Y, 30, 14 },
+        { GPGPU_REG_BLOCK_ID_Z, 2, 6 },
+        { GPGPU_REG_WARP_ID, 4, 8 },
+        { GPGPU_REG_LANE_ID, 17, 19 },
+        { GPGPU_REG_THREAD_MASK, 0xA5A55A5A, 0x5A5AA5A5 },
+    };
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    size_t i;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    for (i = 0; i < ARRAY_SIZE(registers); i++) {
+        qpci_io_writel(pdev, bar0, registers[i].offset, registers[i].before);
+    }
+    for (i = 0; i < ARRAY_SIZE(registers); i++) {
+        g_assert_cmphex(qpci_io_readl(pdev, bar0, registers[i].offset), ==,
+                        registers[i].before);
+    }
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_CTRL), ==,
+                    GPGPU_CTRL_ENABLE);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL,
+                   GPGPU_CTRL_ENABLE | GPGPU_CTRL_RESET);
+
+    for (i = 0; i < ARRAY_SIZE(registers); i++) {
+        g_assert_cmphex(qpci_io_readl(pdev, bar0, registers[i].offset), ==, 0);
+    }
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_CTRL), ==, 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS), ==,
+                    GPGPU_STATUS_READY);
+
+    for (i = 0; i < ARRAY_SIZE(registers); i++) {
+        qpci_io_writel(pdev, bar0, registers[i].offset, registers[i].after);
+    }
+    for (i = 0; i < ARRAY_SIZE(registers); i++) {
+        g_assert_cmphex(qpci_io_readl(pdev, bar0, registers[i].offset), ==,
+                        registers[i].after);
+    }
+
+    qpci_iounmap(pdev, bar0);
+}
+
 /*
  * 测试 13: 简单内核执行测试
  * 验证 RISC-V 指令解释器能正确执行简单的 kernel
@@ -1001,6 +1059,7 @@ static void gpgpu_register_nodes(void)
     qos_add_test("simt-warp-lane", "gpgpu", gpgpu_test_warp_lane_regs, NULL);
     qos_add_test("simt-thread-mask", "gpgpu", gpgpu_test_thread_mask_reg, NULL);
     qos_add_test("simt-reset", "gpgpu", gpgpu_test_simt_reset, NULL);
+    qos_add_test("simt-reset-all", "gpgpu", gpgpu_test_simt_reset_all, NULL);
 
     /* 内核执行测试 */
     qos_add_test("kernel-exec", "gpgpu", gpgpu_test_kernel_exec, NULL);
