@@ -88,6 +88,12 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)(s->dma.dst_addr >> 32);
     case GPGPU_REG_DMA_SIZE:
         return s->dma.size;
+    case GPGPU_REG_THREAD_ID_X:
+        return s->simt.thread_id[0];
+    case GPGPU_REG_THREAD_ID_Y:
+        return s->simt.thread_id[1];
+    case GPGPU_REG_THREAD_ID_Z:
+        return s->simt.thread_id[2];
     default:
         return 0;
     }
@@ -158,6 +164,15 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_DMA_SIZE:
         s->dma.size = (uint32_t)val;
+        break;
+    case GPGPU_REG_THREAD_ID_X:
+        s->simt.thread_id[0] = (uint32_t)val;
+        break;
+    case GPGPU_REG_THREAD_ID_Y:
+        s->simt.thread_id[1] = (uint32_t)val;
+        break;
+    case GPGPU_REG_THREAD_ID_Z:
+        s->simt.thread_id[2] = (uint32_t)val;
         break;
     default:
         break;
