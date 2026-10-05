@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qemu/module.h"
@@ -132,23 +133,31 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
     },
 };
 
-/* TODO: Implement VRAM read */
 static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)size;
-    return 0;
+    GPGPUState *s = opaque;
+
+    if (addr >= s->vram_size || size > s->vram_size - addr) {
+        s->error_status |= GPGPU_ERR_VRAM_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return 0;
+    }
+
+    return ldn_le_p(s->vram_ptr + addr, size);
 }
 
-/* TODO: Implement VRAM write */
 static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
-    (void)size;
+    GPGPUState *s = opaque;
+
+    if (addr >= s->vram_size || size > s->vram_size - addr) {
+        s->error_status |= GPGPU_ERR_VRAM_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return;
+    }
+
+    stn_le_p(s->vram_ptr + addr, size, val);
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {
