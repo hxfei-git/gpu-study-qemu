@@ -66,6 +66,10 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->irq_enable;
     case GPGPU_REG_IRQ_STATUS:
         return s->irq_status;
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        return (uint32_t)s->kernel.kernel_addr;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        return (uint32_t)(s->kernel.kernel_addr >> 32);
     case GPGPU_REG_GRID_DIM_X:
         return s->kernel.grid_dim[0];
     case GPGPU_REG_GRID_DIM_Y:
@@ -111,6 +115,36 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
+static void gpgpu_dispatch_kernel(GPGPUState *s)
+{
+    int ret;
+
+    if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) ||
+        (s->global_status & GPGPU_STATUS_BUSY) ||
+        !s->kernel.grid_dim[0] || !s->kernel.grid_dim[1] ||
+        !s->kernel.grid_dim[2] || !s->kernel.block_dim[0] ||
+        !s->kernel.block_dim[1] || !s->kernel.block_dim[2] ||
+        (s->kernel.kernel_addr & 3) ||
+        s->vram_size < sizeof(uint32_t) ||
+        s->kernel.kernel_addr > s->vram_size - sizeof(uint32_t)) {
+        s->error_status |= GPGPU_ERR_INVALID_CMD;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return;
+    }
+
+    s->global_status |= GPGPU_STATUS_BUSY;
+    ret = gpgpu_core_exec_kernel(s);
+    s->global_status &= ~GPGPU_STATUS_BUSY;
+    s->global_status |= GPGPU_STATUS_READY;
+
+    if (ret < 0) {
+        s->error_status |= GPGPU_ERR_KERNEL_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+    } else {
+        s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+    }
+}
+
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
@@ -139,6 +173,14 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_IRQ_ACK:
         s->irq_status &= ~(uint32_t)val;
+        break;
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        s->kernel.kernel_addr =
+            (s->kernel.kernel_addr & 0xffffffff00000000ULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xffffffffULL) |
+                               ((uint64_t)(uint32_t)val << 32);
         break;
     case GPGPU_REG_GRID_DIM_X:
         s->kernel.grid_dim[0] = (uint32_t)val;
@@ -203,6 +245,9 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_THREAD_MASK:
         s->simt.thread_mask = (uint32_t)val;
+        break;
+    case GPGPU_REG_DISPATCH:
+        gpgpu_dispatch_kernel(s);
         break;
     default:
         break;
