@@ -13,6 +13,52 @@
 #include "gpgpu_core.h"
 #include "qemu/bswap.h"
 
+/* RISC-V and SoftFloat use different rounding-mode encodings. */
+static bool gpgpu_core_set_rounding_mode(GPGPULane *lane, uint32_t rm)
+{
+    FloatRoundMode mode;
+
+    if (rm == 7) {
+        rm = (lane->fcsr >> 5) & 7;
+    }
+
+    switch (rm) {
+    case 0:
+        mode = float_round_nearest_even;
+        break;
+    case 1:
+        mode = float_round_to_zero;
+        break;
+    case 2:
+        mode = float_round_down;
+        break;
+    case 3:
+        mode = float_round_up;
+        break;
+    case 4:
+        mode = float_round_ties_away;
+        break;
+    default:
+        return false;
+    }
+
+    set_float_rounding_mode(mode, &lane->fp_status);
+    set_float_exception_flags(0, &lane->fp_status);
+    return true;
+}
+
+/* Accumulate IEEE 754 exceptions in the RISC-V fflags bit positions. */
+static void gpgpu_core_update_fflags(GPGPULane *lane)
+{
+    int flags = get_float_exception_flags(&lane->fp_status);
+
+    lane->fcsr |= ((flags & float_flag_inexact) ? 1U << 0 : 0) |
+                  ((flags & float_flag_underflow) ? 1U << 1 : 0) |
+                  ((flags & float_flag_overflow) ? 1U << 2 : 0) |
+                  ((flags & float_flag_divbyzero) ? 1U << 3 : 0) |
+                  ((flags & float_flag_invalid) ? 1U << 4 : 0);
+}
+
 /* Initialize the active lanes and per-warp identity. */
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
@@ -37,10 +83,15 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         lane->active = true;
         lane->pc = pc;
         lane->mhartid = MHARTID_ENCODE(block_id_linear, warp_id, lane_id);
+        set_float_rounding_mode(float_round_nearest_even, &lane->fp_status);
+        set_float_detect_tininess(float_tininess_after_rounding,
+                                 &lane->fp_status);
+        set_default_nan_mode(true, &lane->fp_status);
+        set_float_default_nan_pattern(0x40, &lane->fp_status);
     }
 }
 
-/* Execute the integer kernel instructions used by experiment 8. */
+/* Execute the integer and floating-point kernels used by experiments 8/9. */
 int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 {
     uint32_t cycles = 0;
@@ -101,6 +152,16 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 
             case 0x13:  /* OP-IMM */
                 switch (funct3) {
+                case 0x0: {  /* ADDI */
+                    int32_t imm = (int32_t)inst >> 20;
+
+                    if (rd != 0) {
+                        lane->gpr[rd] = lane->gpr[rs1] + (uint32_t)imm;
+                    }
+                    lane->pc += 4;
+                    break;
+                }
+
                 case 0x1: {  /* SLLI */
                     uint32_t shamt = (inst >> 20) & 0x1F;
 
@@ -167,6 +228,55 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 default:
                     return -1;
                 }
+                break;
+
+            case 0x53:  /* OP-FP */
+                switch (funct7) {
+                case 0x00:  /* FADD.S */
+                case 0x08:  /* FMUL.S */
+                    break;
+                case 0x60:  /* FCVT.W.S */
+                case 0x68:  /* FCVT.S.W */
+                    if (rs2 != 0) {
+                        return -1;
+                    }
+                    break;
+                default:
+                    return -1;
+                }
+
+                if (!gpgpu_core_set_rounding_mode(lane, funct3)) {
+                    return -1;
+                }
+
+                switch (funct7) {
+                case 0x00:  /* FADD.S */
+                    lane->fpr[rd] = float32_add(lane->fpr[rs1],
+                                              lane->fpr[rs2],
+                                              &lane->fp_status);
+                    break;
+                case 0x08:  /* FMUL.S */
+                    lane->fpr[rd] = float32_mul(lane->fpr[rs1],
+                                              lane->fpr[rs2],
+                                              &lane->fp_status);
+                    break;
+                case 0x60: {  /* FCVT.W.S */
+                    int32_t value = float32_to_int32(lane->fpr[rs1],
+                                                    &lane->fp_status);
+
+                    if (rd != 0) {
+                        lane->gpr[rd] = (uint32_t)value;
+                    }
+                    break;
+                }
+                case 0x68:  /* FCVT.S.W */
+                    lane->fpr[rd] = int32_to_float32((int32_t)lane->gpr[rs1],
+                                                   &lane->fp_status);
+                    break;
+                }
+
+                gpgpu_core_update_fflags(lane);
+                lane->pc += 4;
                 break;
 
             default:
