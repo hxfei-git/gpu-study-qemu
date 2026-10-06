@@ -59,6 +59,78 @@ static void gpgpu_core_update_fflags(GPGPULane *lane)
                   ((flags & float_flag_invalid) ? 1U << 4 : 0);
 }
 
+/* Convert FP32 to saturating E2M1 using ordered positive FP32 encodings. */
+static float4_e2m1 gpgpu_core_float32_to_e2m1(float32 value,
+                                              float_status *status)
+{
+    static const uint32_t values[] = {
+        0x00000000, 0x3F000000, 0x3F800000, 0x3FC00000,
+        0x40000000, 0x40400000, 0x40800000, 0x40C00000,
+        0x41000000, /* Virtual next value, 8.0, for overflow rounding. */
+    };
+    static const uint32_t midpoints[] = {
+        0x3E800000, 0x3F400000, 0x3FA00000, 0x3FE00000,
+        0x40200000, 0x40600000, 0x40A00000, 0x40E00000,
+    };
+    uint32_t magnitude = value & 0x7FFFFFFF;
+    uint32_t sign = (value >> 28) & 8;
+    uint32_t upper = 0;
+    uint32_t result;
+    uint16_t flags = float_flag_inexact;
+    bool round_up;
+
+    /* E2M1 has no NaN or infinity encodings; preserve the input sign. */
+    if (magnitude >= 0x7F800000) {
+        if (magnitude > 0x7F800000) {
+            float_raise(float_flag_invalid, status);
+        }
+        return sign | 7;
+    }
+    if (magnitude >= values[8]) {
+        float_raise(float_flag_overflow | float_flag_inexact, status);
+        return sign | 7;
+    }
+
+    while (magnitude > values[upper]) {
+        upper++;
+    }
+    if (magnitude == values[upper]) {
+        return sign | upper;
+    }
+
+    switch (get_float_rounding_mode(status)) {
+    case float_round_nearest_even:
+        round_up = magnitude > midpoints[upper - 1] ||
+                   (magnitude == midpoints[upper - 1] && !(upper & 1));
+        break;
+    case float_round_ties_away:
+        round_up = magnitude >= midpoints[upper - 1];
+        break;
+    case float_round_to_zero:
+        round_up = false;
+        break;
+    case float_round_down:
+        round_up = sign != 0;
+        break;
+    case float_round_up:
+        round_up = sign == 0;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    result = upper - 1 + round_up;
+    if (result > 7) {
+        result = 7;
+        flags |= float_flag_overflow;
+    } else if (result < 2) {
+        /* Detect tininess after rounding, as for the other FP formats. */
+        flags |= float_flag_underflow;
+    }
+    float_raise(flags, status);
+    return sign | result;
+}
+
 /* Initialize the active lanes and per-warp identity. */
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
@@ -91,7 +163,7 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
     }
 }
 
-/* Execute the integer and floating-point kernels used by experiments 8/9. */
+/* Execute the integer and floating-point kernels used by experiments 8-10. */
 int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 {
     uint32_t cycles = 0;
@@ -231,9 +303,29 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 break;
 
             case 0x53:  /* OP-FP */
+                if (funct7 == 0x78) {  /* FMV.W.X */
+                    if (rs2 != 0 || funct3 != 0) {
+                        return -1;
+                    }
+                    lane->fpr[rd] = lane->gpr[rs1];
+                    lane->pc += 4;
+                    break;
+                }
+
                 switch (funct7) {
                 case 0x00:  /* FADD.S */
                 case 0x08:  /* FMUL.S */
+                    break;
+                case 0x22:  /* BF16 conversion */
+                case 0x26:  /* E2M1 conversion */
+                    if (rs2 > 1) {
+                        return -1;
+                    }
+                    break;
+                case 0x24:  /* E4M3 / E5M2 conversion */
+                    if (rs2 > 3) {
+                        return -1;
+                    }
                     break;
                 case 0x60:  /* FCVT.W.S */
                 case 0x68:  /* FCVT.S.W */
@@ -259,6 +351,58 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                     lane->fpr[rd] = float32_mul(lane->fpr[rs1],
                                               lane->fpr[rs2],
                                               &lane->fp_status);
+                    break;
+                case 0x22:  /* BF16 conversion */
+                    if (rs2 == 0) {
+                        lane->fpr[rd] = bfloat16_to_float32(
+                            (bfloat16)lane->fpr[rs1], &lane->fp_status);
+                    } else {
+                        lane->fpr[rd] = float32_to_bfloat16(
+                            lane->fpr[rs1], &lane->fp_status);
+                    }
+                    break;
+                case 0x24:  /* E4M3 / E5M2 conversion */
+                    if (rs2 == 0 || rs2 == 2) {
+                        bfloat16 value;
+
+                        if (rs2 == 0) {
+                            value = float8_e4m3_to_bfloat16(
+                                (float8_e4m3)lane->fpr[rs1], &lane->fp_status);
+                        } else {
+                            value = float8_e5m2_to_bfloat16(
+                                (float8_e5m2)lane->fpr[rs1], &lane->fp_status);
+                        }
+                        lane->fpr[rd] = bfloat16_to_float32(value,
+                                                          &lane->fp_status);
+                    } else if (rs2 == 1) {
+                        float32 value = lane->fpr[rs1];
+                        float8_e4m3 result = float32_to_float8_e4m3(
+                            value, true, &lane->fp_status);
+
+                        /* E4M3 NaN requires all exponent/fraction bits set. */
+                        lane->fpr[rd] = float32_is_any_nan(value)
+                                        ? 0x7F : result;
+                    } else {
+                        /* Saturate finite values while preserving Inf. */
+                        lane->fpr[rd] = float32_to_float8_e5m2(
+                            lane->fpr[rs1],
+                            !float32_is_infinity(lane->fpr[rs1]),
+                            &lane->fp_status);
+                    }
+                    break;
+                case 0x26:  /* E2M1 conversion */
+                    if (rs2 == 0) {
+                        float8_e4m3 value = float4_e2m1_to_float8_e4m3(
+                            lane->fpr[rs1] & 0xF, &lane->fp_status);
+                        bfloat16 bf16 = float8_e4m3_to_bfloat16(
+                            value, &lane->fp_status);
+
+                        lane->fpr[rd] = bfloat16_to_float32(bf16,
+                                                          &lane->fp_status);
+                    } else {
+                        lane->fpr[rd] = gpgpu_core_float32_to_e2m1(
+                            lane->fpr[rs1], &lane->fp_status);
+                    }
                     break;
                 case 0x60: {  /* FCVT.W.S */
                     int32_t value = float32_to_int32(lane->fpr[rs1],
