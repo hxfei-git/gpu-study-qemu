@@ -74,3 +74,26 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 - `../QEMU_2026_GPGPU_适配.html`
 - `../QEMU_2026_实验.html`
 - `../QEMU_2026_讲义.html`
+
+若 `00_QEMU` 大纲不存在，使用 `../QEMU GPGPU 实验大纲.md`。
+
+## 当前 GPGPU 实验
+
+进阶实验一已在 `hxfei-qemu` 分支完成。第一阶段软件栈位于 `software/gpgpu/`，
+包含 Linux PCI 驱动、libgpgpu、RV32 汇编 kernel 和汇编前端、三个 FP32 示例及客体集成测试。
+修改接口前阅读 `software/gpgpu/README.md` 和 `WORK_ITEMS.md`。
+当前 ABI 位于 `software/gpgpu/include/gpgpu_uapi.h`。
+
+运行 `make -f Makefile.camp test-gpgpu-stack` 验证 ARM64 Linux 驱动与运行时。
+首次运行会初始化 Alpine，后续构建复用 `build/gpgpu-linux-module/` 中保存编译环境的磁盘。
+运行 `make -C software/gpgpu check-assembler` 验证汇编前端编码。
+
+2026-10-07 的第一阶段验证通过了三个示例（17,953 个输出值）、
+68 项驱动与运行时检查，以及 RISC-V 和 ARM64 virt 上各 21 项 GPGPU QTest。
+这 21 项包括 17 项评分测试和 4 项回归测试。核对测试数量与日志，
+不能仅凭评分脚本的退出状态判断全部通过。
+
+设备使用独占会话和同步调用。设备指针为 VRAM 偏移；
+mmap 映射 64 KiB 一致性 DMA 暂存缓冲区。
+共享内存与屏障、CP 队列、异步流和 GPU 地址隔离留待后续实现。
+解释器支持 BF16、FP8 和 FP4 转换，尚未实现 FP16 转换。设备已明确禁止迁移。
