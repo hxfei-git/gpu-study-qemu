@@ -4,6 +4,7 @@
 """Prepare, test, or boot the ARM64 module using paths from this checkout."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -32,6 +33,14 @@ ISO_URL = (
 RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt", "initramfs-module")
 BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
                  "kernel-packages")
+BUILD_INPUTS = ("gpgpu_pci.c", "gpgpu_regs.h", "Makefile", "guest-compile.sh")
+BUILD_VERSION = 2
+ENVIRONMENT_INPUTS = ("guest-build.sh", "developer-init.sh",
+                      "guest-dev-init.sh", "module-init.sh")
+ENVIRONMENT_FILES = ("vmlinuz-virt", "initramfs-module",
+                     "initramfs-developer") + BUILD_RECORDS
+ENVIRONMENT_VERSION = 1
+DEVELOPER_DISK_SIZE = 2 * 1024 * 1024 * 1024
 
 
 def sha256(path):
@@ -42,28 +51,52 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def prepared_metadata(output):
+def read_metadata(output, manifest, filenames):
     try:
-        metadata = json.loads((output / "module-test.json").read_text())
+        metadata = json.loads((output / manifest).read_text())
         if not isinstance(metadata, dict):
             return None
         hashes = metadata.get("files")
         if not isinstance(hashes, dict):
             return None
         if any(sha256(output / name) != hashes.get(name)
-               for name in RUNTIME_FILES):
+               for name in filenames):
             return None
         return metadata
     except (OSError, ValueError):
         return None
 
 
-def source_hash():
+def prepared_metadata(output):
+    return read_metadata(output, "module-test.json", RUNTIME_FILES)
+
+
+def environment_metadata(output):
+    metadata = read_metadata(output, "environment.json", ENVIRONMENT_FILES)
+    if not metadata:
+        return None
+    try:
+        release = (output / "kernel-release").read_text().strip()
+        if not release or metadata.get("kernel_release") != release:
+            return None
+        size = (output / "developer.raw").stat().st_size
+        if size != metadata.get("disk_size"):
+            return None
+    except (OSError, ValueError):
+        return None
+    return metadata
+
+
+def inputs_hash(filenames, version):
     digest = hashlib.sha256()
-    for path in sorted(SOURCE.iterdir()):
-        if path.is_file():
-            digest.update(path.name.encode() + b"\0" + path.read_bytes())
+    digest.update(f"gpgpu-build:{version}\0".encode())
+    for name in filenames:
+        digest.update(name.encode() + b"\0" + (SOURCE / name).read_bytes())
     return digest.hexdigest()
+
+
+def source_hash():
+    return inputs_hash(BUILD_INPUTS, BUILD_VERSION)
 
 
 def ensure_qemu(output):
@@ -197,20 +230,37 @@ class Guest:
             self.log.close()
 
 
-def prepare(output, force):
-    output.mkdir(parents=True, exist_ok=True)
-    print("Checking ARM64 QEMU build...", flush=True)
-    ensure_qemu(output)
-    manifest = output / "module-test.json"
-    fingerprint = source_hash()
-    if not force:
-        metadata = prepared_metadata(output)
-        if metadata and metadata.get("source_hash") == fingerprint:
-            print("Using prepared module and matching kernel.", flush=True)
-            return
+def module_metadata(module, runtime, fingerprint, environment):
+    data = module.read_bytes()
+    if (len(data) < 20 or data[:6] != b"\x7fELF\x02\x01"
+            or struct.unpack_from("<H", data, 18)[0] != 183):
+        raise RuntimeError("Expected a little-endian ARM64 module")
+    release = environment["kernel_release"]
+    vermagic = next(part.decode() for part in data.split(b"\0")
+                    if part.startswith(b"vermagic="))
+    if not vermagic.startswith("vermagic=" + release + " "):
+        raise RuntimeError("Module and runtime kernel versions differ")
+    return {
+        "source_hash": fingerprint,
+        "environment_hash": environment["source_hash"],
+        "kernel_release": release,
+        "vermagic": vermagic.removeprefix("vermagic="),
+        "files": {name: sha256(module if name == "gpgpu_pci.ko"
+                               else runtime / name) for name in RUNTIME_FILES},
+    }
 
+
+def write_metadata(path, metadata):
+    path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def prepare_environment(output, fingerprint):
     image = bootstrap_images()
-    print("Building module and matching runtime in ARM64 guest...", flush=True)
+    print("Preparing persistent ARM64 compiler environment (once)...",
+          flush=True)
+    stage = Path(tempfile.mkdtemp(prefix=".environment-", dir=output))
+    with (stage / "developer.raw").open("wb") as disk:
+        disk.truncate(DEVELOPER_DISK_SIZE)
     command = base_command("2G") + [
         "-kernel", str(IMAGES / "vmlinuz-bootstrap"),
         "-initrd", str(IMAGES / "initramfs-bootstrap"),
@@ -219,15 +269,17 @@ def prepare(output, force):
         "alpine_dev=/dev/vda:iso9660 modloop=/boot/modloop-virt",
         "-drive", f"file={image},if=none,id=bootiso,format=raw,readonly=on",
         "-device", "virtio-blk-pci,drive=bootiso",
+        "-drive", f"file={stage / 'developer.raw'},if=none,id=developer,"
+        "format=raw",
+        "-device", "virtio-blk-pci,drive=developer",
         "-device", "gpgpu,bus=pcie.0",
     ]
     command += shared_directory(SOURCE, "gpgpu_src", True)
     command += shared_directory(output, "gpgpu_build", False)
     command += ["-netdev", "user,id=net0",
                 "-device", "virtio-net-pci,netdev=net0"]
-    stage = Path(tempfile.mkdtemp(prefix=".prepare-", dir=output))
     try:
-        guest = Guest(command, output / "prepare-console.log")
+        guest = Guest(command, output / "environment-console.log")
         try:
             guest.wait(rb"localhost login:")
             guest.send("root\n")
@@ -241,42 +293,101 @@ def prepare(output, force):
                 "gpgpu_build /mnt/gpgpu-build\n"
                 "sh /mnt/gpgpu-src/guest-build.sh "
                 + shlex.quote(stage.name) + " "
-                "> /mnt/gpgpu-build/native-build.log 2>&1\n"
-                "printf 'GPGPU_BUILD_RC=%s\\n' \"$?\"\n"
+                "> /mnt/gpgpu-build/environment-build.log 2>&1\n"
+                "printf 'GPGPU_ENVIRONMENT_RC=%s\\n' \"$?\"\n"
             )
-            result = guest.wait(rb"^GPGPU_BUILD_RC=(\d+)$", timeout=1800)
+            result = guest.wait(rb"^GPGPU_ENVIRONMENT_RC=(\d+)$", timeout=1800)
             if result.group(1) != b"0":
                 raise RuntimeError(
-                    "Guest build failed; inspect native-build.log")
+                    "Environment setup failed; inspect environment-build.log")
         finally:
             guest.close()
 
-        data = (stage / "gpgpu_pci.ko").read_bytes()
-        if (len(data) < 20 or data[:6] != b"\x7fELF\x02\x01"
-                or struct.unpack_from("<H", data, 18)[0] != 183):
-            raise RuntimeError("Expected a little-endian ARM64 module")
         release = (stage / "kernel-release").read_text().strip()
-        vermagic = next(part.decode() for part in data.split(b"\0")
-                        if part.startswith(b"vermagic="))
-        if not vermagic.startswith("vermagic=" + release + " "):
-            raise RuntimeError("Module and runtime kernel versions differ")
-        staged_manifest = stage / manifest.name
-        staged_manifest.write_text(json.dumps({
-            "source_hash": fingerprint, "kernel_release": release,
-            "vermagic": vermagic.removeprefix("vermagic="),
-            "files": {name: sha256(stage / name) for name in RUNTIME_FILES},
-        }, indent=2) + "\n")
-        for name in RUNTIME_FILES + BUILD_RECORDS:
+        environment = {
+            "source_hash": inputs_hash(ENVIRONMENT_INPUTS,
+                                       ENVIRONMENT_VERSION),
+            "kernel_release": release,
+            "disk_size": DEVELOPER_DISK_SIZE,
+            "files": {name: sha256(stage / name)
+                      for name in ENVIRONMENT_FILES},
+        }
+        module = module_metadata(stage / "gpgpu_pci.ko", stage, fingerprint,
+                                 environment)
+        write_metadata(stage / "environment.json", environment)
+        write_metadata(stage / "module-test.json", module)
+        for name in ENVIRONMENT_FILES + ("developer.raw", "gpgpu_pci.ko"):
             (stage / name).replace(output / name)
-        # Publish the manifest last; incomplete output fails hash validation.
-        staged_manifest.replace(manifest)
+        (stage / "module-test.json").replace(output / "module-test.json")
+        (stage / "environment.json").replace(output / "environment.json")
     finally:
         shutil.rmtree(stage)
     print(f"Prepared {output / 'gpgpu_pci.ko'} for {release}", flush=True)
 
 
+def compile_module(output, fingerprint, environment):
+    print("Incrementally building module with the saved compiler...",
+          flush=True)
+    stage = Path(tempfile.mkdtemp(prefix=".module-", dir=output))
+    command = base_command("1G") + [
+        "-kernel", str(output / "vmlinuz-virt"),
+        "-initrd", str(output / "initramfs-developer"),
+        "-append", "console=ttyAMA0",
+        "-drive", f"file={output / 'developer.raw'},if=none,id=developer,"
+        "format=raw",
+        "-device", "virtio-blk-pci,drive=developer",
+        "-device", "gpgpu,bus=pcie.0", "-nic", "none",
+    ]
+    command += shared_directory(SOURCE, "gpgpu_src", True)
+    command += shared_directory(output, "gpgpu_build", False)
+    try:
+        guest = Guest(command, output / "module-console.log")
+        try:
+            guest.wait(rb"^GPGPU_DEVELOPER_READY$")
+            guest.send(
+                "sh /mnt/gpgpu-src/guest-compile.sh "
+                + shlex.quote(stage.name) + " "
+                "> /mnt/gpgpu-build/module-build.log 2>&1\n"
+                "printf 'GPGPU_MODULE_RC=%s\\n' \"$?\"\n"
+            )
+            result = guest.wait(rb"^GPGPU_MODULE_RC=(\d+)$", timeout=600)
+            if result.group(1) != b"0":
+                raise RuntimeError(
+                    "Module build failed; inspect module-build.log")
+        finally:
+            guest.close()
+        metadata = module_metadata(stage / "gpgpu_pci.ko", output,
+                                   fingerprint, environment)
+        write_metadata(stage / "module-test.json", metadata)
+        (stage / "gpgpu_pci.ko").replace(output / "gpgpu_pci.ko")
+        (stage / "module-test.json").replace(output / "module-test.json")
+    finally:
+        shutil.rmtree(stage)
+    print(f"Updated {output / 'gpgpu_pci.ko'}", flush=True)
+
+
+def prepare(output, force, rebuild_module=False):
+    output.mkdir(parents=True, exist_ok=True)
+    print("Checking ARM64 QEMU build...", flush=True)
+    ensure_qemu(output)
+    fingerprint = source_hash()
+    environment = environment_metadata(output)
+    if (force or not environment or environment.get("source_hash")
+            != inputs_hash(ENVIRONMENT_INPUTS, ENVIRONMENT_VERSION)):
+        prepare_environment(output, fingerprint)
+        return
+    print("Using saved kernel and ARM64 compiler environment.", flush=True)
+    metadata = prepared_metadata(output)
+    if (not rebuild_module and metadata
+            and metadata.get("source_hash") == fingerprint
+            and metadata.get("environment_hash") == environment["source_hash"]):
+        print("Module is already up to date.", flush=True)
+        return
+    compile_module(output, fingerprint, environment)
+
+
 def runtime_command(output, interactive=False):
-    if not prepared_metadata(output):
+    if not QEMU_BINARY.is_file() or not prepared_metadata(output):
         raise RuntimeError("Run 'make prepare' before booting the module")
     command = base_command(interactive=interactive) + [
         "-kernel", str(output / "vmlinuz-virt"),
@@ -312,14 +423,21 @@ def test(output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "test", "run"))
+    parser.add_argument("command", choices=("prepare", "module", "test", "run"))
     parser.add_argument("--output-dir", type=Path,
                         default=ROOT / "build" / "gpgpu-linux-module")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--skip-prepare", action="store_true",
+                        help="Test existing artifacts without rebuilding")
     args = parser.parse_args()
+    if args.skip_prepare and (args.command != "test" or args.force):
+        parser.error("--skip-prepare requires test without --force")
     output = args.output_dir.resolve()
-    if args.command in ("prepare", "test"):
-        prepare(output, args.force)
+    if args.command in ("prepare", "module", "test") and not args.skip_prepare:
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / ".build.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            prepare(output, args.force)
     if args.command == "test":
         test(output)
     elif args.command == "run":
