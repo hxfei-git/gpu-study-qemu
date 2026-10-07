@@ -9,7 +9,7 @@ MODULE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR ?= $(abspath $(MODULE_DIR)/../../../build/gpgpu-linux-module)
 PYTHON ?= python3
 
-.PHONY: all clean prepare module test test-fast run
+.PHONY: all clean prepare module test test-fast stack-test stack-test-fast run
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(MODULE_DIR)" MO="$(BUILD_DIR)" modules
@@ -28,6 +28,14 @@ test:
 
 test-fast:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" test --skip-prepare \
+		--output-dir "$(BUILD_DIR)"
+
+stack-test:
+	$(PYTHON) "$(MODULE_DIR)/module-test.py" stack-test \
+		--output-dir "$(BUILD_DIR)"
+
+stack-test-fast:
+	$(PYTHON) "$(MODULE_DIR)/module-test.py" stack-test --skip-prepare \
 		--output-dir "$(BUILD_DIR)"
 
 run:

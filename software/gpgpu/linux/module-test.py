@@ -33,8 +33,9 @@ ISO_URL = (
 RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt", "initramfs-module")
 BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
                  "kernel-packages")
-BUILD_INPUTS = ("gpgpu_pci.c", "gpgpu_regs.h", "Makefile", "guest-compile.sh")
-BUILD_VERSION = 2
+BUILD_INPUTS = ("gpgpu_pci.c", "gpgpu_regs.h", "Makefile", "guest-compile.sh",
+                "../include/gpgpu_uapi.h")
+BUILD_VERSION = 3
 ENVIRONMENT_INPUTS = ("guest-build.sh", "developer-init.sh",
                       "guest-dev-init.sh", "module-init.sh")
 ENVIRONMENT_FILES = ("vmlinuz-virt", "initramfs-module",
@@ -275,9 +276,11 @@ def prepare_environment(output, fingerprint):
         "-device", "gpgpu,bus=pcie.0",
     ]
     command += shared_directory(SOURCE, "gpgpu_src", True)
+    command += shared_directory(SOURCE.parent, "gpgpu_stack", True)
     command += shared_directory(output, "gpgpu_build", False)
     command += ["-netdev", "user,id=net0",
                 "-device", "virtio-net-pci,netdev=net0"]
+    environment_saved = False
     try:
         guest = Guest(command, output / "environment-console.log")
         try:
@@ -312,34 +315,26 @@ def prepare_environment(output, fingerprint):
             "files": {name: sha256(stage / name)
                       for name in ENVIRONMENT_FILES},
         }
-        module = module_metadata(stage / "gpgpu_pci.ko", stage, fingerprint,
-                                 environment)
         write_metadata(stage / "environment.json", environment)
-        write_metadata(stage / "module-test.json", module)
-        for name in ENVIRONMENT_FILES + ("developer.raw", "gpgpu_pci.ko"):
+        for name in ENVIRONMENT_FILES + ("developer.raw",):
             (stage / name).replace(output / name)
-        (stage / "module-test.json").replace(output / "module-test.json")
         (stage / "environment.json").replace(output / "environment.json")
+        environment_saved = True
     finally:
-        shutil.rmtree(stage)
-    print(f"Prepared {output / 'gpgpu_pci.ko'} for {release}", flush=True)
+        if environment_saved:
+            shutil.rmtree(stage)
+        else:
+            print(f"Environment staging assets retained at {stage}",
+                  flush=True)
+    print(f"Saved ARM64 compiler environment for {release}", flush=True)
+    compile_module(output, fingerprint, environment)
 
 
 def compile_module(output, fingerprint, environment):
     print("Incrementally building module with the saved compiler...",
           flush=True)
     stage = Path(tempfile.mkdtemp(prefix=".module-", dir=output))
-    command = base_command("1G") + [
-        "-kernel", str(output / "vmlinuz-virt"),
-        "-initrd", str(output / "initramfs-developer"),
-        "-append", "console=ttyAMA0",
-        "-drive", f"file={output / 'developer.raw'},if=none,id=developer,"
-        "format=raw",
-        "-device", "virtio-blk-pci,drive=developer",
-        "-device", "gpgpu,bus=pcie.0", "-nic", "none",
-    ]
-    command += shared_directory(SOURCE, "gpgpu_src", True)
-    command += shared_directory(output, "gpgpu_build", False)
+    command = developer_command(output)
     try:
         guest = Guest(command, output / "module-console.log")
         try:
@@ -364,6 +359,22 @@ def compile_module(output, fingerprint, environment):
     finally:
         shutil.rmtree(stage)
     print(f"Updated {output / 'gpgpu_pci.ko'}", flush=True)
+
+
+def developer_command(output):
+    command = base_command("1G") + [
+        "-kernel", str(output / "vmlinuz-virt"),
+        "-initrd", str(output / "initramfs-developer"),
+        "-append", "console=ttyAMA0",
+        "-drive", f"file={output / 'developer.raw'},if=none,id=developer,"
+        "format=raw",
+        "-device", "virtio-blk-pci,drive=developer",
+        "-device", "gpgpu,bus=pcie.0", "-nic", "none",
+    ]
+    command += shared_directory(SOURCE, "gpgpu_src", True)
+    command += shared_directory(SOURCE.parent, "gpgpu_stack", True)
+    command += shared_directory(output, "gpgpu_build", False)
+    return command
 
 
 def prepare(output, force, rebuild_module=False):
@@ -415,34 +426,96 @@ def test(output):
             if result.group(1) != b"0":
                 raise RuntimeError(f"{marker} failed; inspect test-console.log")
             print(f"{marker}: passed", flush=True)
-        guest.send("dmesg | grep 'gpgpu_pci:'\n")
-        guest.wait(rb"gpgpu_pci: module unloaded")
+        check_kernel_log(guest)
+    finally:
+        guest.close()
+
+
+def check_kernel_log(guest):
+    guest.send("dmesg\n" "printf 'GPGPU_DMESG_END\\n'\n")
+    guest.wait(rb"^GPGPU_DMESG_END$")
+    if re.search(rb"(?:Oops:|BUG:|Kernel panic)", guest.buffer):
+        raise RuntimeError("Guest kernel fault; inspect console log")
+
+
+def stack_test(output):
+    (output / "stack-test.json").unlink(missing_ok=True)
+    if not environment_metadata(output) or not prepared_metadata(output):
+        raise RuntimeError("Run 'make prepare' before testing the stack")
+    stack_output = output / "stack"
+    # Assemble RV32 kernels on the host. The guest only needs its saved C
+    # compiler, so repeated tests do not download development packages.
+    subprocess.run(["make", "-C", str(SOURCE.parent),
+                    f"BUILD_DIR={stack_output}", "kernels"], check=True)
+    command = developer_command(output)
+    guest = Guest(command, output / "stack-console.log")
+    try:
+        guest.wait(rb"^GPGPU_DEVELOPER_READY$")
+        guest.send(
+            "mkdir -p /mnt/gpgpu-stack\n"
+            "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
+            "gpgpu_stack /mnt/gpgpu-stack\n"
+            "sh /mnt/gpgpu-src/guest-stack-test.sh "
+            "> /mnt/gpgpu-build/stack-test.log 2>&1\n"
+            "printf 'GPGPU_STACK_RC=%s\\n' \"$?\"\n"
+        )
+        result = guest.wait(rb"^GPGPU_STACK_RC=(\d+)$", timeout=600)
+        log = (output / "stack-test.log").read_text(errors="replace")
+        print(log, end="", flush=True)
+        if result.group(1) != b"0":
+            raise RuntimeError("Stack test failed; inspect stack-test.log")
+        for pattern in (r"GPGPU demos: 3/3 PASS",
+                        r"GPGPU runtime tests: (\d+)/(\d+) PASS",
+                        r"GPGPU unload/reload: 2/2 PASS"):
+            match = re.search(pattern, log)
+            if not match or (match.groups() and
+                             (match.group(1) != match.group(2) or
+                              int(match.group(1)) == 0)):
+                raise RuntimeError("Missing complete result in stack-test.log")
+        check_kernel_log(guest)
+        write_metadata(output / "stack-test.json", {
+            "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime()),
+            "kernel_release": (output / "kernel-release").read_text().strip(),
+            "module_sha256": sha256(output / "gpgpu_pci.ko"),
+            "demo_sha256": sha256(stack_output / "gpgpu-demo"),
+            "tests_sha256": sha256(stack_output / "test-runtime"),
+            "demo_passed": 3,
+            "runtime_tests_passed": int(re.search(
+                r"GPGPU runtime tests: (\d+)/\d+ PASS", log).group(1)),
+            "kernel_faults": 0,
+        })
     finally:
         guest.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "module", "test", "run"))
+    parser.add_argument("command", choices=("prepare", "module", "test", "run",
+                                            "stack-test"))
     parser.add_argument("--output-dir", type=Path,
                         default=ROOT / "build" / "gpgpu-linux-module")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true",
                         help="Test existing artifacts without rebuilding")
     args = parser.parse_args()
-    if args.skip_prepare and (args.command != "test" or args.force):
-        parser.error("--skip-prepare requires test without --force")
+    if args.skip_prepare and (args.command not in ("test", "stack-test")
+                              or args.force):
+        parser.error("--skip-prepare requires a test without --force")
     output = args.output_dir.resolve()
-    if args.command in ("prepare", "module", "test") and not args.skip_prepare:
+    if args.command == "run":
+        command = runtime_command(output, interactive=True)
+        os.execv(command[0], command)
+    else:
         output.mkdir(parents=True, exist_ok=True)
         with (output / ".build.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            prepare(output, args.force)
-    if args.command == "test":
-        test(output)
-    elif args.command == "run":
-        command = runtime_command(output, interactive=True)
-        os.execv(command[0], command)
+            if not args.skip_prepare:
+                prepare(output, args.force)
+            if args.command == "test":
+                test(output)
+            elif args.command == "stack-test":
+                stack_test(output)
 
 
 if __name__ == "__main__":
