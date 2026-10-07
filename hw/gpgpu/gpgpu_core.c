@@ -131,6 +131,52 @@ static float4_e2m1 gpgpu_core_float32_to_e2m1(float32 value,
     return sign | result;
 }
 
+/* CTRL 窗口供 GPU 线程访问，与 PCI BAR0 分开。 */
+static bool gpgpu_core_load_word(GPGPUState *s, GPGPUWarp *warp,
+                                 uint32_t lane_id, uint32_t addr,
+                                 uint32_t *value)
+{
+    uint32_t linear_thread = warp->thread_id_base + lane_id;
+
+    if (gpgpu_vram_word_valid(s, addr)) {
+        *value = ldl_le_p(s->vram_ptr + addr);
+        return true;
+    }
+
+    switch (addr) {
+    case GPGPU_CORE_CTRL_THREAD_ID_X:
+        *value = linear_thread % s->kernel.block_dim[0];
+        break;
+    case GPGPU_CORE_CTRL_THREAD_ID_Y:
+        *value = linear_thread / s->kernel.block_dim[0] %
+                 s->kernel.block_dim[1];
+        break;
+    case GPGPU_CORE_CTRL_THREAD_ID_Z:
+        *value = linear_thread / s->kernel.block_dim[0] /
+                 s->kernel.block_dim[1];
+        break;
+    case GPGPU_CORE_CTRL_BLOCK_ID_X:
+    case GPGPU_CORE_CTRL_BLOCK_ID_Y:
+    case GPGPU_CORE_CTRL_BLOCK_ID_Z:
+        *value = warp->block_id[(addr - GPGPU_CORE_CTRL_BLOCK_ID_X) / 4];
+        break;
+    case GPGPU_CORE_CTRL_BLOCK_DIM_X:
+    case GPGPU_CORE_CTRL_BLOCK_DIM_Y:
+    case GPGPU_CORE_CTRL_BLOCK_DIM_Z:
+        *value = s->kernel.block_dim[(addr - GPGPU_CORE_CTRL_BLOCK_DIM_X) / 4];
+        break;
+    case GPGPU_CORE_CTRL_GRID_DIM_X:
+    case GPGPU_CORE_CTRL_GRID_DIM_Y:
+    case GPGPU_CORE_CTRL_GRID_DIM_Z:
+        *value = s->kernel.grid_dim[(addr - GPGPU_CORE_CTRL_GRID_DIM_X) / 4];
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
 /* Initialize the active lanes and per-warp identity. */
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
@@ -180,8 +226,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 continue;
             }
 
-            if ((lane->pc & 3) || s->vram_size < 4 ||
-                lane->pc > s->vram_size - 4) {
+            if (!gpgpu_vram_word_valid(s, lane->pc)) {
                 return -1;
             }
 
@@ -269,27 +314,114 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 lane->pc += 4;
                 break;
 
-            case 0x33:  /* OP */
-                if (funct3 != 0 || funct7 != 0) {
+            case 0x33: {  /* ADD / SUB / MUL */
+                uint32_t value;
+
+                if (funct3 != 0) {
+                    return -1;
+                }
+                switch (funct7) {
+                case 0x00:
+                    value = lane->gpr[rs1] + lane->gpr[rs2];
+                    break;
+                case 0x20:
+                    value = lane->gpr[rs1] - lane->gpr[rs2];
+                    break;
+                case 0x01:
+                    /* 有无符号 MUL 的乘积低半部相同。 */
+                    value = lane->gpr[rs1] * lane->gpr[rs2];
+                    break;
+                default:
                     return -1;
                 }
                 if (rd != 0) {
-                    lane->gpr[rd] = lane->gpr[rs1] + lane->gpr[rs2];
+                    lane->gpr[rd] = value;
                 }
                 lane->pc += 4;
                 break;
+            }
+
+            case 0x03:  /* LW */
+            case 0x07: {  /* FLW */
+                int32_t offset = (int32_t)inst >> 20;
+                uint32_t addr = lane->gpr[rs1] + (uint32_t)offset;
+                uint32_t value;
+
+                if (funct3 != 2 ||
+                    !gpgpu_core_load_word(s, warp, lane_id, addr, &value)) {
+                    return -1;
+                }
+                if (opcode == 0x07) {
+                    lane->fpr[rd] = value;
+                } else if (rd != 0) {
+                    lane->gpr[rd] = value;
+                }
+                lane->pc += 4;
+                break;
+            }
+
+            case 0x63: {  /* 条件分支；每个 lane 保存各自的 PC。 */
+                uint32_t raw_imm = ((inst >> 31) << 12) |
+                                   (((inst >> 7) & 1) << 11) |
+                                   (((inst >> 25) & 0x3F) << 5) |
+                                   (((inst >> 8) & 0xF) << 1);
+                int32_t offset = (int32_t)(raw_imm << 19) >> 19;
+                uint32_t left = lane->gpr[rs1];
+                uint32_t right = lane->gpr[rs2];
+                bool taken;
+
+                switch (funct3) {
+                case 0:
+                    taken = left == right;
+                    break;
+                case 1:
+                    taken = left != right;
+                    break;
+                case 4:
+                    taken = (int32_t)left < (int32_t)right;
+                    break;
+                case 5:
+                    taken = (int32_t)left >= (int32_t)right;
+                    break;
+                case 6:
+                    taken = left < right;
+                    break;
+                case 7:
+                    taken = left >= right;
+                    break;
+                default:
+                    return -1;
+                }
+                lane->pc += taken ? (uint32_t)offset : 4;
+                break;
+            }
+
+            case 0x6F: {  /* JAL */
+                uint32_t raw_imm = ((inst >> 31) << 20) |
+                                   (((inst >> 12) & 0xFF) << 12) |
+                                   (((inst >> 20) & 1) << 11) |
+                                   (((inst >> 21) & 0x3FF) << 1);
+                int32_t offset = (int32_t)(raw_imm << 11) >> 11;
+
+                if (rd != 0) {
+                    lane->gpr[rd] = lane->pc + 4;
+                }
+                lane->pc += (uint32_t)offset;
+                break;
+            }
 
             case 0x23:  /* STORE */
+            case 0x27:  /* FSW */
                 switch (funct3) {
                 case 0x2: {  /* SW */
                     uint32_t raw_imm = (((inst >> 25) & 0x7F) << 5) |
                                        ((inst >> 7) & 0x1F);
                     int32_t offset = (int32_t)(raw_imm << 20) >> 20;
                     uint32_t addr = lane->gpr[rs1] + (uint32_t)offset;
-                    uint32_t value = lane->gpr[rs2];
+                    uint32_t value = opcode == 0x27 ? lane->fpr[rs2] :
+                                                     lane->gpr[rs2];
 
-                    if ((addr & 3) || s->vram_size < 4 ||
-                        addr > s->vram_size - 4) {
+                    if (!gpgpu_vram_word_valid(s, addr)) {
                         return -1;
                     }
                     stl_le_p(s->vram_ptr + addr, value);
@@ -437,29 +569,28 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 /* Execute the configured grid one block and warp at a time. */
 int gpgpu_core_exec_kernel(GPGPUState *s)
 {
-    const uint32_t max_blocks = 1U << MHARTID_BLOCK_BITS;
-    const uint32_t max_threads = GPGPU_WARP_SIZE * (1U << MHARTID_WARP_BITS);
     uint32_t block_count = 1;
     uint32_t threads_per_block = 1;
     uint32_t warp_count;
     uint32_t pc;
 
     /* 派发入口已检查地址对齐、VRAM 边界和维度非零。 */
-    if (s->kernel.kernel_addr > UINT32_MAX) {
-        return -1;
-    }
 
     /* Keep block and warp IDs within their mhartid fields. */
     for (size_t i = 0; i < 3; i++) {
         uint32_t grid_dim = s->kernel.grid_dim[i];
         uint32_t block_dim = s->kernel.block_dim[i];
 
-        if (grid_dim > max_blocks / block_count ||
-            block_dim > max_threads / threads_per_block) {
+        if (grid_dim > GPGPU_MAX_BLOCKS / block_count ||
+            block_dim > GPGPU_MAX_BLOCK_THREADS / threads_per_block) {
             return -1;
         }
         block_count *= grid_dim;
         threads_per_block *= block_dim;
+    }
+
+    if (block_count > GPGPU_MAX_TOTAL_THREADS / threads_per_block) {
+        return -1;
     }
 
     pc = (uint32_t)s->kernel.kernel_addr;
@@ -484,6 +615,9 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
                     gpgpu_core_init_warp(&warp, pc,
                                         thread_id_base, block_id,
                                         num_threads, warp_id, block_id_linear);
+                    for (uint32_t i = 0; i < num_threads; i++) {
+                        warp.lanes[i].gpr[10] = s->kernel.kernel_args;
+                    }
 
                     if (gpgpu_core_exec_warp(s, &warp, 100000) < 0) {
                         return -1;

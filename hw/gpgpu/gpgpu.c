@@ -11,6 +11,8 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "gpgpu.h"
+#include "qemu/host-utils.h"
+#include "gpgpu_core.h"
 
 /* PCI/QOM 生命周期与 BAR 注册；执行引擎由各自模块实现。 */
 
@@ -53,6 +55,14 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 {
     GPGPUState *s = GPGPU(pdev);
     uint8_t *pci_conf = pdev->config;
+
+    if (s->warp_size != GPGPU_WARP_SIZE || s->vram_size < 4096 ||
+        s->vram_size > GPGPU_CORE_CTRL_BASE ||
+        !is_power_of_2(s->vram_size)) {
+        error_setg(errp, "GPGPU: warp_size must be 32; vram_size must be a "
+                   "power of two between 4 KiB and 2 GiB");
+        return;
+    }
 
     pci_config_set_interrupt_pin(pci_conf, 1);
 
@@ -108,6 +118,7 @@ static void gpgpu_reset(DeviceState *dev)
     gpgpu_reset_state(s);
     /* 复位发生在 realize 成功之后，此时 VRAM 已分配。 */
     memset(s->vram_ptr, 0, s->vram_size);
+    gpgpu_irq_reset(s);
 }
 
 static const Property gpgpu_properties[] = {
@@ -123,6 +134,8 @@ static const Property gpgpu_properties[] = {
 
 static const VMStateDescription vmstate_gpgpu = {
     .name = "gpgpu",
+    /* 目前尚未迁移 VRAM 和执行中的操作。 */
+    .unmigratable = true,
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {

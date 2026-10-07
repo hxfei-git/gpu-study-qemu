@@ -28,6 +28,11 @@ typedef struct GPGPUState GPGPUState;
 #define GPGPU_NUM_REGS      32      /* RISC-V 通用寄存器数量 */
 #define GPGPU_NUM_FREGS     32      /* RISC-V 浮点寄存器数量 */
 
+/* 限制在 QEMU 主循环中同步执行的工作量。 */
+#define GPGPU_MAX_BLOCKS            4096
+#define GPGPU_MAX_BLOCK_THREADS     1024
+#define GPGPU_MAX_TOTAL_THREADS     65536
+
 /* 浮点 CSR 地址 */
 #define CSR_FFLAGS          0x001
 #define CSR_FRM             0x002

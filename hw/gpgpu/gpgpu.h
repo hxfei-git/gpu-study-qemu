@@ -36,10 +36,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
 /* 客体写入的启动描述符，由 gpgpu_dispatch_kernel() 读取。 */
 typedef struct GPGPUKernelParams {
     uint64_t kernel_addr;     /* VRAM 字节偏移，4 字节对齐。 */
-    uint64_t kernel_args;     /* 预留的参数块 VRAM 字节偏移。 */
+    uint64_t kernel_args;     /* VRAM 字节偏移，写入 a0。 */
     uint32_t grid_dim[3];     /* X/Y/Z 的 block 数，均非零。 */
     uint32_t block_dim[3];    /* block 的 X/Y/Z 线程数，均非零。 */
-    uint32_t shared_mem_size; /* 预留的每个 block 共享内存字节数。 */
+    uint32_t shared_mem_size; /* 每个 block 的字节数，只支持零。 */
 } GPGPUKernelParams;
 
 typedef struct GPGPUDMAState {
@@ -50,7 +50,7 @@ typedef struct GPGPUDMAState {
     uint64_t src_addr;
     uint64_t dst_addr;
     uint32_t size;             /* 客体写入的传输字节数。 */
-    GPGPUDMAControl ctrl;      /* 预留的 DMA_CTRL 标志。 */
+    GPGPUDMAControl ctrl;      /* DMA_CTRL 标志，START 位自动清除。 */
     GPGPUDMAStatus status;     /* 只读：IDLE/BUSY/COMPLETE/ERROR。 */
     QEMUTimer *timer;          /* DMA 模块的完成回调定时器。 */
 } GPGPUDMAState;
@@ -114,6 +114,7 @@ void gpgpu_raise_irq(GPGPUState *s, GPGPUIrq events);
 void gpgpu_set_error(GPGPUState *s, GPGPUError error);
 bool gpgpu_irq_init(GPGPUState *s, Error **errp);
 void gpgpu_irq_cleanup(GPGPUState *s);
+void gpgpu_irq_reset(GPGPUState *s);
 void gpgpu_irq_clear(GPGPUState *s);
 
 /* DMA 模块管理描述符、数据传输和完成定时器。 */
