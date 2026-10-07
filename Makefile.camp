@@ -2,10 +2,11 @@
 #
 # Usage: make -f Makefile.camp [target]
 #
-# All experiments are RISC-V based.
+# The foundation experiments are RISC-V based.
 #   - CPU experiment:  TCG testcase  (tests/gevico/tcg)    [softmmu]
 #   - SoC experiment:  QTest         (tests/gevico/qtest)  [softmmu]
 #   - GPGPU experiment: QTest        (tests/gevico/qtest)  [softmmu]
+#   - GPGPU software stack: driver/runtime in an ARM64 Linux guest
 #   - Rust experiment: QTest + unit  (tests/gevico/qtest)  [softmmu + rust]
 
 SHELL := bash -o pipefail
@@ -54,6 +55,7 @@ help:
 	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
 	@echo "  test-soc           Run SoC experiment tests (QTest)"
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
+	@echo "  test-gpgpu-stack   Run GPGPU Linux driver/runtime integration tests"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
 	@echo "  test-rust-qtest    Run Rust QTest tests only"
@@ -154,6 +156,12 @@ test-gpgpu: build
 	score=$$((passed * 100 / $(GPGPU_TOTAL))); \
 	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
 	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
+
+# ─── GPGPU software stack (real Linux PCI driver/runtime) ────────────
+
+.PHONY: test-gpgpu-stack
+test-gpgpu-stack:
+	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test
 
 # ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
 
