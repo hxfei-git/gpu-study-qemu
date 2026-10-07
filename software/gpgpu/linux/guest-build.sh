@@ -31,7 +31,7 @@ mkdir -p "$output_dir/apk-cache"
 # Resolve both packages from the same repository index. Old APK versions
 # are removed from mirrors, so do not pin only the development package.
 apk --cache-dir "$output_dir/apk-cache" add \
-    build-base linux-virt linux-virt-dev mkinitfs
+    build-base linux-virt linux-virt-dev mkinitfs e2fsprogs
 
 kernel_dir=
 for directory in /usr/src/linux-headers-*-virt; do
@@ -46,10 +46,8 @@ test -n "$kernel_dir"
 test -s "$kernel_dir/Module.symvers"
 kernel_release=${kernel_dir##*/linux-headers-}
 
-# Build on guest tmpfs to avoid host/guest timestamp skew over 9P.
-module_build=$(mktemp -d /tmp/gpgpu-module.XXXXXX)
-make -C "$source_dir" KDIR="$kernel_dir" BUILD_DIR="$module_build"
-cp "$module_build/gpgpu_pci.ko" "$runtime_dir/gpgpu_pci.ko"
+# The stable source and object directories are saved on the developer disk.
+sh "$source_dir/guest-compile.sh" "$1"
 cp /boot/vmlinuz-virt "$runtime_dir/vmlinuz-virt"
 cp "$kernel_dir/Module.symvers" "$runtime_dir/kernel-Module.symvers"
 cp "$kernel_dir/.config" "$runtime_dir/kernel-config"
@@ -58,7 +56,29 @@ printf '%s\n' 'kernel/fs/9p/*' 'kernel/net/9p/*' \
     > /etc/mkinitfs/features.d/gpgpu9p.modules
 mkinitfs -i "$source_dir/module-init.sh" -F 'base virtio gpgpu9p' \
     -o "$runtime_dir/initramfs-module" "$kernel_release"
+mkinitfs -i "$source_dir/developer-init.sh" \
+    -F 'base virtio ext4 gpgpu9p' \
+    -o "$runtime_dir/initramfs-developer" "$kernel_release"
 printf '%s\n' "$kernel_release" > "$runtime_dir/kernel-release"
 modinfo "$runtime_dir/gpgpu_pci.ko"
 apk info -v linux-virt linux-virt-dev > "$runtime_dir/kernel-packages"
+
+# /dev/vdb is the new, dedicated image attached by the prepare command.
+test -f "$runtime_dir/developer.raw"
+test -b /dev/vdb
+sectors=$(cat /sys/class/block/vdb/size)
+test "$((sectors * 512))" -eq "$(stat -c %s "$runtime_dir/developer.raw")"
+mkfs.ext4 -F /dev/vdb
+developer_root=/mnt/developer-root
+mkdir -p "$developer_root"
+mount -t ext4 /dev/vdb "$developer_root"
+cp -a /bin /sbin /lib /usr /etc /root /var "$developer_root/"
+mkdir -p "$developer_root/proc" "$developer_root/sys" \
+    "$developer_root/dev" "$developer_root/tmp" "$developer_root/run" \
+    "$developer_root/mnt/gpgpu-src" "$developer_root/mnt/gpgpu-build"
+chmod 1777 "$developer_root/tmp"
+cp "$source_dir/guest-dev-init.sh" \
+    "$developer_root/usr/sbin/gpgpu-dev-init"
+chmod 755 "$developer_root/usr/sbin/gpgpu-dev-init"
 sync
+umount "$developer_root"
