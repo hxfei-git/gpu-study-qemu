@@ -2,6 +2,7 @@
 
 ifneq ($(KERNELRELEASE),)
 obj-m := gpgpu_pci.o
+ccflags-y += -I$(src)/../include
 else
 KDIR ?= /lib/modules/$(shell uname -r)/build
 MODULE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
