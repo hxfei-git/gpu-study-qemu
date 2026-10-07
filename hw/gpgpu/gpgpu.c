@@ -11,6 +11,8 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "gpgpu.h"
+#include "qemu/host-utils.h"
+#include "gpgpu_core.h"
 
 /* PCI/QOM lifecycle and BAR registration. Engines live in separate modules. */
 
@@ -53,6 +55,14 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 {
     GPGPUState *s = GPGPU(pdev);
     uint8_t *pci_conf = pdev->config;
+
+    if (s->warp_size != GPGPU_WARP_SIZE || s->vram_size < 4096 ||
+        s->vram_size > GPGPU_CORE_CTRL_BASE ||
+        !is_power_of_2(s->vram_size)) {
+        error_setg(errp, "GPGPU: warp_size must be 32; vram_size must be a "
+                   "power of two between 4 KiB and 2 GiB");
+        return;
+    }
 
     pci_config_set_interrupt_pin(pci_conf, 1);
 
@@ -108,6 +118,7 @@ static void gpgpu_reset(DeviceState *dev)
     gpgpu_reset_state(s);
     /* Reset follows successful realize, so VRAM is already allocated. */
     memset(s->vram_ptr, 0, s->vram_size);
+    gpgpu_irq_reset(s);
 }
 
 static const Property gpgpu_properties[] = {
@@ -123,6 +134,8 @@ static const Property gpgpu_properties[] = {
 
 static const VMStateDescription vmstate_gpgpu = {
     .name = "gpgpu",
+    /* VRAM and in-flight operations are intentionally not migrated yet. */
+    .unmigratable = true,
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {

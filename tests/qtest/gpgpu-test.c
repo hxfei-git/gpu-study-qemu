@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "hw/pci/pci_regs.h"
 #include "libqtest.h"
 #include "libqos/qgraph.h"
 #include "libqos/pci.h"
@@ -73,6 +74,9 @@
 /* 内核地址寄存器 */
 #define GPGPU_REG_KERNEL_ADDR_LO    0x0300
 #define GPGPU_REG_KERNEL_ADDR_HI    0x0304
+#define GPGPU_REG_KERNEL_ARGS_LO    0x0308
+#define GPGPU_REG_KERNEL_ARGS_HI    0x030C
+#define GPGPU_REG_SHARED_MEM_SIZE   0x0328
 #define GPGPU_REG_DISPATCH          0x0330
 
 /* 寄存器位定义 */
@@ -83,6 +87,14 @@
 #define GPGPU_DMA_DIR_TO_VRAM       (0 << 1)
 #define GPGPU_DMA_DIR_FROM_VRAM     (1 << 1)
 #define GPGPU_DMA_COMPLETE          (1 << 1)
+#define GPGPU_DMA_BUSY              (1 << 0)
+#define GPGPU_DMA_ERROR             (1 << 2)
+#define GPGPU_DMA_IRQ_ENABLE        (1 << 2)
+#define GPGPU_IRQ_KERNEL_DONE       (1 << 0)
+#define GPGPU_IRQ_DMA_DONE          (1 << 1)
+#define GPGPU_IRQ_ERROR             (1 << 2)
+#define GPGPU_ERR_KERNEL_FAULT      (1 << 2)
+#define GPGPU_ERR_DMA_FAULT         (1 << 3)
 
 /* 设备标识值 */
 #define GPGPU_DEV_ID_VALUE          0x47505055  /* "GPPU" */
@@ -1027,6 +1039,263 @@ static void gpgpu_test_lp_convert_saturate(void *obj, void *data,
     qpci_iounmap(pdev, bar2);
 }
 
+static void gpgpu_test_program_dma(QPCIDevice *pdev, QPCIBar bar0,
+                                   uint64_t src, uint64_t dst,
+                                   uint32_t size, uint32_t ctrl)
+{
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SRC_LO, src);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SRC_HI, src >> 32);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_DST_LO, dst);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_DST_HI, dst >> 32);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_SIZE, size);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DMA_CTRL,
+                   ctrl | GPGPU_DMA_START | GPGPU_DMA_IRQ_ENABLE);
+}
+
+/* Exercise data movement, completion latency, and all DMA error boundaries. */
+static void gpgpu_test_dma_roundtrip(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    QPCIDevice *pdev = &((QGPGPU *)obj)->dev;
+    QTestState *qts = pdev->bus->qts;
+    uint8_t input[64], output[64] = {0};
+    uint64_t host = guest_alloc(alloc, sizeof(input));
+    QPCIBar bar0, bar2;
+    uint16_t command;
+
+    qpci_device_enable(pdev);
+    qpci_msix_enable(pdev);
+    bar0 = pdev->msix_table_bar;
+    bar2 = qpci_iomap(pdev, 2, NULL);
+    g_assert_cmpuint(qpci_msix_table_size(pdev), ==, 4);
+    g_assert_true(qpci_msix_masked(pdev, 1));
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_IRQ_ENABLE, 7);
+    for (size_t i = 0; i < sizeof(input); i++) {
+        input[i] = i * 3 + 1;
+    }
+    qtest_memwrite(qts, host, input, sizeof(input));
+    gpgpu_test_program_dma(pdev, bar0, host, 0x2000, sizeof(input), 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_BUSY);
+    g_assert_false(qpci_msix_pending(pdev, 1));
+    qtest_clock_step(qts, 1000000);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_COMPLETE);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_IRQ_STATUS), ==,
+                    GPGPU_IRQ_DMA_DONE);
+    g_assert_true(qpci_msix_pending(pdev, 1));
+    for (size_t i = 0; i < sizeof(input); i++) {
+        g_assert_cmphex(qpci_io_readb(pdev, bar2, 0x2000 + i), ==, input[i]);
+    }
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_IRQ_ACK, GPGPU_IRQ_DMA_DONE);
+    qtest_memwrite(qts, host, output, sizeof(output));
+    gpgpu_test_program_dma(pdev, bar0, 0x2000, host, sizeof(output),
+                           GPGPU_DMA_DIR_FROM_VRAM);
+    qtest_clock_step(qts, 1000000);
+    qtest_memread(qts, host, output, sizeof(output));
+    g_assert_cmpmem(output, sizeof(output), input, sizeof(input));
+
+    gpgpu_test_program_dma(pdev, bar0, host,
+                           GPGPU_DEFAULT_VRAM_SIZE - 4, 8, 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_ERROR);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS) &
+                    GPGPU_ERR_DMA_FAULT, ==, GPGPU_ERR_DMA_FAULT);
+    g_assert_true(qpci_msix_pending(pdev, 2));
+    gpgpu_test_program_dma(pdev, bar0, UINT64_MAX - 3, 0x2000, 8, 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_ERROR);
+    gpgpu_test_program_dma(pdev, bar0, host, 0x2000, 0, 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_ERROR);
+
+    command = qpci_config_readw(pdev, PCI_COMMAND);
+    qpci_config_writew(pdev, PCI_COMMAND, command & ~PCI_COMMAND_MASTER);
+    gpgpu_test_program_dma(pdev, bar0, host, 0x2000, sizeof(input), 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==,
+                    GPGPU_DMA_ERROR);
+    qpci_config_writew(pdev, PCI_COMMAND, command);
+
+    /* Reset cancels an in-flight completion and its interrupt. */
+    gpgpu_test_program_dma(pdev, bar0, host, 0x2000, sizeof(input), 0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
+    qtest_clock_step(qts, 1000000);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_DMA_STATUS), ==, 0);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_IRQ_STATUS), ==, 0);
+    guest_free(alloc, host);
+    qpci_msix_disable(pdev);
+}
+
+/* Store the linear 3D thread ID plus a counter from a backward loop. */
+static const uint32_t abi_kernel[] = {
+    0x800002B7,  /* lui t0, 0x80000 */
+    0x0002A303,  /* lw t1, 0(t0) */
+    0x0042A383,  /* lw t2, 4(t0) */
+    0x0082AE03,  /* lw t3, 8(t0) */
+    0x0202AE83,  /* lw t4, 32(t0) */
+    0x0242AF03,  /* lw t5, 36(t0) */
+    0x03EE0E33,  /* mul t3, t3, t5 */
+    0x007E0E33,  /* add t3, t3, t2 */
+    0x03DE0E33,  /* mul t3, t3, t4 */
+    0x006E0E33,  /* add t3, t3, t1 */
+    0x0102A303,  /* lw t1, 16(t0) */
+    0x0142A383,  /* lw t2, 20(t0) */
+    0x0302AE83,  /* lw t4, 48(t0) */
+    0x03D383B3,  /* mul t2, t2, t4 */
+    0x00730333,  /* add t1, t1, t2 */
+    0x00C00E93,  /* addi t4, zero, 12 */
+    0x03D30333,  /* mul t1, t1, t4 */
+    0x01C30333,  /* add t1, t1, t3 */
+    0x00052283,  /* lw t0, 0(a0) */
+    0x00231393,  /* slli t2, t1, 2 */
+    0x007282B3,  /* add t0, t0, t2 */
+    0x00000393,  /* addi t2, zero, 0 */
+    0x00300E13,  /* addi t3, zero, 3 */
+    0x00138393,  /* addi t2, t2, 1 */
+    0xFFC3CEE3,  /* blt t2, t3, -4 */
+    0x00730333,  /* add t1, t1, t2 */
+    0x0062A023,  /* sw t1, 0(t0) */
+    0x0080006F,  /* jal zero, 8 */
+    0x00000000,  /* illegal, must be skipped */
+    0x00100073,  /* ebreak */
+};
+
+static const uint32_t load_store_fp_kernel[] = {
+    0x00052283,  /* lw t0, 0(a0) */
+    0x00452303,  /* lw t1, 4(a0) */
+    0x00852383,  /* lw t2, 8(a0) */
+    0x80000E37,  /* lui t3, 0x80000 */
+    0x000E2E83,  /* lw t4, 0(t3) */
+    0x002E9E93,  /* slli t4, t4, 2 */
+    0x01D282B3,  /* add t0, t0, t4 */
+    0x01D30333,  /* add t1, t1, t4 */
+    0x01D383B3,  /* add t2, t2, t4 */
+    0x0002A007,  /* flw ft0, 0(t0) */
+    0x00032087,  /* flw ft1, 0(t1) */
+    0x00100153,  /* fadd.s ft2, ft0, ft1 */
+    0x0023A027,  /* fsw ft2, 0(t2) */
+    0x00100073,  /* ebreak */
+};
+
+static void gpgpu_test_upload_kernel(QPCIDevice *pdev, QPCIBar bar2,
+                                     const uint32_t *code, size_t words)
+{
+    for (size_t i = 0; i < words; i++) {
+        qpci_io_writel(pdev, bar2, i * 4, code[i]);
+    }
+}
+
+static void gpgpu_test_set_dims(QPCIDevice *pdev, QPCIBar bar0,
+                                uint32_t gx, uint32_t gy, uint32_t gz,
+                                uint32_t bx, uint32_t by, uint32_t bz)
+{
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, gx);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, gy);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, gz);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, bx);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, by);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, bz);
+}
+
+static void gpgpu_test_kernel_abi(void *obj, void *data,
+                                 QGuestAllocator *alloc)
+{
+    QPCIDevice *pdev = &((QGPGPU *)obj)->dev;
+    QPCIBar bar0, bar2;
+
+    qpci_device_enable(pdev);
+    qpci_msix_enable(pdev);
+    bar0 = pdev->msix_table_bar;
+    bar2 = qpci_iomap(pdev, 2, NULL);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_IRQ_ENABLE, 7);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO, 0x100);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO), ==,
+                    0x100);
+    qpci_io_writel(pdev, bar2, 0x100, 0x1000);
+    gpgpu_test_upload_kernel(pdev, bar2, abi_kernel, ARRAY_SIZE(abi_kernel));
+    gpgpu_test_set_dims(pdev, bar0, 2, 2, 1, 3, 2, 2);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), ==, 0);
+    g_assert_true(qpci_msix_pending(pdev, 0));
+    for (size_t i = 0; i < 48; i++) {
+        g_assert_cmpuint(qpci_io_readl(pdev, bar2, 0x1000 + i * 4), ==,
+                         i + 3);
+    }
+
+    /* The same argument ABI carries FP32 input and output pointers. */
+    qpci_io_writel(pdev, bar2, 0x100, 0x2000);
+    qpci_io_writel(pdev, bar2, 0x104, 0x3000);
+    qpci_io_writel(pdev, bar2, 0x108, 0x4000);
+    for (size_t i = 0; i < 8; i++) {
+        qpci_io_writel(pdev, bar2, 0x2000 + i * 4, 0xBFC00000); /* -1.5 */
+        qpci_io_writel(pdev, bar2, 0x3000 + i * 4, 0x40200000); /* 2.5 */
+    }
+    gpgpu_test_upload_kernel(pdev, bar2, load_store_fp_kernel,
+                             ARRAY_SIZE(load_store_fp_kernel));
+    gpgpu_test_set_dims(pdev, bar0, 1, 1, 1, 8, 1, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_IRQ_ACK, 7);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), ==, 0);
+    for (size_t i = 0; i < 8; i++) {
+        g_assert_cmphex(qpci_io_readl(pdev, bar2, 0x4000 + i * 4), ==,
+                        0x3F800000); /* 1.0 */
+    }
+    qpci_msix_disable(pdev);
+}
+
+static void gpgpu_test_kernel_faults(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    QPCIDevice *pdev = &((QGPGPU *)obj)->dev;
+    QPCIBar bar0, bar2;
+    const uint32_t bad_load[] = {
+        0x00052283, /* lw t0, 0(a0) */
+        0x0002A303, /* lw t1, 0(t0) */
+        0x00100073, /* ebreak */
+    };
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+    gpgpu_test_set_dims(pdev, bar0, 1, 1, 1, 1, 1, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_LO, 0x100);
+    qpci_io_writel(pdev, bar2, 0x100, GPGPU_DEFAULT_VRAM_SIZE);
+    gpgpu_test_upload_kernel(pdev, bar2, bad_load, ARRAY_SIZE(bad_load));
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), ==,
+                    GPGPU_ERR_KERNEL_FAULT);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_IRQ_STATUS), ==,
+                    GPGPU_IRQ_ERROR);
+
+    /* A backward self-jump must exhaust the global instruction budget. */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_ERROR_STATUS, UINT32_MAX);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_IRQ_ACK, UINT32_MAX);
+    qpci_io_writel(pdev, bar2, 0, 0x0000006F); /* jal zero, 0 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), ==,
+                    GPGPU_ERR_KERNEL_FAULT);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_ERROR_STATUS, UINT32_MAX);
+    qpci_io_writel(pdev, bar2, 0, 0x00100073);
+    gpgpu_test_set_dims(pdev, bar0, 1, 1, 1, 1025, 1, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), !=, 0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_ERROR_STATUS, UINT32_MAX);
+    gpgpu_test_set_dims(pdev, bar0, 1, 1, 1, 1, 1, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_HI, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), !=, 0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ARGS_HI, 0);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_ERROR_STATUS, UINT32_MAX);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_SHARED_MEM_SIZE, 4);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+    g_assert_cmphex(qpci_io_readl(pdev, bar0, GPGPU_REG_ERROR_STATUS), !=, 0);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -1069,6 +1338,9 @@ static void gpgpu_register_nodes(void)
                  gpgpu_test_lp_convert_e5m2_e2m1, NULL);
     qos_add_test("lp-convert-saturate", "gpgpu",
                  gpgpu_test_lp_convert_saturate, NULL);
+    qos_add_test("dma-roundtrip", "gpgpu", gpgpu_test_dma_roundtrip, NULL);
+    qos_add_test("kernel-abi", "gpgpu", gpgpu_test_kernel_abi, NULL);
+    qos_add_test("kernel-faults", "gpgpu", gpgpu_test_kernel_faults, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);

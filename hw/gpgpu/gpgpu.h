@@ -36,10 +36,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
 /* Guest-written launch descriptor, consumed by gpgpu_dispatch_kernel(). */
 typedef struct GPGPUKernelParams {
     uint64_t kernel_addr;     /* Code byte offset in VRAM; 4-byte aligned. */
-    uint64_t kernel_args;     /* Reserved Args byte offset in VRAM. */
+    uint64_t kernel_args;     /* Args byte offset in VRAM; loaded into a0. */
     uint32_t grid_dim[3];     /* Number of blocks in X/Y/Z; each nonzero. */
     uint32_t block_dim[3];    /* Threads per block in X/Y/Z; each nonzero. */
-    uint32_t shared_mem_size; /* Reserved shared-memory bytes per block. */
+    uint32_t shared_mem_size; /* Bytes per block; currently only zero works. */
 } GPGPUKernelParams;
 
 typedef struct GPGPUDMAState {
@@ -50,7 +50,7 @@ typedef struct GPGPUDMAState {
     uint64_t src_addr;
     uint64_t dst_addr;
     uint32_t size;             /* Guest-written transfer size in bytes. */
-    GPGPUDMAControl ctrl;      /* Reserved DMA_CTRL flags. */
+    GPGPUDMAControl ctrl;      /* DMA_CTRL flags, with START self-clearing. */
     GPGPUDMAStatus status;     /* Read-only IDLE/BUSY/COMPLETE/ERROR. */
     QEMUTimer *timer;          /* Completion callback; owned by DMA module. */
 } GPGPUDMAState;
@@ -114,6 +114,7 @@ void gpgpu_raise_irq(GPGPUState *s, GPGPUIrq events);
 void gpgpu_set_error(GPGPUState *s, GPGPUError error);
 bool gpgpu_irq_init(GPGPUState *s, Error **errp);
 void gpgpu_irq_cleanup(GPGPUState *s);
+void gpgpu_irq_reset(GPGPUState *s);
 void gpgpu_irq_clear(GPGPUState *s);
 
 /* DMA owns its descriptor, transfer and completion timer. */
