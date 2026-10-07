@@ -69,3 +69,29 @@ paths relative to the repository root:
 - `../QEMU_2026_GPGPU_适配.html`
 - `../QEMU_2026_实验.html`
 - `../QEMU_2026_讲义.html`
+
+If the `00_QEMU` outline is absent, use `../QEMU GPGPU 实验大纲.md`.
+
+## Current GPGPU Experiment
+
+Advanced experiment one is complete on branch `hxfei-qemu`. The stage-one
+software stack lives in `software/gpgpu/`: a Linux PCI driver, libgpgpu,
+RV32 assembly kernels and frontend, three FP32 demos, and guest integration
+tests. Read `software/gpgpu/README.md` and `WORK_ITEMS.md` before changing
+its interfaces. The current ABI is `software/gpgpu/include/gpgpu_uapi.h`.
+
+Run `make -f Makefile.camp test-gpgpu-stack` for the ARM64 Linux driver and
+runtime tests. First use bootstraps Alpine; later builds reuse the compiler
+disk under `build/gpgpu-linux-module/`. Run
+`make -C software/gpgpu check-assembler` for frontend encoding tests.
+
+Stage-one validation on 2026-10-07 passed three demos (17,953 output values),
+68 driver/runtime checks and 21 GPGPU QTests on both RISC-V and ARM64 virt.
+The 21 tests include the 17 scoring tests and four regressions. Inspect test
+counts and logs; do not infer success from the scoring wrapper exit status.
+
+The device uses exclusive sessions and synchronous calls. Device pointers
+are VRAM offsets; mmap maps the 64 KiB coherent DMA staging buffer.
+Shared memory/barriers, CP queues, async streams and GPU address isolation
+are future work. The interpreter supports BF16, FP8 and FP4 conversions;
+it does not implement FP16 conversion. Migration is explicitly disabled.
