@@ -46,8 +46,8 @@ test -n "$kernel_dir"
 test -s "$kernel_dir/Module.symvers"
 kernel_release=${kernel_dir##*/linux-headers-}
 
-# The stable source and object directories are saved on the developer disk.
-sh "$source_dir/guest-compile.sh" "$1"
+# 构建实验模块之前，先保存编译环境。
+# 驱动编译失败时也须保留已安装的内核头文件。
 cp /boot/vmlinuz-virt "$runtime_dir/vmlinuz-virt"
 cp "$kernel_dir/Module.symvers" "$runtime_dir/kernel-Module.symvers"
 cp "$kernel_dir/.config" "$runtime_dir/kernel-config"
@@ -60,7 +60,6 @@ mkinitfs -i "$source_dir/developer-init.sh" \
     -F 'base virtio ext4 gpgpu9p' \
     -o "$runtime_dir/initramfs-developer" "$kernel_release"
 printf '%s\n' "$kernel_release" > "$runtime_dir/kernel-release"
-modinfo "$runtime_dir/gpgpu_pci.ko"
 apk info -v linux-virt linux-virt-dev > "$runtime_dir/kernel-packages"
 
 # /dev/vdb is the new, dedicated image attached by the prepare command.

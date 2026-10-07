@@ -15,18 +15,26 @@ esac
 output_dir="/mnt/gpgpu-build/$stage_name"
 test -d "$output_dir"
 shared_source=/mnt/gpgpu-src
+shared_stack=/mnt/gpgpu-stack
+if ! test -d "$shared_stack/include"; then
+    mkdir -p "$shared_stack"
+    mount -t 9p -o trans=virtio,version=9p2000.L,ro \
+        gpgpu_stack "$shared_stack"
+fi
 module_source=/root/gpgpu-module-src
 module_build=/root/gpgpu-module-build
 object_file="$module_build/gpgpu_pci.o"
 mkdir -p "$module_source" "$module_build"
 
 changed_files=0
-for name in Makefile gpgpu_pci.c gpgpu_regs.h; do
-    if cmp -s "$shared_source/$name" "$module_source/$name"; then
+for source_file in "$shared_source/Makefile" "$shared_source/gpgpu_pci.c" \
+    "$shared_source/gpgpu_regs.h" "$shared_stack/include/gpgpu_uapi.h"; do
+    destination="$module_source/${source_file##*/}"
+    if cmp -s "$source_file" "$destination"; then
         continue
     fi
     # Use guest timestamps; retain existing timestamps for unchanged content.
-    cp "$shared_source/$name" "$module_source/$name"
+    cp "$source_file" "$destination"
     changed_files=$((changed_files + 1))
 done
 printf 'GPGPU_SOURCE_CHANGED=%s\n' "$changed_files"
