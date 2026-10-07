@@ -28,6 +28,12 @@ typedef struct GPGPUState GPGPUState;
 #define GPGPU_NUM_REGS      32      /* RISC-V 通用寄存器数量 */
 #define GPGPU_NUM_FREGS     32      /* RISC-V 浮点寄存器数量 */
 
+/* Bound work performed synchronously while holding QEMU's main loop. */
+#define GPGPU_MAX_BLOCKS            4096
+#define GPGPU_MAX_BLOCK_THREADS     1024
+#define GPGPU_MAX_TOTAL_THREADS     65536
+#define GPGPU_MAX_KERNEL_INSNS      (8 * 1024 * 1024)
+
 /* 浮点 CSR 地址 */
 #define CSR_FFLAGS          0x001
 #define CSR_FRM             0x002
@@ -133,11 +139,12 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
  * gpgpu_core_exec_warp - 执行一个 warp 直到完成
  * @s: GPGPU 设备状态
  * @warp: warp 状态指针
- * @max_cycles: 最大执行周期数（防止死循环）
+ * @insn_budget: remaining lane instructions for the entire launch
  *
  * 返回: 0 成功，-1 错误（如非法指令）
  */
-int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles);
+int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp,
+                         uint32_t *insn_budget);
 
 /**
  * gpgpu_core_exec_kernel - 执行完整的 kernel

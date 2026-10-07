@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qemu/module.h"
@@ -23,6 +24,41 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
+static void gpgpu_update_irq(GPGPUState *s, uint32_t events)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    uint32_t pending = s->irq_status & s->irq_enable;
+
+    events &= pending;
+    pci_set_irq(pdev, pending && !msix_enabled(pdev) && !msi_enabled(pdev));
+    if (msix_enabled(pdev)) {
+        if (events & GPGPU_IRQ_KERNEL_DONE) {
+            msix_notify(pdev, GPGPU_MSIX_VEC_KERNEL);
+        }
+        if (events & GPGPU_IRQ_DMA_DONE) {
+            msix_notify(pdev, GPGPU_MSIX_VEC_DMA);
+        }
+        if (events & GPGPU_IRQ_ERROR) {
+            msix_notify(pdev, GPGPU_MSIX_VEC_ERROR);
+        }
+    } else if (msi_enabled(pdev) && events) {
+        msi_notify(pdev, 0);
+    }
+}
+
+static void gpgpu_raise_irq(GPGPUState *s, uint32_t events)
+{
+    s->irq_status |= events;
+    gpgpu_update_irq(s, events);
+}
+
+static void gpgpu_set_error(GPGPUState *s, uint32_t error)
+{
+    s->error_status |= error;
+    s->global_status |= GPGPU_STATUS_ERROR;
+    gpgpu_raise_irq(s, GPGPU_IRQ_ERROR);
+}
+
 static void gpgpu_reset_state(GPGPUState *s)
 {
     s->global_ctrl = 0;
@@ -34,7 +70,7 @@ static void gpgpu_reset_state(GPGPUState *s)
     memset(&s->dma, 0, sizeof(s->dma));
     memset(&s->simt, 0, sizeof(s->simt));
     timer_del(s->dma_timer);
-    timer_del(s->kernel_timer);
+    pci_set_irq(PCI_DEVICE(s), 0);
 }
 
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
@@ -70,6 +106,10 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)s->kernel.kernel_addr;
     case GPGPU_REG_KERNEL_ADDR_HI:
         return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        return (uint32_t)s->kernel.kernel_args;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        return (uint32_t)(s->kernel.kernel_args >> 32);
     case GPGPU_REG_GRID_DIM_X:
         return s->kernel.grid_dim[0];
     case GPGPU_REG_GRID_DIM_Y:
@@ -82,6 +122,8 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->kernel.block_dim[1];
     case GPGPU_REG_BLOCK_DIM_Z:
         return s->kernel.block_dim[2];
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        return s->kernel.shared_mem_size;
     case GPGPU_REG_DMA_SRC_LO:
         return (uint32_t)s->dma.src_addr;
     case GPGPU_REG_DMA_SRC_HI:
@@ -92,6 +134,10 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)(s->dma.dst_addr >> 32);
     case GPGPU_REG_DMA_SIZE:
         return s->dma.size;
+    case GPGPU_REG_DMA_CTRL:
+        return s->dma.ctrl;
+    case GPGPU_REG_DMA_STATUS:
+        return s->dma.status;
     case GPGPU_REG_THREAD_ID_X:
         return s->simt.thread_id[0];
     case GPGPU_REG_THREAD_ID_Y:
@@ -124,11 +170,13 @@ static void gpgpu_dispatch_kernel(GPGPUState *s)
         !s->kernel.grid_dim[0] || !s->kernel.grid_dim[1] ||
         !s->kernel.grid_dim[2] || !s->kernel.block_dim[0] ||
         !s->kernel.block_dim[1] || !s->kernel.block_dim[2] ||
+        s->kernel.shared_mem_size ||
         (s->kernel.kernel_addr & 3) ||
+        (s->kernel.kernel_args & 3) ||
         s->vram_size < sizeof(uint32_t) ||
-        s->kernel.kernel_addr > s->vram_size - sizeof(uint32_t)) {
-        s->error_status |= GPGPU_ERR_INVALID_CMD;
-        s->global_status |= GPGPU_STATUS_ERROR;
+        s->kernel.kernel_addr > s->vram_size - sizeof(uint32_t) ||
+        s->kernel.kernel_args > s->vram_size - sizeof(uint32_t)) {
+        gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
         return;
     }
 
@@ -138,11 +186,59 @@ static void gpgpu_dispatch_kernel(GPGPUState *s)
     s->global_status |= GPGPU_STATUS_READY;
 
     if (ret < 0) {
-        s->error_status |= GPGPU_ERR_KERNEL_FAULT;
-        s->global_status |= GPGPU_STATUS_ERROR;
+        gpgpu_set_error(s, GPGPU_ERR_KERNEL_FAULT);
     } else {
-        s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+        gpgpu_raise_irq(s, GPGPU_IRQ_KERNEL_DONE);
     }
+}
+
+static void gpgpu_start_dma(GPGPUState *s, uint32_t ctrl)
+{
+    uint64_t vram_addr;
+    uint64_t host_addr;
+    MemTxResult result;
+
+    if (s->dma.status & GPGPU_DMA_BUSY) {
+        gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+        return;
+    }
+
+    s->dma.ctrl = ctrl & (GPGPU_DMA_START | GPGPU_DMA_DIR_FROM_VRAM |
+                          GPGPU_DMA_IRQ_ENABLE);
+    if (!(ctrl & GPGPU_DMA_START)) {
+        return;
+    }
+    s->dma.ctrl &= ~GPGPU_DMA_START;
+    vram_addr = ctrl & GPGPU_DMA_DIR_FROM_VRAM ? s->dma.src_addr :
+                                               s->dma.dst_addr;
+    host_addr = ctrl & GPGPU_DMA_DIR_FROM_VRAM ? s->dma.dst_addr :
+                                               s->dma.src_addr;
+
+    if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) || !s->dma.size ||
+        vram_addr >= s->vram_size ||
+        s->dma.size > s->vram_size - vram_addr ||
+        host_addr > UINT64_MAX - (s->dma.size - 1)) {
+        s->dma.status = GPGPU_DMA_ERROR;
+        gpgpu_set_error(s, GPGPU_ERR_DMA_FAULT);
+        return;
+    }
+
+    s->dma.status = GPGPU_DMA_BUSY;
+    if (ctrl & GPGPU_DMA_DIR_FROM_VRAM) {
+        result = pci_dma_write(PCI_DEVICE(s), host_addr,
+                               s->vram_ptr + vram_addr, s->dma.size);
+    } else {
+        result = pci_dma_read(PCI_DEVICE(s), host_addr,
+                              s->vram_ptr + vram_addr, s->dma.size);
+    }
+    if (result != MEMTX_OK) {
+        s->dma.status = GPGPU_DMA_ERROR;
+        gpgpu_set_error(s, GPGPU_ERR_DMA_FAULT);
+        return;
+    }
+
+    /* Data moves now; the completion event has a fixed 1 ms latency. */
+    timer_mod(s->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
 
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
@@ -151,6 +247,12 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
     GPGPUState *s = opaque;
 
     (void)size;
+
+    if (addr >= GPGPU_REG_DMA_SRC_LO && addr <= GPGPU_REG_DMA_SIZE &&
+        (s->dma.status & GPGPU_DMA_BUSY)) {
+        gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+        return;
+    }
 
     switch (addr) {
     case GPGPU_REG_GLOBAL_CTRL:
@@ -166,13 +268,18 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->global_status &= ~GPGPU_STATUS_ERROR;
         }
         break;
-    case GPGPU_REG_IRQ_ENABLE:
+    case GPGPU_REG_IRQ_ENABLE: {
+        uint32_t old = s->irq_enable;
+
         s->irq_enable = val & (GPGPU_IRQ_KERNEL_DONE |
                               GPGPU_IRQ_DMA_DONE |
                               GPGPU_IRQ_ERROR);
+        gpgpu_update_irq(s, s->irq_enable & ~old);
         break;
+    }
     case GPGPU_REG_IRQ_ACK:
         s->irq_status &= ~(uint32_t)val;
+        gpgpu_update_irq(s, 0);
         break;
     case GPGPU_REG_KERNEL_ADDR_LO:
         s->kernel.kernel_addr =
@@ -180,6 +287,14 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_KERNEL_ADDR_HI:
         s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xffffffffULL) |
+                               ((uint64_t)(uint32_t)val << 32);
+        break;
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        s->kernel.kernel_args =
+            (s->kernel.kernel_args & 0xffffffff00000000ULL) | (uint32_t)val;
+        break;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xffffffffULL) |
                                ((uint64_t)(uint32_t)val << 32);
         break;
     case GPGPU_REG_GRID_DIM_X:
@@ -200,6 +315,9 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
     case GPGPU_REG_BLOCK_DIM_Z:
         s->kernel.block_dim[2] = (uint32_t)val;
         break;
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        s->kernel.shared_mem_size = val;
+        break;
     case GPGPU_REG_DMA_SRC_LO:
         s->dma.src_addr = (s->dma.src_addr & 0xffffffff00000000ULL) |
                          (uint32_t)val;
@@ -218,6 +336,9 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPGPU_REG_DMA_SIZE:
         s->dma.size = (uint32_t)val;
+        break;
+    case GPGPU_REG_DMA_CTRL:
+        gpgpu_start_dma(s, val);
         break;
     case GPGPU_REG_THREAD_ID_X:
         s->simt.thread_id[0] = (uint32_t)val;
@@ -258,6 +379,10 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
     .read = gpgpu_ctrl_read,
     .write = gpgpu_ctrl_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
     .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -269,8 +394,7 @@ static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
     GPGPUState *s = opaque;
 
     if (addr >= s->vram_size || size > s->vram_size - addr) {
-        s->error_status |= GPGPU_ERR_VRAM_FAULT;
-        s->global_status |= GPGPU_STATUS_ERROR;
+        gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
         return 0;
     }
 
@@ -283,8 +407,7 @@ static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
     GPGPUState *s = opaque;
 
     if (addr >= s->vram_size || size > s->vram_size - addr) {
-        s->error_status |= GPGPU_ERR_VRAM_FAULT;
-        s->global_status |= GPGPU_STATUS_ERROR;
+        gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
         return;
     }
 
@@ -328,22 +451,28 @@ static const MemoryRegionOps gpgpu_doorbell_ops = {
     },
 };
 
-/* TODO: Implement DMA completion handler */
 static void gpgpu_dma_complete(void *opaque)
 {
-    (void)opaque;
-}
+    GPGPUState *s = opaque;
 
-/* TODO: Implement kernel completion handler */
-static void gpgpu_kernel_complete(void *opaque)
-{
-    (void)opaque;
+    s->dma.status = GPGPU_DMA_COMPLETE;
+    if (s->dma.ctrl & GPGPU_DMA_IRQ_ENABLE) {
+        gpgpu_raise_irq(s, GPGPU_IRQ_DMA_DONE);
+    }
 }
 
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 {
     GPGPUState *s = GPGPU(pdev);
     uint8_t *pci_conf = pdev->config;
+
+    if (s->warp_size != GPGPU_WARP_SIZE || s->vram_size < 4096 ||
+        s->vram_size > GPGPU_CORE_CTRL_BASE ||
+        !is_power_of_2(s->vram_size)) {
+        error_setg(errp, "GPGPU: warp_size must be 32; vram_size must be a "
+                   "power of two between 4 KiB and 2 GiB");
+        return;
+    }
 
     pci_config_set_interrupt_pin(pci_conf, 1);
 
@@ -385,11 +514,16 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
         return;
     }
 
-    msi_init(pdev, 0, 1, true, false, errp);
+    if (msi_init(pdev, 0, 1, true, false, errp)) {
+        msix_uninit(pdev, &s->ctrl_mmio, &s->ctrl_mmio);
+        g_free(s->vram_ptr);
+        return;
+    }
+    for (unsigned int i = 0; i < GPGPU_MSIX_VECTORS; i++) {
+        msix_vector_use(pdev, i);
+    }
 
     s->dma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, gpgpu_dma_complete, s);
-    s->kernel_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                   gpgpu_kernel_complete, s);
 
     s->global_status = GPGPU_STATUS_READY;
 }
@@ -399,7 +533,6 @@ static void gpgpu_exit(PCIDevice *pdev)
     GPGPUState *s = GPGPU(pdev);
 
     timer_free(s->dma_timer);
-    timer_free(s->kernel_timer);
     g_free(s->vram_ptr);
     msix_uninit(pdev, &s->ctrl_mmio, &s->ctrl_mmio);
     msi_uninit(pdev);
@@ -413,6 +546,8 @@ static void gpgpu_reset(DeviceState *dev)
     if (s->vram_ptr) {
         memset(s->vram_ptr, 0, s->vram_size);
     }
+    msix_reset(PCI_DEVICE(s));
+    msi_reset(PCI_DEVICE(s));
 }
 
 static const Property gpgpu_properties[] = {
@@ -428,6 +563,8 @@ static const Property gpgpu_properties[] = {
 
 static const VMStateDescription vmstate_gpgpu = {
     .name = "gpgpu",
+    /* VRAM and in-flight operations are intentionally not migrated yet. */
+    .unmigratable = true,
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {

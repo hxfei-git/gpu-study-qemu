@@ -273,9 +273,6 @@ struct GPGPUState {
     GPGPUDMAState dma;              /* DMA 状态 */
     QEMUTimer *dma_timer;           /* DMA 完成定时器 (模拟传输延迟) */
 
-    /*-- 内核执行状态 (用于模拟) --*/
-    QEMUTimer *kernel_timer;        /* 内核执行完成定时器 */
-
     /*-- SIMT 执行上下文 (CTRL 设备) --*/
     GPGPUSIMTContext simt;          /* 当前线程的执行上下文 */
 };
