@@ -143,6 +143,10 @@ const MemoryRegionOps gpgpu_ctrl_ops = {
     .read = gpgpu_ctrl_read,
     .write = gpgpu_ctrl_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
     .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
