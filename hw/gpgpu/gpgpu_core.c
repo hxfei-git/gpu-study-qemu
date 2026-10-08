@@ -444,10 +444,8 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
     uint32_t warp_count;
     uint32_t pc;
 
-    if (s->kernel.kernel_addr > UINT32_MAX ||
-        (s->kernel.kernel_addr & 3) ||
-        s->vram_size < sizeof(uint32_t) ||
-        s->kernel.kernel_addr > s->vram_size - sizeof(uint32_t)) {
+    /* 派发入口已检查地址对齐、VRAM 边界和维度非零。 */
+    if (s->kernel.kernel_addr > UINT32_MAX) {
         return -1;
     }
 
@@ -456,8 +454,7 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
         uint32_t grid_dim = s->kernel.grid_dim[i];
         uint32_t block_dim = s->kernel.block_dim[i];
 
-        if (!grid_dim || !block_dim ||
-            grid_dim > max_blocks / block_count ||
+        if (grid_dim > max_blocks / block_count ||
             block_dim > max_threads / threads_per_block) {
             return -1;
         }

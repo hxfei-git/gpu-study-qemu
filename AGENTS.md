@@ -1,69 +1,74 @@
-# Repository Guidelines
+# 仓库约束
 
-## Project Structure & Module Organization
+## 项目结构与模块划分
 
-QEMU Camp 2026 contains RISC-V CPU, SoC, GPGPU, and Rust experiments.
-Instruction emulation lives in `target/riscv/`; the G233 board is
-`hw/riscv/g233.c`, with device models under `hw/` and headers under `include/`.
-GPGPU: `hw/gpgpu/`; Rust devices: `rust/hw/`.
+QEMU Camp 2026 包含 RISC-V CPU、SoC、GPGPU 和 Rust 实验。
+指令模拟位于 `target/riscv/`，G233 板级实现为 `hw/riscv/g233.c`，
+设备模型位于 `hw/`，头文件位于 `include/`。
+GPGPU 实现在 `hw/gpgpu/`，Rust 设备实现在 `rust/hw/`。
 
-Camp tests live in `tests/gevico/tcg/` and `tests/gevico/qtest/`; GPGPU tests
-are in `tests/qtest/gpgpu-test.c`. Other tests include `tests/unit/`
-and `tests/functional/`. Read `README.md`, `README_zh.md`, and `docs/devel/`
-for setup and internals. Firmware lives in `pc-bios/`; build output belongs in `build/`.
+实验测试位于 `tests/gevico/tcg/` 和 `tests/gevico/qtest/`；
+GPGPU 测试位于 `tests/qtest/gpgpu-test.c`。
+其他测试位于 `tests/unit/` 和 `tests/functional/`。
+构建与内部实现说明见 `README.md`、`README_zh.md` 和 `docs/devel/`。
+固件位于 `pc-bios/`，构建产物统一放在 `build/`。
 
-## Build, Test, and Development Commands
+## 构建、测试与开发命令
 
-Run from the repository root. Install QEMU build dependencies, a RISC-V
-bare-metal compiler (`riscv64-unknown-elf-gcc`), Rust, and `bindgen-cli`
-following `README.md`.
+在仓库根目录运行命令。按 `README.md` 安装 QEMU 构建依赖、
+RISC-V 裸机编译器 `riscv64-unknown-elf-gcc`、Rust 和 `bindgen-cli`。
 
-- `make -f Makefile.camp configure`: configure RISC-V system/user emulation
-  and Rust support in `build/`.
-- `make -f Makefile.camp build JOBS=4`: compile using four parallel jobs.
-- `make -f Makefile.camp test-cpu`: run instruction tests through TCG.
-- `make -f Makefile.camp test-soc`: run G233 peripheral QTests.
-- `make -f Makefile.camp test-gpgpu`: run GPGPU QOS subtests.
-- `make -f Makefile.camp test-rust`: run Rust unit and device QTests.
-- `make -f Makefile.camp test`: run all camp suites.
-- `build/qemu-system-riscv64 -machine help`: list available machines.
+- `make -f Makefile.camp configure`：在 `build/` 配置 RISC-V 系统和用户态模拟及 Rust 支持。
+- `make -f Makefile.camp build JOBS=4`：使用四个并行任务编译。
+- `make -f Makefile.camp test-cpu`：通过 TCG 运行指令测试。
+- `make -f Makefile.camp test-soc`：运行 G233 外设 QTest。
+- `make -f Makefile.camp test-gpgpu`：运行 GPGPU QOS 子测试。
+- `make -f Makefile.camp test-rust`：运行 Rust 单元和设备测试。
+- `make -f Makefile.camp test`：运行全部实验测试。
+- `build/qemu-system-riscv64 -machine help`：列出可用机器类型。
 
-## Coding Style & Naming Conventions
+## 代码修改与语言约束
 
-Follow `.editorconfig` and `docs/devel/style.rst`: four-space C indentation,
-tabs for Makefile recipes, LF endings, and lines preferably within 80 columns.
-Use `snake_case` functions/variables, `CamelCase` types, and uppercase macros.
-Include `qemu/osdep.h` first in C sources. Check the latest commit with
-`scripts/checkpatch.pl --branch HEAD^..HEAD`. Format Rust with
-`make -C build rustfmt` (nightly rustfmt); follow `docs/devel/rust.rst` for
-Clippy through Meson's development environment.
+修改代码时，尽量缩小影响范围和改动量，沿用现有架构、模块职责、接口和执行模型。
+只修改完成当前任务必需的内容，不顺手重构、移动代码或改名；
+必须调整架构或接口时，先说明原因和必要范围。
 
-## Testing Guidelines
+与用户的交互、代码注释、文档说明以及提交标题和正文均使用中文。
+技术术语可保留通用英文写法；标识符、路径、命令、协议字段、汇编助记符、
+机器读取的标记和许可证声明保留原文，不因中文化改变其含义或行为。
 
-Use TCG bare-metal tests, GLib-based QTest/QOS tests, and native Rust unit
-tests. Name instruction tests `test-insn-*.c`, peripheral tests `test-*.c`,
-and Rust test functions `test_*`. Register new tests in the relevant Meson
-or Makefile lists. Cover changed behavior and regression cases; no camp
-coverage percentage is specified. Run the affected suite and inspect pass
-counts and logs: scoring wrappers and CI can succeed despite failed tests.
+## 代码风格与命名
 
-## Commit & Pull Request Guidelines
+遵循 `.editorconfig` 和 `docs/devel/style.rst`：C 使用四个空格缩进，
+Makefile 配方使用制表符，文件使用 LF 换行，每行尽量不超过 80 列。
+函数和变量使用 `snake_case`，类型使用 `CamelCase`，宏使用大写。
+C 源文件首先包含 `qemu/osdep.h`。
+用 `scripts/checkpatch.pl --branch HEAD^..HEAD` 检查最新提交。
+Rust 格式检查使用 `make -C build rustfmt`，需要 nightly rustfmt；
+Clippy 的 Meson 开发环境配置见 `docs/devel/rust.rst`。
 
-History mixes plain summaries with `ci:` and `tests/gevico:` prefixes.
-Prefer `subsystem: imperative summary`, such as `tests/gevico: fix SPI chip select`.
-Explain why; add `Signed-off-by` for upstream submissions.
-PRs should describe behavior, link relevant issues,
-and report test commands and pass counts. Camp CI runs on eligible pushes
-to `main`; verify locally before requesting review.
+## 测试要求
 
-## Agent-Specific Instructions
+使用 TCG 裸机测试、基于 GLib 的 QTest/QOS 测试和原生 Rust 单元测试。
+指令测试命名为 `test-insn-*.c`，外设测试命名为 `test-*.c`，
+Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 Makefile 列表。
+覆盖修改的行为和回归场景；实验未规定覆盖率百分比。
+运行受影响的测试集，并核对通过数量和日志：评分脚本与 CI 可能在有失败项时仍返回成功。
 
-Explain concepts in prose. Avoid comparison tables, especially
-responsibility tables or field mappings that replace conceptual explanations.
+## 提交与拉取请求要求
 
-When explaining QEMU concepts or working on camp exercises, consult the
-reference materials in the repository's parent directory. Resolve these
-paths relative to the repository root:
+已有历史包含普通描述及 `ci:`、`tests/gevico:` 等前缀。
+后续提交标题优先采用“子系统：具体修改”的中文形式，例如“测试：修复 SPI 片选”。
+正文解释修改原因；向上游提交时添加 `Signed-off-by`。
+拉取请求说明修改行为，关联问题，并列出测试命令和通过数量。
+符合条件的 `main` 分支推送会触发实验 CI；请求审阅前先完成本地验证。
+
+## 智能体交互要求
+
+用连贯文字解释概念。避免用对比表，尤其不要以职责表或字段映射表代替概念说明。
+
+解释 QEMU 概念或修改实验代码时，查阅父目录中的参考材料。
+以下路径相对于仓库根目录：
 
 - `../00_QEMU GPGPU 四阶段实验大纲.md`
 - `../QEMU_2026_GPGPU_适配.html`
