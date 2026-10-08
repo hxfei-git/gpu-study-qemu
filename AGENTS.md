@@ -79,7 +79,8 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 
 ## 当前 GPGPU 实验
 
-进阶实验一已在 `hxfei-qemu` 分支完成。第一阶段软件栈位于 `software/gpgpu/`，
+进阶实验一已完成。`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支；
+`hxfei-qemu` 保留早期开发历史。第一阶段软件栈位于 `software/gpgpu/`，
 包含 Linux PCI 驱动、libgpgpu、RV32 汇编 kernel 和汇编前端、三个 FP32 示例及客体集成测试。
 修改接口前阅读 `software/gpgpu/README.md` 和 `WORK_ITEMS.md`。
 当前 ABI 位于 `software/gpgpu/include/gpgpu_uapi.h`。
