@@ -170,14 +170,34 @@ def bootstrap_images():
     return image
 
 
-def base_command(memory="512M", interactive=False):
-    command = [str(QEMU_BINARY), "-machine", "virt,gic-version=3",
+def base_command(memory="512M", interactive=False, iommu="none"):
+    machine = "virt,gic-version=3"
+    if iommu == "smmuv3":
+        machine += ",iommu=smmuv3,default-bus-bypass-iommu=off"
+    command = [str(QEMU_BINARY), "-machine", machine,
                "-cpu", "cortex-a57", "-accel", "tcg",
                "-m", memory, "-smp", "2"]
     if interactive:
         return command + ["-nographic"]
     return command + ["-display", "none", "-serial", "stdio",
                       "-monitor", "none"]
+
+
+def kernel_command_line(iommu):
+    command = "console=ttyAMA0"
+    if iommu == "smmuv3":
+        command += " iommu.passthrough=0 iommu.strict=1"
+    return command
+
+
+def check_iommu_kernel(output, iommu):
+    if iommu == "smmuv3":
+        config = (output / "kernel-config").read_text().splitlines()
+        for option in ("CONFIG_ARM_SMMU_V3", "CONFIG_IOMMU_SUPPORT",
+                       "CONFIG_IOMMU_DMA"):
+            # 最小运行 initramfs 不额外装载 SMMU 模块。
+            if f"{option}=y" not in config:
+                raise RuntimeError(f"客体内核缺少 {option}=y")
 
 
 def shared_directory(path, tag, readonly):
@@ -361,11 +381,12 @@ def compile_module(output, fingerprint, environment):
     print(f"Updated {output / 'gpgpu_pci.ko'}", flush=True)
 
 
-def developer_command(output):
-    command = base_command("1G") + [
+def developer_command(output, iommu="none"):
+    check_iommu_kernel(output, iommu)
+    command = base_command("1G", iommu=iommu) + [
         "-kernel", str(output / "vmlinuz-virt"),
         "-initrd", str(output / "initramfs-developer"),
-        "-append", "console=ttyAMA0",
+        "-append", kernel_command_line(iommu),
         "-drive", f"file={output / 'developer.raw'},if=none,id=developer,"
         "format=raw",
         "-device", "virtio-blk-pci,drive=developer",
@@ -397,20 +418,55 @@ def prepare(output, force, rebuild_module=False):
     compile_module(output, fingerprint, environment)
 
 
-def runtime_command(output, interactive=False):
+def runtime_command(output, interactive=False, iommu="none"):
     if not QEMU_BINARY.is_file() or not prepared_metadata(output):
         raise RuntimeError("Run 'make prepare' before booting the module")
-    command = base_command(interactive=interactive) + [
+    check_iommu_kernel(output, iommu)
+    command = base_command(interactive=interactive, iommu=iommu) + [
         "-kernel", str(output / "vmlinuz-virt"),
         "-initrd", str(output / "initramfs-module"),
-        "-append", "console=ttyAMA0", "-device", "gpgpu,bus=pcie.0",
+        "-append", kernel_command_line(iommu),
+        "-device", "gpgpu,bus=pcie.0",
     ]
     return (command + shared_directory(output, "gpgpu_module", True)
             + ["-nic", "none"])
 
 
-def test(output):
-    guest = Guest(runtime_command(output), output / "test-console.log")
+def check_iommu_domain(guest, iommu):
+    guest.send(
+        "for dev in /sys/bus/pci/devices/*; do\n"
+        "  test \"$(cat \"$dev/vendor\")\" = 0x1234 || continue\n"
+        "  test \"$(cat \"$dev/device\")\" = 0x1337 || continue\n"
+        "  group=none\n"
+        "  domain=none\n"
+        "  if test -e \"$dev/iommu_group\"; then\n"
+        "    group=$(readlink -f \"$dev/iommu_group\")\n"
+        "    domain=$(cat \"$dev/iommu_group/type\")\n"
+        "  fi\n"
+        "  printf 'GPGPU_IOMMU_DEVICE=%s GROUP=%s TYPE=%s\\n' "
+        "\"${dev##*/}\" \"${group##*/}\" \"$domain\"\n"
+        "done\n"
+        "printf 'GPGPU_IOMMU_END\\n'\n"
+    )
+    guest.wait(rb"^GPGPU_IOMMU_END$")
+    matches = re.findall(
+        rb"^GPGPU_IOMMU_DEVICE=(\S+) GROUP=(\S+) TYPE=(\S+)\r?$",
+        guest.buffer, re.M)
+    expected = b"DMA" if iommu == "smmuv3" else b"none"
+    if len(matches) != 1 or matches[0][2] != expected:
+        raise RuntimeError(f"GPGPU IOMMU domain 不符合 {iommu}: {matches!r}")
+    device, group, domain = (value.decode() for value in matches[0])
+    print(f"GPGPU {device}: IOMMU={iommu} group={group} type={domain}",
+          flush=True)
+    return {"mode": iommu, "device": device, "group": group, "type": domain}
+
+
+def test(output, iommu):
+    results = output / iommu
+    results.mkdir(exist_ok=True)
+    (results / "test.json").unlink(missing_ok=True)
+    guest = Guest(runtime_command(output, iommu=iommu),
+                  results / "test-console.log")
     try:
         guest.wait(rb"^.*# $")
         for command, marker in [
@@ -426,7 +482,19 @@ def test(output):
             if result.group(1) != b"0":
                 raise RuntimeError(f"{marker} failed; inspect test-console.log")
             print(f"{marker}: passed", flush=True)
+            if marker == "INSMOD":
+                domain = check_iommu_domain(guest, iommu)
         check_kernel_log(guest)
+        write_metadata(results / "test.json", {
+            "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime()),
+            "kernel_release": (output / "kernel-release").read_text().strip(),
+            "module_sha256": sha256(output / "gpgpu_pci.ko"),
+            "iommu": domain,
+            "module_checks_passed": 5,
+            "kernel_faults": 0,
+            "smmu_faults": 0,
+        })
     finally:
         guest.close()
 
@@ -434,12 +502,17 @@ def test(output):
 def check_kernel_log(guest):
     guest.send("dmesg\n" "printf 'GPGPU_DMESG_END\\n'\n")
     guest.wait(rb"^GPGPU_DMESG_END$")
-    if re.search(rb"(?:Oops:|BUG:|Kernel panic)", guest.buffer):
+    if re.search(rb"(?:Oops:|BUG:|Kernel panic|"
+                 rb"(?:smmu|iommu)[^\n]*\b(?:fault|error|event 0x|aborted)|"
+                 rb"(?:CMDQ|EVTQ)[^\n]*(?:error|overflow))",
+                 guest.buffer, re.I):
         raise RuntimeError("Guest kernel fault; inspect console log")
 
 
-def stack_test(output):
-    (output / "stack-test.json").unlink(missing_ok=True)
+def stack_test(output, iommu):
+    results = output / iommu
+    results.mkdir(exist_ok=True)
+    (results / "stack-test.json").unlink(missing_ok=True)
     if not environment_metadata(output) or not prepared_metadata(output):
         raise RuntimeError("Run 'make prepare' before testing the stack")
     stack_output = output / "stack"
@@ -447,8 +520,8 @@ def stack_test(output):
     # 因此重复测试无需下载开发软件包。
     subprocess.run(["make", "-C", str(SOURCE.parent),
                     f"BUILD_DIR={stack_output}", "kernels"], check=True)
-    command = developer_command(output)
-    guest = Guest(command, output / "stack-console.log")
+    command = developer_command(output, iommu)
+    guest = Guest(command, results / "stack-console.log")
     try:
         guest.wait(rb"^GPGPU_DEVELOPER_READY$")
         guest.send(
@@ -456,34 +529,41 @@ def stack_test(output):
             "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
             "gpgpu_stack /mnt/gpgpu-stack\n"
             "sh /mnt/gpgpu-src/guest-stack-test.sh "
-            "> /mnt/gpgpu-build/stack-test.log 2>&1\n"
+            f"> /mnt/gpgpu-build/{iommu}/stack-test.log 2>&1\n"
             "printf 'GPGPU_STACK_RC=%s\\n' \"$?\"\n"
         )
         result = guest.wait(rb"^GPGPU_STACK_RC=(\d+)$", timeout=600)
-        log = (output / "stack-test.log").read_text(errors="replace")
+        log = (results / "stack-test.log").read_text(errors="replace")
         print(log, end="", flush=True)
         if result.group(1) != b"0":
             raise RuntimeError("Stack test failed; inspect stack-test.log")
-        for pattern in (r"GPGPU demos: 3/3 PASS",
-                        r"GPGPU runtime tests: (\d+)/(\d+) PASS",
-                        r"GPGPU unload/reload: 2/2 PASS"):
-            match = re.search(pattern, log)
-            if not match or (match.groups() and
-                             (match.group(1) != match.group(2) or
-                              int(match.group(1)) == 0)):
+        for pattern in (r"^GPGPU demos: 3/3 PASS$",
+                        r"^GPGPU runtime tests: 68/68 PASS$",
+                        r"^GPGPU unload/reload: 2/2 PASS$"):
+            if len(re.findall(pattern, log, re.M)) != 1:
                 raise RuntimeError("Missing complete result in stack-test.log")
+        values = re.findall(r"^.*: (\d+)/(\d+) values PASS$", log, re.M)
+        if (values != [("17003", "17003"), ("437", "437"), ("513", "513")]
+                or len(re.findall(r"^PASS ", log, re.M)) != 68):
+            raise RuntimeError("示例输出或运行时检查数量不足")
+        domain = check_iommu_domain(guest, iommu)
         check_kernel_log(guest)
-        write_metadata(output / "stack-test.json", {
+        write_metadata(results / "stack-test.json", {
             "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                             time.gmtime()),
             "kernel_release": (output / "kernel-release").read_text().strip(),
             "module_sha256": sha256(output / "gpgpu_pci.ko"),
             "demo_sha256": sha256(stack_output / "gpgpu-demo"),
             "tests_sha256": sha256(stack_output / "test-runtime"),
+            "iommu": domain,
+            "guest_exit_code": int(result.group(1)),
             "demo_passed": 3,
+            "demo_values_passed": sum(int(passed) for passed, _ in values),
             "runtime_tests_passed": int(re.search(
                 r"GPGPU runtime tests: (\d+)/\d+ PASS", log).group(1)),
             "kernel_faults": 0,
+            "smmu_faults": 0,
+            "unload_reload_passed": 2,
         })
     finally:
         guest.close()
@@ -496,6 +576,8 @@ def main():
     parser.add_argument("--output-dir", type=Path,
                         default=ROOT / "build" / "gpgpu-linux-module")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--iommu", choices=("none", "smmuv3"), default="none",
+                        help="系统 IOMMU 模式，默认 none")
     parser.add_argument("--skip-prepare", action="store_true",
                         help="Test existing artifacts without rebuilding")
     args = parser.parse_args()
@@ -504,7 +586,7 @@ def main():
         parser.error("--skip-prepare requires a test without --force")
     output = args.output_dir.resolve()
     if args.command == "run":
-        command = runtime_command(output, interactive=True)
+        command = runtime_command(output, interactive=True, iommu=args.iommu)
         os.execv(command[0], command)
     else:
         output.mkdir(parents=True, exist_ok=True)
@@ -513,9 +595,9 @@ def main():
             if not args.skip_prepare:
                 prepare(output, args.force)
             if args.command == "test":
-                test(output)
+                test(output, args.iommu)
             elif args.command == "stack-test":
-                stack_test(output)
+                stack_test(output, args.iommu)
 
 
 if __name__ == "__main__":

@@ -139,7 +139,7 @@ PCI IDs
 Field           Value
 =============== ================
 Vendor ID       0x1234 (QEMU)
-Device ID       0xGPGP (TBD)
+Device ID       0x1337
 Revision        0x01
 Class Code      0x030200 (3D Controller)
 Subsystem VID   0x1234
@@ -352,11 +352,11 @@ DMA Engine (0x0400 - 0x04FF)
    * - 0x0400
      - 8
      - RW
-     - **DMA_SRC_ADDR**: DMA source address (host physical or VRAM)
+     - **DMA_SRC_ADDR**: 系统 DMA 地址或 VRAM 字节偏移，由方向选择
    * - 0x0408
      - 8
      - RW
-     - **DMA_DST_ADDR**: DMA destination address
+     - **DMA_DST_ADDR**: VRAM 字节偏移或系统 DMA 地址，由方向选择
    * - 0x0410
      - 4
      - RW
@@ -378,6 +378,54 @@ DMA Engine (0x0400 - 0x04FF)
        - Bit 0: DMA busy
        - Bit 1: DMA complete
        - Bit 2: DMA error
+
+系统 IOMMU 与 DMA 地址
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Linux 驱动将 ``dma_alloc_coherent()`` 返回的 DMA 地址写入系统内存端，
+显存端填写 VRAM 字节偏移。启用系统 IOMMU（输入输出内存管理单元）时，
+系统内存端是 IOVA（设备 DMA 虚拟地址），由 ARM64 virt 的 SMMUv3
+（Arm 系统内存管理单元第三版）翻译为客体物理地址。数据路径为：
+
+::
+
+    BAR0 系统 DMA 地址 → PCI 地址空间 → SMMUv3 → 客体 RAM 暂存区
+    BAR0 显存偏移      → GPGPU VRAM
+
+``hw/gpgpu/gpgpu_dma.c`` 使用 ``pci_dma_read/write()`` 并检查
+``MemTxResult``。未映射访问使 ``DMA_STATUS`` 为 ERROR，置位
+``ERROR_STATUS.DMA_FAULT`` 并报告错误中断，不发送 DMA 完成通知。
+向 ``ERROR_STATUS`` 和 ``IRQ_ACK`` 写 1 清除锁存状态后，可用合法映射
+重新提交描述符；不需要重置设备或重建页表。
+
+从仓库根目录运行：
+
+.. code-block:: sh
+
+    make -C software/gpgpu/linux prepare
+    make -C software/gpgpu/linux test IOMMU=smmuv3
+    make -f Makefile.camp test-gpgpu-stack IOMMU=smmuv3
+    make -C software/gpgpu/linux run IOMMU=smmuv3
+    make -f Makefile.camp test-gpgpu-iommu JOBS=4
+
+默认 ``IOMMU=none``，脚本参数为 ``--iommu none|smmuv3``。启用时使用
+``-machine virt,gic-version=3,iommu=smmuv3,default-bus-bypass-iommu=off``，
+并追加内核参数 ``iommu.passthrough=0 iommu.strict=1``。自举和编译保持
+原配置，两个模式共用内核、驱动与编译器磁盘。
+
+客体必须具备内建 SMMUv3 和 IOMMU DMA 支持。测试按 PCI ID ``1234:1337``
+查找设备，读取其 ``iommu_group/type``，要求为 ``DMA``，并检查非预期
+SMMU fault。结果和日志分别保存在 ``build/gpgpu-linux-module/none/`` 与
+``build/gpgpu-linux-module/smmuv3/``。系统 IOMMU 不改变应用设备指针和
+kernel 参数的 VRAM 偏移语义，不提供 GPU 内部地址隔离。
+
+2026-10-08 在 ``main`` 分支以 ARM64 Linux ``6.18.55-0-virt`` 实测：
+两种模式各通过 17,953 个示例输出、68/68 运行时检查、5/5 装卸载和
+2/2 卸载重载；SMMUv3 下设备 domain 类型为 ``DMA``，无非预期 SMMU
+fault。ARM64、RISC-V 原有 GPGPU QTest 各 21/21，新专项 2/2，均无
+跳过，命令退出码均为 0。专项覆盖非恒等映射的 DMA 往返、未映射写入
+的错误通知与无完成通知，以及清错后的原映射恢复。没有增加跨页、
+只读权限或撤销／重映射用例；大块搬运沿用软件栈测试。
 
 Thread Context Registers (0x1000 - 0x1FFF)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

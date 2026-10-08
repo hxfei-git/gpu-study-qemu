@@ -3,6 +3,36 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 # 进阶实验一：类 CUDA 最小软件栈
 
+| 缩写 | 英文全称 | 中文含义 |
+| --- | --- | --- |
+| QEMU | Quick Emulator | 仿真工具 |
+| GPGPU | General-Purpose Computing on Graphics Processing Units | GPU 通用计算 |
+| GPU | Graphics Processing Unit | 图形处理器 |
+| CUDA | Compute Unified Device Architecture | 统一计算设备架构 |
+| ARM64 | Arm 64-bit Architecture | Arm 64 位架构 |
+| RV32 / RISC-V | 32-bit RISC-V / Reduced Instruction Set Computer V | 本实验的 32 位精简指令集 |
+| API / ABI | Application Programming Interface / Application Binary Interface | 应用编程／二进制接口 |
+| PCI / BAR | Peripheral Component Interconnect / Base Address Register | 外设互连／基址寄存器 |
+| DMA | Direct Memory Access | 直接内存访问 |
+| IOMMU | Input/Output Memory Management Unit | 输入输出内存管理单元 |
+| SMMUv3 | System Memory Management Unit version 3 | Arm 系统内存管理单元第三版 |
+| IOVA | I/O Virtual Address | 设备 DMA 虚拟地址 |
+| RAM / VRAM | Random Access Memory / Video RAM | 系统内存／显存 |
+| H2D / D2H | Host to Device / Device to Host | 主机到设备／设备到主机 |
+| MSI-X / IRQ | Message Signaled Interrupts Extended / Interrupt Request | 扩展消息中断／中断请求 |
+| MMIO | Memory-Mapped I/O | 内存映射输入输出 |
+| SIMT | Single Instruction, Multiple Threads | 单指令多线程 |
+| FP32 / FP16 / FP8 / FP4 | Floating Point 32 / 16 / 8 / 4-bit | 对应位宽的浮点格式 |
+| BF16 | Brain Floating Point 16-bit | 16 位浮点格式 |
+| ReLU | Rectified Linear Unit | 线性整流函数 |
+| CP | Command Processor | 命令处理器 |
+| TCG | Tiny Code Generator | QEMU 动态翻译后端 |
+| TLS | Transport Layer Security | 传输层安全协议 |
+| JSON | JavaScript Object Notation | JavaScript 对象表示法 |
+| ISO | International Organization for Standardization | 此处指 ISO 9660 光盘镜像 |
+| SHA-256 | Secure Hash Algorithm 256-bit | 256 位安全散列算法 |
+| BDF | Bus, Device, Function | PCI 总线、设备、功能号 |
+
 第一阶段的成果放在 `software/gpgpu/`。ARM64 Linux 应用通过 libgpgpu
 提交数据和 kernel，QEMU 中的 GPGPU 执行 RV32 代码，再把结果传回应用。
 Host 在本文中指 Linux 客体里的应用；QEMU 进程运行在物理宿主机上。
@@ -56,6 +86,21 @@ H2D 时运行时先把应用数据复制进缓冲区，驱动将 DMA 地址、VR
 方向写入 BAR0，设备调用 `pci_dma_read()` 写入 VRAM。D2H 时设备通过
 `pci_dma_write()` 写回 DMA 缓冲区，运行时再复制到应用输出数组。大于
 64 KiB 的拷贝由运行时拆成多个描述符。用户无需提供物理地址或操作 BAR。
+
+启用系统 IOMMU 后，描述符的系统内存端仍填写 `dma_alloc_coherent()`
+返回的 `staging_dma`，此时它是 IOVA。设备沿 PCI 地址空间交给 SMMUv3
+翻译成客体物理地址，再访问暂存区：
+
+```text
+应用缓冲区 ↔ mmap 的 64 KiB 暂存区
+                        ↑ 系统内存访问
+GPGPU 的 PCI DMA → SMMUv3：IOVA → 客体物理地址
+        ↕
+VRAM：描述符的显存端、应用设备指针和 kernel 参数仍为字节偏移
+```
+
+关闭 IOMMU 时沿用直通 DMA 路径。系统翻译与保护不改变 VRAM 寻址，
+也不隔离不同 GPU kernel 对显存的访问。
 
 运行时把 kernel 二进制和 Args 分别上传到 VRAM，驱动设置代码地址、参数
 地址和三维 grid/block 后派发。每个线程入口的 a0 指向 Args，执行器按设备
@@ -133,6 +178,18 @@ make -C software/gpgpu/linux test
 make -C software/gpgpu/linux stack-test
 # 同一端到端测试也登记在 camp Makefile
 make -f Makefile.camp test-gpgpu-stack
+
+# 两种模式共用内核、驱动、编译器磁盘；默认 IOMMU=none
+make -C software/gpgpu/linux test IOMMU=smmuv3
+make -f Makefile.camp test-gpgpu-stack IOMMU=smmuv3
+make -C software/gpgpu/linux run IOMMU=smmuv3
+
+# 已 prepare 的环境可使用 test-fast / stack-test-fast 跳过构建
+make -C software/gpgpu/linux stack-test-fast IOMMU=none
+make -C software/gpgpu/linux stack-test-fast IOMMU=smmuv3
+
+# 复用 prepare 创建的 ARM64 QEMU 配置，执行两个专项 QTest
+make -f Makefile.camp test-gpgpu-iommu JOBS=4
 ```
 
 Host 构建需要 C 编译器、ar 和 Python 3；QEMU 依赖见仓库 README。
@@ -140,46 +197,83 @@ Host 构建需要 C 编译器、ar 和 Python 3；QEMU 依赖见仓库 README。
 内核开发包。之后使用保存的 developer.raw 增量编译，无需重新安装客体。
 客体程序由 ARM64 gcc 原生构建；RV32 kernel 使用同一份汇编源码生成。
 
-所有二进制、镜像与日志保存在仓库 `build/`。端到端测试记录在
-`build/gpgpu-linux-module/stack-test.json`，详细输出见同目录的
-`stack-console.log` 与 `stack-test.log`。脚本按 demo、测试数量与退出码
-判定成功，并检查中断计数和客体内核日志。
+`module-test.py` 的各入口接受 `--iommu none|smmuv3`。启用时使用
+`-machine virt,gic-version=3,iommu=smmuv3,default-bus-bypass-iommu=off`，
+在原内核参数后追加 `iommu.passthrough=0 iommu.strict=1`。自举和模块编译
+继续使用原配置；模式不进入环境指纹，切换模式不会重建环境。
 
-本轮单独构建了 RISC-V QTest 环境，基础测试与新增回归可这样重跑：
+测试要求保存的内核配置启用 `CONFIG_ARM_SMMU_V3=y`、
+`CONFIG_IOMMU_SUPPORT=y`、`CONFIG_IOMMU_DMA=y`。客体按 PCI ID
+`1234:1337` 找到 GPGPU，检查 `/sys/bus/pci/devices/<BDF>/iommu_group/type`
+确实为 `DMA`；`none` 模式要求设备没有 IOMMU group。初始化日志不能代替
+这个检查。脚本还检查内核异常及非预期 SMMU fault、事件和队列错误。
+
+所有产物保存在 `build/`。两种模式的日志与结果分别写入
+`build/gpgpu-linux-module/none/` 和 `build/gpgpu-linux-module/smmuv3/`：
+装卸载为 `test-console.log`、`test.json`；软件栈为 `stack-console.log`、
+`stack-test.log`、`stack-test.json`。脚本要求三个示例的输出数量分别为
+17,003、437、513，运行时逐项 PASS 和汇总均为 68，并核对客体退出码。
+专项 QTest 日志为 `build/gpgpu-iommu-qtest.log`，Makefile 同时检查退出码、
+2/2 数量与无跳过。
+
+本次把 ARM64 与 RISC-V 配置在同一构建目录
+`build/arm64-qemu`（`--target-list=aarch64-softmmu,riscv64-softmmu`），
+原有 GPGPU QTest 的实际命令为：
 
 ```sh
-QTEST_QEMU_BINARY=build/gpgpu-qtest/qemu-system-riscv64 \
-  build/gpgpu-qtest/tests/qtest/qos-test \
-  -p /riscv64/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests \
-  --tap -k
+for arch in aarch64 riscv64; do
+    QTEST_QEMU_BINARY=build/arm64-qemu/qemu-system-$arch \
+      build/arm64-qemu/tests/qtest/qos-test \
+      -p /$arch/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests \
+      --tap
+done
 ```
 
 ## 本轮验证记录
 
-2026-10-07 在当前仓库的 `hxfei-qemu` 分支验证。Linux 客体为 ARM64
-Alpine，内核 `6.18.55-0-virt`，QEMU 使用 TCG 的 `virt,gic-version=3`。
+2026-10-08 在本仓库 `main` 分支运行。ARM64 Alpine 客体内核为
+`6.18.55-0-virt`，QEMU 使用 TCG。保存的内核配置中
+`CONFIG_ARM_SMMU_V3`、`CONFIG_IOMMU_SUPPORT`、`CONFIG_IOMMU_DMA`
+均为 `y`。本次云环境缺少旧构建产物，首次自举使用
+`python /workspace/.gpu-study-env/module-test-cloud.py prepare`，通过云环境
+已有代理安装软件包，并保留 TLS、包签名与 ISO 校验。后续实际回归命令为：
 
-三个 demo 全部通过，逐元素核对 17,953 个输出：vector add 17,003 个，
-矩阵乘 437 个（`19×17` 乘 `17×23`），ReLU 513 个。计算期间 MSI-X
-计数增量为 kernel=3、DMA=21、error=0。矩阵使用 `grid=(3,3,1)`、
-`block=(8,8,1)`；vector add 使用 `grid=(266,1,1)`、`block=(64,1,1)`；
-ReLU 使用 `grid=(6,1,1)`、`block=(96,1,1)`。
+```sh
+for iommu in none smmuv3; do
+    make -C software/gpgpu/linux test IOMMU=$iommu
+    make -f Makefile.camp test-gpgpu-stack IOMMU=$iommu
+done
+make -f Makefile.camp test-gpgpu-iommu JOBS=4
+```
 
-驱动与运行时测试 68/68 通过，包括 `64 KiB + 37` 字节的分块搬运、两个
-线程交错 DMA、360 个三维索引输出（8 个 block，每个 45 个线程）、非法
-mmap/ioctl/分配/派发参数，以及坏 kernel 的错误 MSI-X 与后续恢复。
-装卸载检查 5/5，端到端流程末尾卸载重载 2/2，客体日志未发现 Oops、BUG
-或 panic。验证记录包含 module/demo/test 二进制 SHA-256。
+两种模式分别通过三个 demo 的 17,953 个输出：vector add 17,003 个，
+矩阵乘 437 个，ReLU 513 个；每种模式执行三个 demo 的 MSI-X 总增量
+均为 kernel=3、DMA=21、error=0。两种模式各自的驱动与运行时检查为 68/68，
+包括 `64 KiB + 37` 字节分块搬运、并发 DMA、三维索引、非法参数和坏
+kernel 后恢复；装卸载为 5/5，软件栈末尾卸载重载为 2/2。
+四条 Linux 回归命令及客体检查的退出码均为 0，未发现 Oops、BUG、panic
+或非预期 SMMU fault。没有少跑或跳过的检查。
 
-RISC-V 和 ARM64 `virt` 上均为 21/21 GPGPU QTest 通过：原有评分测试
-17/17、已有 `simt-reset-all` 回归 1/1、新增 DMA、kernel ABI 与 fault
-回归 3/3。日志分别是 `build/gpgpu-device-riscv-qtest.log` 与
-`build/gpgpu-device-qtest.log`。Host 与 ARM64 客体 C 构建均启用
-`-Wall -Wextra -Werror`，汇编器的 4 个编码测试方法通过。
+按 `1234:1337` 找到的设备，在装卸载测试中为 `0000:00:01.0`，
+软件栈测试中为 `0000:00:02.0`。SMMUv3 模式对应 group 1 和 group 2，
+类型均为 `DMA`；`none` 模式均无 IOMMU group。两个模式共用同一内核、
+模块和磁盘：环境与模块清单散列、磁盘 inode 和大小均未变化，切换到
+SMMUv3 时显示 `Module is already up to date.`。命令、退出码和复用记录
+见 `build/gpgpu-linux-validation.json`，两种模式的 JSON 结果还记录了
+模块、demo 和测试二进制的 SHA-256。
 
-设备提交 checkpatch 为 0 errors、0 warnings。Linux 驱动提交出现 4 个
-`void __user *` 参数的指针空格误报：仓库检查器只识别 `__force`，未识别
-Linux 的 `__user` 注解；保留标准 Linux 注解，原生编译通过。
+ARM64 和 RISC-V 原有 GPGPU QTest 各 21/21，新增专项 2/2，均无跳过，
+退出码为 0。日志为 `build/gpgpu-device-aarch64-qtest.log`、
+`build/gpgpu-device-riscv64-qtest.log` 和 `build/gpgpu-iommu-qtest.log`。
+专项用例固定映射 IOVA `0x80_8060_4567` 到客体物理地址 `0x4ecb_a567`，
+通过 BAR0 发起 H2D → D2H 并逐字节比较。非法 D2H 验证 DMA 错误、错误
+MSI-X 和无完成通知；只清错误后使用原映射成功搬运。失败写入被 QEMU
+拆分为多次访问，事件队列中的 18 条记录均为目标未映射范围的翻译 fault，
+恢复阶段无新增 fault。这些是专项用例预期的故障。
+
+复用的原有 SMMUv3 QTest 为 3/3，汇编器检查为 4/4。生产设备、驱动、
+运行时与 ABI 均未修改。本轮未增加跨页布局、只读权限、撤销映射或重新
+映射用例；GPU 内部地址隔离仍未实现。
 
 ## 基础 17 道测题覆盖与边界
 

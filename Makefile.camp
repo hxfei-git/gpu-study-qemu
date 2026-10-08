@@ -33,6 +33,8 @@ CONFIGURE_FLAGS := \
 # Parallel jobs (default: nproc)
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 JOBS  ?= $(NPROC)
+IOMMU ?= none
+ARM64_BUILD_DIR ?= $(BUILD_DIR)/arm64-qemu
 
 # Use QEMU's bundled meson from pyvenv to avoid version mismatch
 MESON = $(BUILD_DIR)/pyvenv/bin/meson
@@ -55,6 +57,7 @@ help:
 	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
 	@echo "  test-soc           Run SoC experiment tests (QTest)"
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
+	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
 	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
@@ -68,6 +71,7 @@ help:
 	@echo "  JOBS=N             Parallel jobs (default: $(NPROC))"
 	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
 	@echo "                     (default: riscv64-unknown-elf-)"
+	@echo "  IOMMU=none|smmuv3  Linux 测试与运行的 IOMMU 模式（默认 none）"
 	@echo "  V=1                Verbose output"
 
 # ─── Configure ────────────────────────────────────────────────────────
@@ -157,11 +161,23 @@ test-gpgpu: build
 	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
 	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
 
+# 复用 Linux 测试的 ARM64 QEMU 配置；首次先执行 linux/Makefile 的 prepare。
+.PHONY: test-gpgpu-iommu
+test-gpgpu-iommu:
+	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
+		qemu-system-aarch64 tests/qtest/gpgpu-iommu-test
+	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
+		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-iommu-test" --tap \
+		2>&1 | tee "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
+	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-iommu-qtest.log")" = 2
+	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
+	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
+
 # ─── GPGPU 软件栈（实际 Linux PCI 驱动与运行时）────────────
 
 .PHONY: test-gpgpu-stack
 test-gpgpu-stack:
-	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test
+	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test IOMMU="$(IOMMU)"
 
 # ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
 
