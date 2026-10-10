@@ -79,7 +79,12 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 
 ## 当前 GPGPU 实验
 
-进阶实验一已完成。`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支；
+根据用户反馈，进阶实验一已完成，并已搭配 A57、支持 SMMUv3 系统 IOMMU。
+当前进入第二阶段：用户 AQL Queue、Doorbell、CP 与 Signal。实现前先阅读
+[QEMU GPGPU 四阶段实验大纲](<../QEMU GPGPU 实验大纲.md>) 中的第二阶段 v1 规格，
+实验计划继续统一在该大纲维护。第二阶段尚未记录实现完成或运行验收通过。
+
+`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支；
 `hxfei-qemu` 保留早期开发历史。第一阶段软件栈位于 `software/gpgpu/`，
 包含 Linux PCI 驱动、libgpgpu、RV32 汇编 kernel 和汇编前端、三个 FP32 示例及客体集成测试。
 修改接口前阅读 `software/gpgpu/README.md` 和 `WORK_ITEMS.md`。
@@ -94,7 +99,9 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 这 21 项包括 17 项评分测试和 4 项回归测试。核对测试数量与日志，
 不能仅凭评分脚本的退出状态判断全部通过。
 
-设备使用独占会话和同步调用。设备指针为 VRAM 偏移；
+现有代码仍使用第一阶段的独占会话和同步调用。设备指针为 VRAM 偏移；
 mmap 映射 64 KiB 一致性 DMA 暂存缓冲区。
-共享内存与屏障、CP 队列、异步流和 GPU 地址隔离留待后续实现。
+第二阶段将按大纲增加用户 AQL Queue、Doorbell、CP 与 Signal，
+并保留现有同步路径的回归验证。共享内存与 block 屏障、异步流和 GPU 地址隔离
+留待后续实现。阶段规格中的新增寄存器、共享区和接口不能作为已有设备能力。
 解释器支持 BF16、FP8 和 FP4 转换，尚未实现 FP16 转换。设备已明确禁止迁移。
