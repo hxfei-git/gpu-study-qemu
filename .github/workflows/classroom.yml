@@ -54,11 +54,13 @@ jobs:
         run: make -f Makefile.camp build
 
       - name: Run CPU tests
+        id: tests
         run: |
-          make -C build check-gevico-tcg || true
+          make -C build check-gevico-tcg
 
       - name: Calculate score
         id: score
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         run: |
           passed=0
           if [ -f "$RESULT_LOG" ]; then
@@ -70,25 +72,34 @@ jobs:
           echo "score=$score"   >> "$GITHUB_OUTPUT"
           echo "total=$total"   >> "$GITHUB_OUTPUT"
           echo "::notice::CPU experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+          test "$passed" -eq "$TOTAL_CASES"
 
       - name: Upload score
         if: ${{ steps.score.outputs.score != '0' }}
+        env:
+          COURSE_ID: ${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_COURSE_ID }}
+          COURSE_TOKEN: ${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_TOKEN }}
+          COURSE_API: ${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}
         run: |
+          if [ -z "$COURSE_ID" ] || [ -z "$COURSE_TOKEN" ] || [ -z "$COURSE_API" ]; then
+            echo "::notice::未配置课程评分凭据，跳过评分上传；测试结果独立判定。"
+            exit 0
+          fi
           summary=$(jq -n \
             --arg channel "github" \
-            --argjson courseId "${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_COURSE_ID }}" \
+            --argjson courseId "$COURSE_ID" \
             --arg ext "{}" \
             --arg name "${{ github.actor }}" \
             --argjson score "${{ steps.score.outputs.score }}" \
             --argjson totalScore "${{ steps.score.outputs.total }}" \
             '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
           echo "$summary"
-          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+          curl -X POST "$COURSE_API" \
             -H "accept: application/json;charset=utf-8" \
             -H "Content-Type: application/json" \
-            -H "token: ${{ secrets.QEMU_CAMP_2026_CPU_AUTUMN_TOKEN }}" \
+            -H "token: $COURSE_TOKEN" \
             -d "$summary" \
-            -v
+            --fail --silent --show-error
 
   # ────────────────────────────────────────────────────────────
   # SoC experiment — QTest, score from soc-result.log
@@ -132,11 +143,13 @@ jobs:
         run: make -f Makefile.camp build
 
       - name: Run SoC tests
+        id: tests
         run: |
-          make -f Makefile.camp test-soc || true
+          make -f Makefile.camp test-soc
 
       - name: Calculate score
         id: score
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         run: |
           passed=0
           if [ -f "$RESULT_LOG" ]; then
@@ -148,25 +161,34 @@ jobs:
           echo "score=$score"   >> "$GITHUB_OUTPUT"
           echo "total=$total"   >> "$GITHUB_OUTPUT"
           echo "::notice::SoC experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+          test "$passed" -eq "$TOTAL_CASES"
 
       - name: Upload score
         if: ${{ steps.score.outputs.score != '0' }}
+        env:
+          COURSE_ID: ${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_COURSE_ID }}
+          COURSE_TOKEN: ${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_TOKEN }}
+          COURSE_API: ${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}
         run: |
+          if [ -z "$COURSE_ID" ] || [ -z "$COURSE_TOKEN" ] || [ -z "$COURSE_API" ]; then
+            echo "::notice::未配置课程评分凭据，跳过评分上传；测试结果独立判定。"
+            exit 0
+          fi
           summary=$(jq -n \
             --arg channel "github" \
-            --argjson courseId "${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_COURSE_ID }}" \
+            --argjson courseId "$COURSE_ID" \
             --arg ext "{}" \
             --arg name "${{ github.actor }}" \
             --argjson score "${{ steps.score.outputs.score }}" \
             --argjson totalScore "${{ steps.score.outputs.total }}" \
             '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
           echo "$summary"
-          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+          curl -X POST "$COURSE_API" \
             -H "accept: application/json;charset=utf-8" \
             -H "Content-Type: application/json" \
-            -H "token: ${{ secrets.QEMU_CAMP_2026_SOC_AUTUMN_TOKEN }}" \
+            -H "token: $COURSE_TOKEN" \
             -d "$summary" \
-            -v
+            --fail --silent --show-error
 
   # ────────────────────────────────────────────────────────────
   # GPGPU experiment — QTest (QOS), 17 subtests → 100 points
@@ -207,11 +229,13 @@ jobs:
         run: make -f Makefile.camp build
 
       - name: Run GPGPU tests
+        id: tests
         run: |
-          make -f Makefile.camp test-gpgpu || true
+          make -f Makefile.camp test-gpgpu
 
       - name: Calculate score
         id: score
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         run: |
           passed=0
           if [ -f "$RESULT_LOG" ]; then
@@ -222,25 +246,34 @@ jobs:
           echo "score=$score"   >> "$GITHUB_OUTPUT"
           echo "total=100"      >> "$GITHUB_OUTPUT"
           echo "::notice::GPGPU experiment: $passed/$TOTAL_CASES cases passed, score $score/100"
+          test "$passed" -eq "$TOTAL_CASES"
 
       - name: Upload score
         if: ${{ steps.score.outputs.score != '0' }}
+        env:
+          COURSE_ID: ${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_COURSE_ID }}
+          COURSE_TOKEN: ${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_TOKEN }}
+          COURSE_API: ${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}
         run: |
+          if [ -z "$COURSE_ID" ] || [ -z "$COURSE_TOKEN" ] || [ -z "$COURSE_API" ]; then
+            echo "::notice::未配置课程评分凭据，跳过评分上传；测试结果独立判定。"
+            exit 0
+          fi
           summary=$(jq -n \
             --arg channel "github" \
-            --argjson courseId "${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_COURSE_ID }}" \
+            --argjson courseId "$COURSE_ID" \
             --arg ext "{}" \
             --arg name "${{ github.actor }}" \
             --argjson score "${{ steps.score.outputs.score }}" \
             --argjson totalScore "${{ steps.score.outputs.total }}" \
             '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
           echo "$summary"
-          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+          curl -X POST "$COURSE_API" \
             -H "accept: application/json;charset=utf-8" \
             -H "Content-Type: application/json" \
-            -H "token: ${{ secrets.QEMU_CAMP_2026_GPU_AUTUMN_TOKEN }}" \
+            -H "token: $COURSE_TOKEN" \
             -d "$summary" \
-            -v
+            --fail --silent --show-error
 
   # ────────────────────────────────────────────────────────────
   # Rust experiment — 3 unit tests + 7 QTest = 10 × 10 pts
@@ -282,11 +315,13 @@ jobs:
         run: make -f Makefile.camp build
 
       - name: Run Rust tests
+        id: tests
         run: |
-          make -f Makefile.camp test-rust || true
+          make -f Makefile.camp test-rust
 
       - name: Calculate score
         id: score
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         run: |
           passed=0
           if [ -f "$RESULT_LOG" ]; then
@@ -298,22 +333,31 @@ jobs:
           echo "score=$score"   >> "$GITHUB_OUTPUT"
           echo "total=$total"   >> "$GITHUB_OUTPUT"
           echo "::notice::Rust experiment: $passed/$TOTAL_CASES cases passed, score $score/$total"
+          test "$passed" -eq "$TOTAL_CASES"
 
       - name: Upload score
         if: ${{ steps.score.outputs.score != '0' }}
+        env:
+          COURSE_ID: ${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_COURSE_ID }}
+          COURSE_TOKEN: ${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_TOKEN }}
+          COURSE_API: ${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}
         run: |
+          if [ -z "$COURSE_ID" ] || [ -z "$COURSE_TOKEN" ] || [ -z "$COURSE_API" ]; then
+            echo "::notice::未配置课程评分凭据，跳过评分上传；测试结果独立判定。"
+            exit 0
+          fi
           summary=$(jq -n \
             --arg channel "github" \
-            --argjson courseId "${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_COURSE_ID }}" \
+            --argjson courseId "$COURSE_ID" \
             --arg ext "{}" \
             --arg name "${{ github.actor }}" \
             --argjson score "${{ steps.score.outputs.score }}" \
             --argjson totalScore "${{ steps.score.outputs.total }}" \
             '{channel: $channel, courseId: $courseId, ext: $ext, name: $name, score: $score, totalScore: $totalScore}')
           echo "$summary"
-          curl -X POST "${{ secrets.QEMU_CAMP_2026_COURSE_POST_API }}" \
+          curl -X POST "$COURSE_API" \
             -H "accept: application/json;charset=utf-8" \
             -H "Content-Type: application/json" \
-            -H "token: ${{ secrets.QEMU_CAMP_2026_EXPER_RUST_AUTUMN_TOKEN }}" \
+            -H "token: $COURSE_TOKEN" \
             -d "$summary" \
-            -v
+            --fail --silent --show-error

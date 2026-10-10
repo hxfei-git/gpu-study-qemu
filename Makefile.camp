@@ -159,7 +159,8 @@ test-gpgpu: build
 	done; \
 	score=$$((passed * 100 / $(GPGPU_TOTAL))); \
 	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
-	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
+	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"; \
+	[ "$$passed" -eq "$(GPGPU_TOTAL)" ]
 
 # 复用 Linux 测试的 ARM64 QEMU 配置；首次先执行 linux/Makefile 的 prepare。
 .PHONY: test-gpgpu-iommu
@@ -213,7 +214,8 @@ test-rust: build
 	done; \
 	echo "$$passed" > $(BUILD_DIR)/rust-result.log; \
 	score=$$((passed * 10)); \
-	echo "--- Rust experiment: $$passed/10 tests passed, score $$score/100 ---"
+	echo "--- Rust experiment: $$passed/10 tests passed, score $$score/100 ---"; \
+	[ "$$passed" -eq 10 ]
 
 # ─── Run all tests ────────────────────────────────────────────────────
 
