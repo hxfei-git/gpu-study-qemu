@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "qemu/timer.h"
+#include "hw/remote/vfio-user-obj.h"
 #include "gpgpu.h"
 
 /* DMA 描述符寄存器、数据搬运和延迟完成通知。 */
@@ -53,11 +54,11 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
 
     s->dma.status = GPGPU_DMA_BUSY;
     if (ctrl & GPGPU_DMA_DIR_FROM_VRAM) {
-        result = pci_dma_write(PCI_DEVICE(s), host_addr,
-                               s->vram_ptr + vram_addr, s->dma.size);
+        result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr,
+                                   s->vram_ptr + vram_addr, s->dma.size, true);
     } else {
-        result = pci_dma_read(PCI_DEVICE(s), host_addr,
-                              s->vram_ptr + vram_addr, s->dma.size);
+        result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr,
+                                   s->vram_ptr + vram_addr, s->dma.size, false);
     }
     if (result != MEMTX_OK) {
         s->dma.status = GPGPU_DMA_ERROR;

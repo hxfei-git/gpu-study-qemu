@@ -9,6 +9,9 @@ MODULE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR ?= $(abspath $(MODULE_DIR)/../../../build/gpgpu-linux-module)
 PYTHON ?= python3
 IOMMU ?= none
+REMOTE ?= 0
+DEVICE_QEMU ?= $(MODULE_DIR)/../../../build/arm64-qemu/qemu-system-riscv32
+REMOTE_FLAGS = $(if $(filter 1,$(REMOTE)),--remote --device-qemu "$(DEVICE_QEMU)")
 
 .PHONY: all clean prepare module test test-fast stack-test stack-test-fast run
 
@@ -28,21 +31,21 @@ module:
 
 test:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" test \
-		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)"
+		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)" $(REMOTE_FLAGS)
 
 test-fast:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" test --skip-prepare \
-		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)"
+		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)" $(REMOTE_FLAGS)
 
 stack-test:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" stack-test \
-		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)"
+		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)" $(REMOTE_FLAGS)
 
 stack-test-fast:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" stack-test --skip-prepare \
-		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)"
+		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)" $(REMOTE_FLAGS)
 
 run:
 	$(PYTHON) "$(MODULE_DIR)/module-test.py" run \
-		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)"
+		--output-dir "$(BUILD_DIR)" --iommu "$(IOMMU)" $(REMOTE_FLAGS)
 endif

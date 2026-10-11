@@ -11,6 +11,7 @@
 #include "hw/arm/smmuv3-common.h"
 #include "hw/gpgpu/gpgpu_regs.h"
 #include "hw/pci/pci_regs.h"
+#include "gpgpu-remote.h"
 
 #define DMA_LEN 64
 #define VRAM_OFFSET 0x2000
@@ -44,6 +45,18 @@ static void submit_dma(QPCIDevice *dev, uint64_t iova, bool d2h, bool fault)
 
     /* 错误后也推进时钟，防止误报延迟的完成通知。 */
     qtest_clock_step(qts, 1000000);
+    if (g_getenv("QTEST_GPGPU_REMOTE")) {
+        int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+
+        /* B 独立推进时钟；A 处理 eventfd 通知。 */
+        while ((qpci_io_readl(dev, bar, GPGPU_REG_DMA_STATUS) ==
+                GPGPU_DMA_BUSY ||
+                !qtest_readl(qts, DMA_GPA + IRQ_OFFSET(fault ? 2 : 1))) &&
+               g_get_monotonic_time() < deadline) {
+            g_usleep(1000);
+            qtest_clock_step(qts, 1000000);
+        }
+    }
     g_assert_cmphex(qpci_io_readl(dev, bar, GPGPU_REG_DMA_STATUS), ==,
                     fault ? GPGPU_DMA_ERROR : GPGPU_DMA_COMPLETE);
     g_assert_cmphex(qpci_io_readl(dev, bar, GPGPU_REG_ERROR_STATUS), ==,
@@ -57,16 +70,27 @@ static void submit_dma(QPCIDevice *dev, uint64_t iova, bool d2h, bool fault)
 static void run_dma(const void *opaque)
 {
     bool fault = GPOINTER_TO_INT(opaque);
-    QTestState *qts = qtest_init(
-        "-machine virt,gic-version=3,iommu=smmuv3,"
-        "default-bus-bypass-iommu=off "
-        "-cpu max -m 512M -nodefaults -device gpgpu");
+    bool remote_mode = g_getenv("QTEST_GPGPU_REMOTE") != NULL;
+    GPGPURemote remote = {0};
+    g_autofree char *device = NULL;
+    g_autofree char *args = NULL;
+    QTestState *qts;
     QGenericPCIBus gbus;
     QPCIDevice *dev = NULL;
     QPCIBar bar;
     uint32_t events = 0;
     uint8_t input[DMA_LEN], output[DMA_LEN];
 
+    if (remote_mode) {
+        gpgpu_remote_start(&remote);
+        device = gpgpu_remote_device_option(&remote);
+    }
+    args = g_strdup_printf(
+        "-machine virt,gic-version=3,iommu=smmuv3,"
+        "default-bus-bypass-iommu=off "
+        "-cpu max -m 512M -nodefaults -device %s",
+        remote_mode ? device : "gpgpu");
+    qts = qtest_init(args);
     qpci_init_generic(&gbus, qts, NULL, false);
     qpci_device_foreach(&gbus.bus, 0x1234, 0x1337, save_device, &dev);
     g_assert_nonnull(dev);
@@ -131,6 +155,7 @@ static void run_dma(const void *opaque)
     qpci_msix_disable(dev);
     g_free(dev);
     qtest_quit(qts);
+    gpgpu_remote_stop(&remote);
 }
 
 int main(int argc, char **argv)

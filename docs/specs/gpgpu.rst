@@ -19,7 +19,7 @@ The GPGPU device is a PCIe device that provides:
 - SIMT execution model with configurable warps and threads
 - Dedicated video memory (VRAM) for GPU computations
 - DMA engine for host-device data transfer
-- Command queue for kernel dispatch
+- Synchronous kernel dispatch registers
 - MSI/MSI-X interrupt support
 
 The device reuses the RISC-V RV32IMF instruction set, avoiding custom GPU
@@ -129,6 +129,53 @@ Command Line Options
 ``warp_size``
     Number of threads per warp. Default: 32. Must be power of 2.
 
+双进程远端设备
+--------------
+
+**[DESIGN]** 原单进程入口继续提供 A57 与 GPGPU 设备。本轮增加
+A57 Host 进程和 RISC-V 设备进程：Host 使用 ``vfio-user-pci``，设备进程使用
+已有的 ``x-remote,vfio-user=on`` machine，并显式创建 ``gpu0``。
+原计算解释器仍运行应用 kernel，设备进程不创建 CP。
+
+::
+
+    进程 A：A57 Linux
+      └─ PCIe 代理 ── 配置空间、BAR 请求 ──→ 进程 B：gpu0
+           ├─ PCI DMA 接口 ←─ B 的 DMA 请求       └─ 设备 VRAM
+           │    └─ SMMUv3（启用时）→ Host RAM
+           └─ Linux 驱动 ←─ B 的中断通知
+
+``none`` 与 ``smmuv3`` 均使用 ``x-dma-via-socket=on``。B 发送完整设备
+DMA 地址、方向和数据请求，A 调用代理设备的 PCI DMA 接口，并返回结果或错误。
+SMMUv3 翻译、权限检查和故障记录继续发生在 A。此选项不增加硬件寄存器。
+该模式关闭 posted writes，串行发送 Host 请求，同步等待中允许处理反向 DMA。
+MSI-X 表和屏蔽状态在两端同步，计算、DMA 完成和错误通知保留原有向量。
+
+服务端使用 ``subprojects/libvfio-user.wrap`` 固定的
+``0b28d205572c80b568a1003db2c8f37ca333e4d7`` 版本。wrap 登记的最小补丁
+``subprojects/packagefiles/libvfio-user/0001-message-dma-window.diff``
+允许无共享 fd 的消息 DMA 区域登记大地址窗口；共享内存区域仍保留原限制，
+区域容量仍为 16。补丁还修正消息地址遗漏区域内偏移 ``sg->offset`` 的问题。
+消息 DMA 窗口不绕过 A 的 IOMMU，也不表示所有地址已映射。
+
+构建需要 QEMU 原有依赖，以及 ``libjson-c-dev``、``libcmocka-dev``。
+从仓库根目录配置三目标，构建产物仍放在 ``build/``：
+
+.. code-block:: sh
+
+    mkdir -p build/arm64-qemu
+    cd build/arm64-qemu
+    ../../configure --target-list=aarch64-softmmu,riscv32-softmmu,riscv64-softmmu \
+        --enable-vfio-user-server --disable-rust --disable-docs \
+        --disable-tools --disable-guest-agent
+    ninja -j4 qemu-system-aarch64 qemu-system-riscv32 qemu-system-riscv64
+    cd ../..
+    make -C software/gpgpu/linux prepare
+    make -C software/gpgpu/linux run REMOTE=1 IOMMU=smmuv3
+
+交互入口由 ``scripts/gpgpu_remote.py`` 启动 B，再连接 A，并保存两端命令和
+设备日志。Host 退出、启动超时和异常会清理两个进程。本版不支持断线重连和迁移。
+
 PCI Configuration
 -----------------
 
@@ -149,9 +196,9 @@ Subsystem ID    0x1100
 PCI Capabilities
 ~~~~~~~~~~~~~~~~
 
-- MSI-X capability (64 vectors)
-- PCIe capability (Gen3 x16)
-- Power Management capability
+- MSI-X capability (4 vectors)
+- MSI capability
+- Standard PCIe Endpoint capability
 
 BAR Layout
 ~~~~~~~~~~

@@ -18,6 +18,7 @@
 #include "hw/remote/machine.h"
 #include "system/memory.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "hw/pci/pci_host.h"
 #include "hw/remote/iohub.h"
 #include "hw/remote/iommu.h"
@@ -60,11 +61,16 @@ static void remote_machine_init(MachineState *machine)
 
         vfu_object_set_bus_irq(pci_host->bus);
     } else {
+#ifdef CONFIG_MULTIPROCESS
         remote_iohub_init(&s->iohub);
 
         pci_bus_irqs(pci_host->bus, remote_iohub_set_irq,
                      &s->iohub, REMOTE_IOHUB_NB_PIRQS);
         pci_bus_map_irqs(pci_host->bus, remote_iohub_map_irq);
+#else
+        error_report("x-remote：本构建仅支持 vfio-user=on");
+        exit(EXIT_FAILURE);
+#endif
     }
 
     qbus_set_hotplug_handler(BUS(pci_host->bus), OBJECT(s));

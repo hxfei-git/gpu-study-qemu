@@ -9,6 +9,7 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/pci/pcie.h"
 #include "migration/vmstate.h"
 #include "gpgpu.h"
 #include "qemu/host-utils.h"
@@ -97,6 +98,12 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
         g_free(s->vram_ptr);
         return;
     }
+    if (pcie_endpoint_cap_init(pdev, 0) < 0) {
+        error_setg(errp, "GPGPU: cannot initialize PCIe endpoint capability");
+        gpgpu_irq_cleanup(s);
+        g_free(s->vram_ptr);
+        return;
+    }
     gpgpu_dma_init(s);
 
     s->global_status = GPGPU_STATUS_READY;
@@ -108,6 +115,7 @@ static void gpgpu_exit(PCIDevice *pdev)
 
     gpgpu_dma_cleanup(s);
     gpgpu_irq_cleanup(s);
+    pcie_cap_exit(pdev);
     g_free(s->vram_ptr);
 }
 

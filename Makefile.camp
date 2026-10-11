@@ -34,7 +34,9 @@ CONFIGURE_FLAGS := \
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 JOBS  ?= $(NPROC)
 IOMMU ?= none
+REMOTE ?= 0
 ARM64_BUILD_DIR ?= $(BUILD_DIR)/arm64-qemu
+DEVICE_QEMU ?= $(ARM64_BUILD_DIR)/qemu-system-riscv32
 
 # Use QEMU's bundled meson from pyvenv to avoid version mismatch
 MESON = $(BUILD_DIR)/pyvenv/bin/meson
@@ -58,6 +60,7 @@ help:
 	@echo "  test-soc           Run SoC experiment tests (QTest)"
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
 	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
+	@echo "  test-gpgpu-remote-iommu  运行远端 GPGPU 的两项 SMMUv3 DMA QTest"
 	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
@@ -72,6 +75,7 @@ help:
 	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
 	@echo "                     (default: riscv64-unknown-elf-)"
 	@echo "  IOMMU=none|smmuv3  Linux 测试与运行的 IOMMU 模式（默认 none）"
+	@echo "  REMOTE=0|1         Linux 测试使用单进程或双进程（默认 0）"
 	@echo "  V=1                Verbose output"
 
 # ─── Configure ────────────────────────────────────────────────────────
@@ -174,11 +178,26 @@ test-gpgpu-iommu:
 	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 
+# 远端测试使用已配置了 AArch64、RV32 与 vfio-user-server 的构建。
+.PHONY: test-gpgpu-remote-iommu
+test-gpgpu-remote-iommu:
+	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
+		qemu-system-aarch64 qemu-system-riscv32 tests/qtest/gpgpu-iommu-test
+	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
+		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" QTEST_GPGPU_REMOTE=1 \
+		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-remote-iommu-logs" \
+		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-iommu-test" --tap \
+		2>&1 | tee "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
+	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log")" = 2
+	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
+	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
+
 # ─── GPGPU 软件栈（实际 Linux PCI 驱动与运行时）────────────
 
 .PHONY: test-gpgpu-stack
 test-gpgpu-stack:
-	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test IOMMU="$(IOMMU)"
+	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test \
+		IOMMU="$(IOMMU)" REMOTE="$(REMOTE)" DEVICE_QEMU="$(DEVICE_QEMU)"
 
 # ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
 

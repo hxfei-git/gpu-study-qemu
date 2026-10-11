@@ -197,6 +197,27 @@ static VFIOUserContainer *vfio_user_create_container(VFIODevice *vbasedev,
     return container;
 }
 
+static bool vfio_user_map_socket_dma(VFIOUserProxy *proxy, Error **errp)
+{
+    VFIOUserDMAMap msg = { 0 };
+
+    /* 客户端 PCI DMA 检查窗口访问的权限和 IOMMU 翻译。 */
+    vfio_user_request_msg(&msg.hdr, VFIO_USER_DMA_MAP, sizeof(msg), 0);
+    msg.argsz = sizeof(struct vfio_iommu_type1_dma_map);
+    msg.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+    msg.size = UINT64_MAX;
+
+    if (!vfio_user_send_wait(proxy, &msg.hdr, NULL, 0, errp)) {
+        return false;
+    }
+    if (msg.hdr.flags & VFIO_USER_ERROR) {
+        error_setg_errno(errp, msg.hdr.error_reply,
+                         "登记消息 DMA 窗口失败");
+        return false;
+    }
+    return true;
+}
+
 /*
  * Try to mirror vfio_container_connect() as much as possible.
  */
@@ -219,10 +240,12 @@ vfio_user_container_connect(AddressSpace *as, VFIODevice *vbasedev,
 
     bcontainer = VFIO_IOMMU(container);
 
-    ret = ram_block_uncoordinated_discard_disable(true);
-    if (ret) {
-        error_setg_errno(errp, -ret, "Cannot set discarding of RAM broken");
-        goto free_container_exit;
+    if (!container->proxy->dma_via_socket) {
+        ret = ram_block_uncoordinated_discard_disable(true);
+        if (ret) {
+            error_setg_errno(errp, -ret, "Cannot set discarding of RAM broken");
+            goto free_container_exit;
+        }
     }
 
     vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
@@ -234,7 +257,9 @@ vfio_user_container_connect(AddressSpace *as, VFIODevice *vbasedev,
 
     vfio_address_space_insert(space, bcontainer);
 
-    if (!vfio_listener_register(bcontainer, errp)) {
+    if (container->proxy->dma_via_socket ?
+        !vfio_user_map_socket_dma(container->proxy, errp) :
+        !vfio_listener_register(bcontainer, errp)) {
         goto listener_release_exit;
     }
 
@@ -243,13 +268,17 @@ vfio_user_container_connect(AddressSpace *as, VFIODevice *vbasedev,
     return container;
 
 listener_release_exit:
-    vfio_listener_unregister(bcontainer);
+    if (!container->proxy->dma_via_socket) {
+        vfio_listener_unregister(bcontainer);
+    }
     if (vioc->release) {
         vioc->release(bcontainer);
     }
 
 enable_discards_exit:
-    ram_block_uncoordinated_discard_disable(false);
+    if (!container->proxy->dma_via_socket) {
+        ram_block_uncoordinated_discard_disable(false);
+    }
 
 free_container_exit:
     object_unref(container);
@@ -266,9 +295,10 @@ static void vfio_user_container_disconnect(VFIOUserContainer *container)
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
     VFIOAddressSpace *space = bcontainer->space;
 
-    ram_block_uncoordinated_discard_disable(false);
-
-    vfio_listener_unregister(bcontainer);
+    if (!container->proxy->dma_via_socket) {
+        ram_block_uncoordinated_discard_disable(false);
+        vfio_listener_unregister(bcontainer);
+    }
     if (vioc->release) {
         vioc->release(bcontainer);
     }

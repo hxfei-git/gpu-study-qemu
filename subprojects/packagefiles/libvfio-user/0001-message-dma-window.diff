@@ -1,3 +1,15 @@
+diff --git a/lib/dma.c b/lib/dma.c
+--- a/lib/dma.c
++++ b/lib/dma.c
+@@ -304,7 +304,7 @@ MOCK_DEFINE(dma_controller_add_region)(dma_controller_t *dma,
+              dma_addr, (char *)dma_addr + size, fd, offset, prot);
+
+-    if (size > dma->max_size) {
++    if (fd != -1 && size > dma->max_size) {
+         vfu_log(dma->vfu_ctx, LOG_ERR, "DMA region size %zu > max %zu",
+                 size, dma->max_size);
+         return ERROR_INT(ENOSPC);
+     }
 diff --git a/lib/libvfio-user.c b/lib/libvfio-user.c
 --- a/lib/libvfio-user.c
 +++ b/lib/libvfio-user.c

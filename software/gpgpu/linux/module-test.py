@@ -13,8 +13,10 @@ import re
 import selectors
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -25,6 +27,9 @@ ROOT = SOURCE.parents[2]
 IMAGES = ROOT / "build" / "gpgpu-arm64-linux"
 QEMU_DIRECTORY = ROOT / "build" / "arm64-qemu"
 QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-aarch64"
+DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv32"
+sys.path.insert(0, str(ROOT / "scripts"))
+from gpgpu_remote import RemoteDevice
 ISO_NAME = "alpine-virt-3.24.2-aarch64.iso"
 ISO_SHA256 = "a57ba668b5f6b17a670fcf8e799d5d7fe43766ed086d6ce2927b0625bf43dbf6"
 ISO_URL = (
@@ -100,17 +105,32 @@ def source_hash():
     return inputs_hash(BUILD_INPUTS, BUILD_VERSION)
 
 
-def ensure_qemu(output):
+def ensure_qemu(output, remote=False):
     QEMU_DIRECTORY.mkdir(parents=True, exist_ok=True)
     with (output / "qemu-build.log").open("w") as log:
-        if not (QEMU_DIRECTORY / "build.ninja").is_file():
+        configure = not (QEMU_DIRECTORY / "build.ninja").is_file()
+        if remote and not configure:
+            targets = (QEMU_DIRECTORY / "config-host.mak").read_text()
+            config_path = (QEMU_DIRECTORY /
+                           "riscv32-softmmu-config-devices.h")
+            config = config_path.read_text() if config_path.is_file() else ""
+            configure = ("riscv32-softmmu" not in targets or
+                         "#define CONFIG_VFIO_USER_SERVER 1" not in config)
+        if configure:
+            target_list = "aarch64-softmmu"
+            if remote:
+                target_list += ",riscv32-softmmu"
             subprocess.run([
-                str(ROOT / "configure"), "--target-list=aarch64-softmmu",
+                str(ROOT / "configure"), f"--target-list={target_list}",
                 "--disable-rust", "--disable-docs", "--disable-tools",
                 "--disable-guest-agent", "--enable-download",
                 "--extra-cflags=-O0 -g0",
-            ], cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
-        subprocess.run(["ninja", "-j4", "qemu-system-aarch64"],
+            ] + (["--enable-vfio-user-server"] if remote else []),
+                cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
+        binaries = ["qemu-system-aarch64"]
+        if remote:
+            binaries += ["qemu-system-riscv32"]
+        subprocess.run(["ninja", "-j4"] + binaries,
                        cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
     subprocess.run([str(QEMU_BINARY), "-device", "gpgpu,help"],
                    stdout=subprocess.DEVNULL, check=True)
@@ -208,10 +228,22 @@ def shared_directory(path, tag, readonly):
 
 
 class Guest:
-    def __init__(self, command, logfile):
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT)
+    def __init__(self, command, logfile, remote=None):
+        self.remote = remote
+        try:
+            if remote:
+                remote.start()
+                command = [remote.device_option() if arg == "@GPGPU_DEVICE@"
+                           else arg for arg in command]
+                (remote.log_directory / "host-command.json").write_text(
+                    json.dumps(command, ensure_ascii=False, indent=2) + "\n")
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT)
+        except BaseException:
+            if remote:
+                remote.close()
+            raise
         self.log = logfile.open("wb")
         self.buffer = b""
         self.selector = selectors.DefaultSelector()
@@ -229,6 +261,9 @@ class Guest:
                 return match
             if b"Kernel panic" in self.buffer:
                 raise RuntimeError("Guest kernel panic; inspect console log")
+            if self.remote and self.remote.process.poll() is not None:
+                raise RuntimeError(
+                    "远端 GPGPU 提前退出，请检查 device.log")
             for key, _ in self.selector.select(timeout=1):
                 data = os.read(key.fd, 65536)
                 if not data:
@@ -245,10 +280,16 @@ class Guest:
                 self.process.wait(timeout=15)
         except (BrokenPipeError, subprocess.TimeoutExpired):
             self.process.terminate()
-            self.process.wait(timeout=15)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
         finally:
             self.selector.close()
             self.log.close()
+            if self.remote:
+                self.remote.close()
 
 
 def module_metadata(module, runtime, fingerprint, environment):
@@ -381,7 +422,7 @@ def compile_module(output, fingerprint, environment):
     print(f"Updated {output / 'gpgpu_pci.ko'}", flush=True)
 
 
-def developer_command(output, iommu="none"):
+def developer_command(output, iommu="none", remote=False):
     check_iommu_kernel(output, iommu)
     command = base_command("1G", iommu=iommu) + [
         "-kernel", str(output / "vmlinuz-virt"),
@@ -390,7 +431,8 @@ def developer_command(output, iommu="none"):
         "-drive", f"file={output / 'developer.raw'},if=none,id=developer,"
         "format=raw",
         "-device", "virtio-blk-pci,drive=developer",
-        "-device", "gpgpu,bus=pcie.0", "-nic", "none",
+        "-device", "@GPGPU_DEVICE@" if remote else "gpgpu,bus=pcie.0",
+        "-nic", "none",
     ]
     command += shared_directory(SOURCE, "gpgpu_src", True)
     command += shared_directory(SOURCE.parent, "gpgpu_stack", True)
@@ -398,10 +440,10 @@ def developer_command(output, iommu="none"):
     return command
 
 
-def prepare(output, force, rebuild_module=False):
+def prepare(output, force, rebuild_module=False, remote=False):
     output.mkdir(parents=True, exist_ok=True)
     print("Checking ARM64 QEMU build...", flush=True)
-    ensure_qemu(output)
+    ensure_qemu(output, remote)
     fingerprint = source_hash()
     environment = environment_metadata(output)
     if (force or not environment or environment.get("source_hash")
@@ -418,7 +460,7 @@ def prepare(output, force, rebuild_module=False):
     compile_module(output, fingerprint, environment)
 
 
-def runtime_command(output, interactive=False, iommu="none"):
+def runtime_command(output, interactive=False, iommu="none", remote=False):
     if not QEMU_BINARY.is_file() or not prepared_metadata(output):
         raise RuntimeError("Run 'make prepare' before booting the module")
     check_iommu_kernel(output, iommu)
@@ -426,7 +468,7 @@ def runtime_command(output, interactive=False, iommu="none"):
         "-kernel", str(output / "vmlinuz-virt"),
         "-initrd", str(output / "initramfs-module"),
         "-append", kernel_command_line(iommu),
-        "-device", "gpgpu,bus=pcie.0",
+        "-device", "@GPGPU_DEVICE@" if remote else "gpgpu,bus=pcie.0",
     ]
     return (command + shared_directory(output, "gpgpu_module", True)
             + ["-nic", "none"])
@@ -461,12 +503,13 @@ def check_iommu_domain(guest, iommu):
     return {"mode": iommu, "device": device, "group": group, "type": domain}
 
 
-def test(output, iommu):
-    results = output / iommu
-    results.mkdir(exist_ok=True)
+def test(output, iommu, device_qemu=None):
+    results = output / "remote" / iommu if device_qemu else output / iommu
+    results.mkdir(parents=True, exist_ok=True)
     (results / "test.json").unlink(missing_ok=True)
-    guest = Guest(runtime_command(output, iommu=iommu),
-                  results / "test-console.log")
+    remote = RemoteDevice(device_qemu, results) if device_qemu else None
+    guest = Guest(runtime_command(output, iommu=iommu, remote=bool(remote)),
+                  results / "test-console.log", remote)
     try:
         guest.wait(rb"^.*# $")
         for command, marker in [
@@ -491,6 +534,7 @@ def test(output, iommu):
             "kernel_release": (output / "kernel-release").read_text().strip(),
             "module_sha256": sha256(output / "gpgpu_pci.ko"),
             "iommu": domain,
+            "transport": "vfio-user" if remote else "local",
             "module_checks_passed": 5,
             "kernel_faults": 0,
             "smmu_faults": 0,
@@ -509,9 +553,9 @@ def check_kernel_log(guest):
         raise RuntimeError("Guest kernel fault; inspect console log")
 
 
-def stack_test(output, iommu):
-    results = output / iommu
-    results.mkdir(exist_ok=True)
+def stack_test(output, iommu, device_qemu=None):
+    results = output / "remote" / iommu if device_qemu else output / iommu
+    results.mkdir(parents=True, exist_ok=True)
     (results / "stack-test.json").unlink(missing_ok=True)
     if not environment_metadata(output) or not prepared_metadata(output):
         raise RuntimeError("Run 'make prepare' before testing the stack")
@@ -520,8 +564,10 @@ def stack_test(output, iommu):
     # 因此重复测试无需下载开发软件包。
     subprocess.run(["make", "-C", str(SOURCE.parent),
                     f"BUILD_DIR={stack_output}", "kernels"], check=True)
-    command = developer_command(output, iommu)
-    guest = Guest(command, results / "stack-console.log")
+    remote = RemoteDevice(device_qemu, results) if device_qemu else None
+    command = developer_command(output, iommu, remote=bool(remote))
+    guest = Guest(command, results / "stack-console.log", remote)
+    guest_log = f"/mnt/gpgpu-build/{results.relative_to(output)}/stack-test.log"
     try:
         guest.wait(rb"^GPGPU_DEVELOPER_READY$")
         guest.send(
@@ -529,7 +575,7 @@ def stack_test(output, iommu):
             "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
             "gpgpu_stack /mnt/gpgpu-stack\n"
             "sh /mnt/gpgpu-src/guest-stack-test.sh "
-            f"> /mnt/gpgpu-build/{iommu}/stack-test.log 2>&1\n"
+            f"> {guest_log} 2>&1\n"
             "printf 'GPGPU_STACK_RC=%s\\n' \"$?\"\n"
         )
         result = guest.wait(rb"^GPGPU_STACK_RC=(\d+)$", timeout=600)
@@ -556,6 +602,7 @@ def stack_test(output, iommu):
             "demo_sha256": sha256(stack_output / "gpgpu-demo"),
             "tests_sha256": sha256(stack_output / "test-runtime"),
             "iommu": domain,
+            "transport": "vfio-user" if remote else "local",
             "guest_exit_code": int(result.group(1)),
             "demo_passed": 3,
             "demo_values_passed": sum(int(passed) for passed, _ in values),
@@ -580,24 +627,45 @@ def main():
                         help="系统 IOMMU 模式，默认 none")
     parser.add_argument("--skip-prepare", action="store_true",
                         help="Test existing artifacts without rebuilding")
+    parser.add_argument("--remote", action="store_true",
+                        help="连接远端 GPGPU")
+    parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY,
+                        help="远端设备 QEMU 路径")
     args = parser.parse_args()
     if args.skip_prepare and (args.command not in ("test", "stack-test")
                               or args.force):
         parser.error("--skip-prepare requires a test without --force")
+    if args.remote and args.command not in ("test", "stack-test", "run"):
+        parser.error("--remote 只适用于 test、stack-test 或 run")
+    device_qemu = args.device_qemu.resolve() if args.remote else None
+    if args.remote:
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, interrupted)
     output = args.output_dir.resolve()
     if args.command == "run":
-        command = runtime_command(output, interactive=True, iommu=args.iommu)
-        os.execv(command[0], command)
+        command = runtime_command(output, interactive=True, iommu=args.iommu,
+                                  remote=args.remote)
+        if not args.remote:
+            os.execv(command[0], command)
+        remote = RemoteDevice(device_qemu, output / "remote" / args.iommu)
+        try:
+            remote.start()
+            command = [remote.device_option() if arg == "@GPGPU_DEVICE@"
+                       else arg for arg in command]
+            subprocess.run(command, check=True)
+        finally:
+            remote.close()
     else:
         output.mkdir(parents=True, exist_ok=True)
         with (output / ".build.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if not args.skip_prepare:
-                prepare(output, args.force)
+                prepare(output, args.force, remote=args.remote)
             if args.command == "test":
-                test(output, args.iommu)
+                test(output, args.iommu, device_qemu)
             elif args.command == "stack-test":
-                stack_test(output, args.iommu)
+                stack_test(output, args.iommu, device_qemu)
 
 
 if __name__ == "__main__":
