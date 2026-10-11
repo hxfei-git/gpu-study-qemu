@@ -26,6 +26,7 @@ struct VFIOUserPCIDevice {
     bool send_queued;   /* all sends are queued */
     uint32_t wait_time; /* timeout for message replies */
     bool no_post;       /* all region writes are sync */
+    MemoryRegion *msix_table_region;
 };
 
 /*
@@ -57,9 +58,50 @@ static const MemoryRegionOps vfio_user_pba_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static uint64_t vfio_user_msix_table_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    VFIOPCIDevice *vdev = opaque;
+
+    return vfio_region_read(&vdev->bars[vdev->msix->table_bar].region,
+                            addr + vdev->msix->table_offset, size);
+}
+
+static void vfio_user_msix_table_write(void *opaque, hwaddr addr,
+                                      uint64_t data, unsigned size)
+{
+    VFIOPCIDevice *vdev = opaque;
+    PCIDevice *pdev = PCI_DEVICE(vdev);
+
+    /* 先更新服务端表项，再更新本地消息与 vector notifier。 */
+    vfio_region_write(&vdev->bars[vdev->msix->table_bar].region,
+                       addr + vdev->msix->table_offset, data, size);
+    memory_region_dispatch_write(&pdev->msix_table_mmio, addr, data,
+                                 size_memop(size), MEMTXATTRS_UNSPECIFIED);
+}
+
+static const MemoryRegionOps vfio_user_msix_table_ops = {
+    .read = vfio_user_msix_table_read,
+    .write = vfio_user_msix_table_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 8 },
+    .impl = { .max_access_size = 4 },
+};
+
 static void vfio_user_msix_setup(VFIOPCIDevice *vdev)
 {
+    VFIOUserPCIDevice *udev = VFIO_USER_PCI(vdev);
     MemoryRegion *vfio_reg, *msix_reg, *pba_reg;
+
+    udev->msix_table_region = g_new0(MemoryRegion, 1);
+    memory_region_init_io(udev->msix_table_region, OBJECT(vdev),
+                          &vfio_user_msix_table_ops, vdev, "VFIO MSIX table",
+                          vdev->msix->entries * PCI_MSIX_ENTRY_SIZE);
+    memory_region_add_subregion_overlap(vdev->bars[vdev->msix->table_bar].mr,
+                                        vdev->msix->table_offset,
+                                        udev->msix_table_region, 1);
+    /* 外层已持有 guard，不重复保护 shadow 更新。 */
+    PCI_DEVICE(vdev)->msix_table_mmio.disable_reentrancy_guard = true;
 
     pba_reg = g_new0(MemoryRegion, 1);
     vdev->msix->pba_region = pba_reg;
@@ -74,11 +116,21 @@ static void vfio_user_msix_setup(VFIOPCIDevice *vdev)
 
 static void vfio_user_msix_teardown(VFIOPCIDevice *vdev)
 {
+    VFIOUserPCIDevice *udev = VFIO_USER_PCI(vdev);
     MemoryRegion *mr, *sub;
+
+    if (!udev->msix_table_region) {
+        return;
+    }
+    memory_region_del_subregion(vdev->bars[vdev->msix->table_bar].mr,
+                                udev->msix_table_region);
+    object_unparent(OBJECT(udev->msix_table_region));
+    g_clear_pointer(&udev->msix_table_region, g_free);
 
     mr = vdev->bars[vdev->msix->pba_bar].mr;
     sub = vdev->msix->pba_region;
     memory_region_del_subregion(mr, sub);
+    object_unparent(OBJECT(sub));
 
     g_free(vdev->msix->pba_region);
     vdev->msix->pba_region = NULL;
@@ -96,7 +148,8 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         vfio_user_send_error(proxy, &msg->hdr, EINVAL);
         return;
     }
-    if (msg->count > proxy->max_xfer_size) {
+    if (msg->count > proxy->max_xfer_size ||
+        msg->offset > UINT64_MAX - msg->count) {
         vfio_user_send_error(proxy, &msg->hdr, E2BIG);
         return;
     }
@@ -107,7 +160,7 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
     memcpy(res, msg, sizeof(*res));
     g_free(msg);
 
-    r = pci_dma_read(pdev, res->offset, &res->data, res->count);
+    r = pci_dma_read(pdev, res->offset, res->data, res->count);
 
     switch (r) {
     case MEMTX_OK:
@@ -143,17 +196,19 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         return;
     }
     /* make sure transfer count isn't larger than the message data */
-    if (msg->count > msg->hdr.size - sizeof(*msg)) {
+    if (msg->count > proxy->max_xfer_size ||
+        msg->count > msg->hdr.size - sizeof(*msg) ||
+        msg->offset > UINT64_MAX - msg->count) {
         vfio_user_send_error(proxy, &msg->hdr, E2BIG);
         return;
     }
 
-    r = pci_dma_write(pdev, msg->offset, &msg->data, msg->count);
+    r = pci_dma_write(pdev, msg->offset, msg->data, msg->count);
 
     switch (r) {
     case MEMTX_OK:
         if ((msg->hdr.flags & VFIO_USER_NO_REPLY) == 0) {
-            vfio_user_send_reply(proxy, &msg->hdr, sizeof(msg->hdr));
+            vfio_user_send_reply(proxy, &msg->hdr, sizeof(*msg));
         } else {
             g_free(msg);
         }
@@ -337,6 +392,7 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
     return;
 
 out_teardown:
+    vfio_user_msix_teardown(vdev);
     vfio_pci_teardown_msi(vdev);
     vfio_pci_bars_exit(vdev);
 error:
