@@ -2,3 +2,4 @@
 url = https://gitlab.com/qemu-project/libvfio-user.git
 revision = 0b28d205572c80b568a1003db2c8f37ca333e4d7
 depth = 1
+diff_files = libvfio-user/0001-message-dma-window.diff

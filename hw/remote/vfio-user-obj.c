@@ -617,7 +617,11 @@ static void vfu_msix_irq_state(vfu_ctx_t *vfu_ctx, uint32_t start,
     VfuObject *o = vfu_get_private(vfu_ctx);
     uint32_t vector;
 
-    for (vector = start; vector < count; vector++) {
+    if (start >= msix_nr_vectors_allocated(o->pci_dev) ||
+        count > msix_nr_vectors_allocated(o->pci_dev) - start) {
+        return;
+    }
+    for (vector = start; vector < start + count; vector++) {
         msix_set_mask(o->pci_dev, vector, mask);
     }
 }
@@ -629,7 +633,11 @@ static void vfu_msi_irq_state(vfu_ctx_t *vfu_ctx, uint32_t start,
     Error *err = NULL;
     uint32_t vector;
 
-    for (vector = start; vector < count; vector++) {
+    if (start >= msi_nr_vectors_allocated(o->pci_dev) ||
+        count > msi_nr_vectors_allocated(o->pci_dev) - start) {
+        return;
+    }
+    for (vector = start; vector < start + count; vector++) {
         msi_set_mask(o->pci_dev, vector, mask, &err);
         if (err) {
             VFU_OBJECT_ERROR(o, "vfu: %s: %s", o->device,
@@ -655,7 +663,11 @@ static int vfu_object_setup_irqs(VfuObject *o, PCIDevice *pci_dev)
                                        msix_nr_vectors_allocated(pci_dev));
         vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_MSIX_IRQ,
                                      &vfu_msix_irq_state);
-    } else if (msi_nr_vectors_allocated(pci_dev)) {
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    if (msi_nr_vectors_allocated(pci_dev)) {
         ret = vfu_setup_device_nr_irqs(vfu_ctx, VFU_DEV_MSI_IRQ,
                                        msi_nr_vectors_allocated(pci_dev));
         vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_MSI_IRQ,
