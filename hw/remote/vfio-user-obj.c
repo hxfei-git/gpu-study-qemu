@@ -96,6 +96,7 @@ struct VfuObjectClass {
 struct VfuObject {
     /* private */
     Object parent;
+    GHashTable *dma_regions;
 
     SocketAddress *socket;
 
@@ -117,6 +118,68 @@ struct VfuObject {
     MSIPrepareMessageFunc *default_msi_prepare_message;
     MSIxPrepareMessageFunc *default_msix_prepare_message;
 };
+
+typedef struct VfuDmaRegion {
+    MemoryRegion mr;
+    VfuObject *owner;
+    hwaddr iova;
+} VfuDmaRegion;
+
+static const MemoryRegionOps vfu_dma_ops;
+
+static MemTxResult vfu_object_msg_dma_rw(VfuObject *o, hwaddr addr, void *buf,
+                                         hwaddr len, bool is_write)
+{
+    g_autofree dma_sg_t *sg = g_malloc(dma_sg_size());
+    uint8_t *ptr = buf;
+
+    if (!len || addr > UINT64_MAX - len) {
+        return MEMTX_ERROR;
+    }
+    while (len) {
+        hwaddr chunk = MIN(len, VFIO_USER_DEFAULT_MAX_DATA_XFER_SIZE);
+        int ret;
+
+        if (vfu_addr_to_sgl(o->vfu_ctx, (void *)(uintptr_t)addr, chunk, sg, 1,
+                           is_write ? PROT_WRITE : PROT_READ) != 1) {
+            return MEMTX_ERROR;
+        }
+        ret = is_write ? vfu_sgl_write(o->vfu_ctx, sg, 1, ptr) :
+                         vfu_sgl_read(o->vfu_ctx, sg, 1, ptr);
+        if (ret != 0) {
+            return MEMTX_ERROR;
+        }
+        len -= chunk;
+        addr += chunk;
+        ptr += chunk;
+    }
+    return MEMTX_OK;
+}
+
+MemTxResult vfu_object_dma_rw(PCIDevice *dev, dma_addr_t addr, void *buf,
+                             dma_addr_t len, bool is_write)
+{
+    MemoryRegionSection section;
+    MemTxResult result;
+    DMADirection dir = is_write ? DMA_DIRECTION_FROM_DEVICE :
+                                   DMA_DIRECTION_TO_DEVICE;
+
+    /* 沿 PCI DMA 映射查找完整消息区域。 */
+    section = memory_region_find(pci_get_address_space(dev)->root, addr, len);
+    if (section.mr && section.mr->ops == &vfu_dma_ops &&
+        section.offset_within_address_space == addr &&
+        int128_eq(section.size, int128_make64(len))) {
+        VfuDmaRegion *region = container_of(section.mr, VfuDmaRegion, mr);
+        hwaddr dma_addr = region->iova + section.offset_within_region;
+
+        result = vfu_object_msg_dma_rw(region->owner, dma_addr, buf, len,
+                                       is_write);
+    } else {
+        result = pci_dma_rw(dev, addr, buf, len, dir, MEMTXATTRS_UNSPECIFIED);
+    }
+    memory_region_unref(section.mr);
+    return result;
+}
 
 static void vfu_object_init_ctx(VfuObject *o, Error **errp);
 
@@ -305,29 +368,62 @@ static ssize_t vfu_object_cfg_access(vfu_ctx_t *vfu_ctx, char * const buf,
     return count;
 }
 
+static MemTxResult vfu_dma_read(void *opaque, hwaddr addr, uint64_t *data,
+                                unsigned size, MemTxAttrs attrs)
+{
+    VfuDmaRegion *region = opaque;
+    uint8_t buf[sizeof(uint64_t)] = { 0 };
+    MemTxResult ret = vfu_object_msg_dma_rw(region->owner, region->iova + addr,
+                                           buf, size, false);
+
+    *data = ldn_le_p(buf, size);
+    return ret;
+}
+
+static MemTxResult vfu_dma_write(void *opaque, hwaddr addr, uint64_t data,
+                                 unsigned size, MemTxAttrs attrs)
+{
+    VfuDmaRegion *region = opaque;
+    uint8_t buf[sizeof(uint64_t)];
+
+    stn_le_p(buf, size, data);
+    return vfu_object_msg_dma_rw(region->owner, region->iova + addr,
+                                 buf, size, true);
+}
+
+static const MemoryRegionOps vfu_dma_ops = {
+    .read_with_attrs = vfu_dma_read,
+    .write_with_attrs = vfu_dma_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = { .max_access_size = 8 },
+};
+
 static void dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     VfuObject *o = vfu_get_private(vfu_ctx);
-    AddressSpace *dma_as = NULL;
-    MemoryRegion *subregion = NULL;
+    AddressSpace *dma_as = pci_device_iommu_address_space(o->pci_dev);
+    VfuDmaRegion *region;
     g_autofree char *name = NULL;
     struct iovec *iov = &info->iova;
 
-    if (!info->vaddr) {
+    if (g_hash_table_contains(o->dma_regions, iov->iov_base)) {
         return;
     }
-
     name = g_strdup_printf("mem-%s-%"PRIx64"", o->device,
-                           (uint64_t)info->vaddr);
-
-    subregion = g_new0(MemoryRegion, 1);
-
-    memory_region_init_ram_ptr(subregion, NULL, name,
-                               iov->iov_len, info->vaddr);
-
-    dma_as = pci_device_iommu_address_space(o->pci_dev);
-
-    memory_region_add_subregion(dma_as->root, (hwaddr)iov->iov_base, subregion);
+                           (uint64_t)iov->iov_base);
+    region = g_new0(VfuDmaRegion, 1);
+    region->owner = o;
+    region->iova = (uintptr_t)iov->iov_base;
+    if (info->vaddr) {
+        memory_region_init_ram_ptr(&region->mr, OBJECT(o), name, iov->iov_len,
+                                   info->vaddr);
+    } else {
+        memory_region_init_io(&region->mr, OBJECT(o), &vfu_dma_ops, region,
+                              name, iov->iov_len);
+    }
+    memory_region_set_readonly(&region->mr, !(info->prot & PROT_WRITE));
+    memory_region_add_subregion(dma_as->root, region->iova, &region->mr);
+    g_hash_table_insert(o->dma_regions, iov->iov_base, region);
 
     trace_vfu_dma_register((uint64_t)iov->iov_base, iov->iov_len);
 }
@@ -335,20 +431,17 @@ static void dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 static void dma_unregister(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     VfuObject *o = vfu_get_private(vfu_ctx);
-    AddressSpace *dma_as = NULL;
-    MemoryRegion *mr = NULL;
-    ram_addr_t offset;
+    AddressSpace *dma_as = pci_device_iommu_address_space(o->pci_dev);
+    VfuDmaRegion *region = g_hash_table_lookup(o->dma_regions,
+                                              info->iova.iov_base);
 
-    mr = memory_region_from_host(info->vaddr, &offset);
-    if (!mr) {
+    if (!region) {
         return;
     }
-
-    dma_as = pci_device_iommu_address_space(o->pci_dev);
-
-    memory_region_del_subregion(dma_as->root, mr);
-
-    object_unparent((OBJECT(mr)));
+    memory_region_del_subregion(dma_as->root, &region->mr);
+    object_unparent(OBJECT(&region->mr));
+    g_hash_table_remove(o->dma_regions, info->iova.iov_base);
+    g_free(region);
 
     trace_vfu_dma_unregister((uint64_t)info->iova.iov_base);
 }
@@ -871,6 +964,8 @@ static void vfu_object_init(Object *obj)
     VfuObject *o = VFU_OBJECT(obj);
 
     k->nr_devs++;
+    o->dma_regions = g_hash_table_new(g_direct_hash, g_direct_equal);
+    o->vfu_poll_fd = -1;
 
     if (!object_dynamic_cast(OBJECT(current_machine), TYPE_REMOTE_MACHINE)) {
         error_setg(&o->err, "vfu: %s only compatible with %s machine",
@@ -882,8 +977,6 @@ static void vfu_object_init(Object *obj)
         o->machine_done.notify = vfu_object_machine_done;
         qemu_add_machine_init_done_notifier(&o->machine_done);
     }
-
-    o->vfu_poll_fd = -1;
 }
 
 static void vfu_object_finalize(Object *obj)
@@ -906,6 +999,7 @@ static void vfu_object_finalize(Object *obj)
         vfu_destroy_ctx(o->vfu_ctx);
         o->vfu_ctx = NULL;
     }
+    g_hash_table_destroy(o->dma_regions);
 
     g_free(o->device);
 

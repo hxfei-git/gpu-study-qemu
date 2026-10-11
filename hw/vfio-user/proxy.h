@@ -72,6 +72,8 @@ typedef struct VFIOUserProxy {
     AioContext *ctx;
     QEMUBH *req_bh;
     bool async_ops;
+    bool dma_via_socket;
+    QemuCond request_cv;
 
     /*
      * above only changed when BQL is held

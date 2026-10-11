@@ -21,6 +21,7 @@
 #include "qemu/lockable.h"
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "system/iothread.h"
 
 static IOThread *vfio_user_iothread;
@@ -158,6 +159,7 @@ static void vfio_user_process(VFIOUserProxy *proxy, VFIOUserMsg *msg)
      */
     if ((msg->hdr->flags & VFIO_USER_TYPE) == VFIO_USER_REPLY) {
         msg->complete = true;
+        qemu_cond_broadcast(&proxy->request_cv);
         if (msg->type == VFIO_MSG_WAIT) {
             qemu_cond_signal(&msg->cv);
         } else {
@@ -175,6 +177,7 @@ static void vfio_user_process(VFIOUserProxy *proxy, VFIOUserMsg *msg)
         }
     } else {
         QTAILQ_INSERT_TAIL(&proxy->incoming, msg, next);
+        qemu_cond_broadcast(&proxy->request_cv);
         qemu_bh_schedule(proxy->req_bh);
     }
 }
@@ -427,6 +430,7 @@ err:
             vfio_user_set_error(msg->hdr, EINVAL);
             msg->complete = true;
             qemu_cond_signal(&msg->cv);
+            qemu_cond_broadcast(&proxy->request_cv);
         }
     }
     return -1;
@@ -705,12 +709,18 @@ bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
 {
     VFIOUserMsg *msg;
     bool ok = false;
+    int64_t deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                       proxy->wait_time;
 
     if (hdr->flags & VFIO_USER_NO_REPLY) {
         error_setg_errno(errp, EINVAL, "%s on NO_REPLY message", __func__);
         return false;
     }
 
+    if (proxy->dma_via_socket) {
+        /* BQL 串行化请求；等待时处理反向 DMA。 */
+        assert(bql_locked());
+    }
     qemu_mutex_lock(&proxy->lock);
 
     msg = vfio_user_getmsg(proxy, hdr, fds);
@@ -722,8 +732,19 @@ bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
 
     if (ok) {
         while (!msg->complete) {
-            if (!qemu_cond_timedwait(&msg->cv, &proxy->lock,
-                                     proxy->wait_time)) {
+            int64_t remaining = deadline -
+                                qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+            if (proxy->dma_via_socket && !QTAILQ_EMPTY(&proxy->incoming)) {
+                qemu_mutex_unlock(&proxy->lock);
+                vfio_user_request(proxy);
+                qemu_mutex_lock(&proxy->lock);
+                continue;
+            }
+            if (remaining <= 0 ||
+                !qemu_cond_timedwait(proxy->dma_via_socket ?
+                                    &proxy->request_cv : &msg->cv,
+                                    &proxy->lock, remaining)) {
                 VFIOUserMsgQ *list;
 
                 list = msg->pending ? &proxy->pending : &proxy->outgoing;
@@ -930,6 +951,7 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
     proxy->state = VFIO_PROXY_CONNECTED;
 
     qemu_mutex_init(&proxy->lock);
+    qemu_cond_init(&proxy->request_cv);
     qemu_cond_init(&proxy->close_cv);
 
     if (vfio_user_iothread == NULL) {
@@ -1019,6 +1041,7 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     /* we now hold the only ref to proxy */
     qemu_mutex_unlock(&proxy->lock);
     qemu_cond_destroy(&proxy->close_cv);
+    qemu_cond_destroy(&proxy->request_cv);
     qemu_mutex_destroy(&proxy->lock);
 
     QLIST_REMOVE(proxy, next);
