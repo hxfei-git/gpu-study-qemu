@@ -55,6 +55,12 @@
 #define GPGPU_REG_DMA_CTRL          0x0414  /* DMA 控制寄存器 */
 #define GPGPU_REG_DMA_STATUS        0x0418  /* DMA 状态寄存器 */
 
+/* 原生 CP：未连接时读零，写入忽略。 */
+#define GPGPU_REG_CP_CTRL           0x0500  /* RESET_HOLD、只读 PRESENT */
+#define GPGPU_REG_CP_RESET_VECTOR   0x0504  /* CP 启动入口 */
+#define GPGPU_CP_RESET_HOLD         (1 << 0)
+#define GPGPU_CP_PRESENT            (1 << 1)
+
 /* 可读写的教学寄存器，与 RV32 解释器控制窗口分开。 */
 #define GPGPU_REG_THREAD_ID_X       0x1000  /* threadIdx.x */
 #define GPGPU_REG_THREAD_ID_Y       0x1004  /* threadIdx.y */

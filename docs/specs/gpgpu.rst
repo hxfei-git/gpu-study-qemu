@@ -129,19 +129,20 @@ Command Line Options
 ``warp_size``
     Number of threads per warp. Default: 32. Must be power of 2.
 
-双进程远端设备
---------------
+双进程与原生 CP
+----------------
 
 **[DESIGN]** 原单进程入口继续提供 A57 与 GPGPU 设备。本轮增加
 A57 Host 进程和 RISC-V 设备进程：Host 使用 ``vfio-user-pci``，设备进程使用
-已有的 ``x-remote,vfio-user=on`` machine，并显式创建 ``gpu0``。
-原计算解释器仍运行应用 kernel，设备进程不创建 CP。
+``gpgpu-cp`` machine，自动创建 ``gpu0`` 和默认保持复位的原生 RV32 CP。
+CP 的指令由 TCG（Tiny Code Generator，QEMU 动态代码生成基础设施）执行；
+原计算解释器仍运行应用 kernel。
 
 ::
 
     进程 A：A57 Linux
-      └─ PCIe 代理 ── 配置空间、BAR 请求 ──→ 进程 B：gpu0
-           ├─ PCI DMA 接口 ←─ B 的 DMA 请求       └─ 设备 VRAM
+      └─ PCIe 代理 ── 配置空间、BAR 请求 ──→ 进程 B：gpu0 + RV32 CP
+           ├─ PCI DMA 接口 ←─ B 的 DMA 请求       └─ 同一份 VRAM
            │    └─ SMMUv3（启用时）→ Host RAM
            └─ Linux 驱动 ←─ B 的中断通知
 
@@ -174,7 +175,8 @@ MSI-X 表和屏蔽状态在两端同步，计算、DMA 完成和错误通知保�
     make -C software/gpgpu/linux run REMOTE=1 IOMMU=smmuv3
 
 交互入口由 ``scripts/gpgpu_remote.py`` 启动 B，再连接 A，并保存两端命令和
-设备日志。Host 退出、启动超时和异常会清理两个进程。本版不支持断线重连和迁移。
+设备日志。Host 退出、启动超时和异常会清理两个进程。本版不支持断线重连和迁移，
+也不扩展 CP 发起异步 Host DMA 的功能。
 
 PCI Configuration
 -----------------
@@ -473,6 +475,48 @@ fault。ARM64、RISC-V 原有 GPGPU QTest 各 21/21，新专项 2/2，均无
 跳过，命令退出码均为 0。专项覆盖非恒等映射的 DMA 往返、未映射写入
 的错误通知与无完成通知，以及清错后的原映射恢复。没有增加跨页、
 只读权限或撤销／重映射用例；大块搬运沿用软件栈测试。
+
+CP 控制寄存器（0x0500）
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+**[DESIGN]** Host 已映射 BAR0、BAR2，接下来经 BAR2 装载固件，并解除
+CP 复位。CP 独立地址空间中的 ``0～vram_size-1`` 映射现有 VRAM 的同偏移。
+例如固件位于 ``0x4000``，Host 写 ``BAR2 基址 + 0x4000``，CP 从地址
+``0x4000`` 取指，两者访问同一份存储。Host BAR 地址不能用作 CP 入口。
+
+::
+
+    写 CP_CTRL.RESET_HOLD = 1，读回确认
+      → 经 BAR2 装载固件与初始数据
+      → 写 CP_RESET_VECTOR
+      → 执行访问屏障和读回，确认写入完成
+      → 清零 RESET_HOLD
+      → CP 执行，并把结果写入 VRAM
+      → Host 经 BAR2 读取结果
+
+``0x0500 CP_CTRL`` 是对齐、小端的 32 位寄存器。bit 0 ``RESET_HOLD``
+可读写、默认 1；bit 1 ``PRESENT`` 只读。连接 CP 时默认读回 3，解除复位后
+读回 2。保留位读零、写入忽略，写只读位也忽略。置位恢复原生 CPU 复位状态并
+保持不取指；清零后从入口执行。重复写入相同复位状态不会重新启动 CPU。
+
+``0x0504 CP_RESET_VECTOR`` 是对齐、小端的 32 位启动地址寄存器，默认 0。
+只有保持复位时可修改；地址须位于 VRAM 内，按 2 字节对齐。有效修改同步更新
+原生 CPU 复位向量和复位态 PC。非法入口或运行期间修改入口保留原值，并置位
+已有 ``ERROR_STATUS.INVALID_CMD``。没有连接 CP 的单进程设备对这两个
+寄存器读零、写入忽略。
+
+复位与启动在目标 CPU 线程中同步完成。CP 单独复位保留 VRAM、入口及原
+DMA、派发、中断状态。``GLOBAL_CTRL.RESET`` 复位设备状态，并使 CP 保持
+复位、入口恢复 0，VRAM 保留。设备冷复位先停止 CP，再清零 VRAM 并恢复
+全部默认状态。``GLOBAL_CTRL.ENABLE`` 不自动启动 CP。
+
+BAR、DMA、计算解释器和冷复位的 VRAM 写入使对应 TCG 翻译失效，支持复位后
+在相同地址替换固件。本轮不永久预留固件分区、不缩小可分配显存；CP 固件与
+原软件栈测试分别运行，明确各自代码和结果地址。
+
+**[BOUNDARY]** CP 本轮只执行基本固件，访问设备本地 VRAM。队列、Doorbell
+事件、计算派发和异步 Host DMA 尚未接入。这是 QEMU 教学接口，不表示
+MI300X 的控制核指令集、寄存器或内部结构。
 
 Thread Context Registers (0x1000 - 0x1FFF)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

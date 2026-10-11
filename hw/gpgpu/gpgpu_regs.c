@@ -11,6 +11,8 @@
 
 void gpgpu_reset_state(GPGPUState *s)
 {
+    /* 停止 CP 后再改变设备状态；此处保留 VRAM。 */
+    gpgpu_cp_reset(s);
     s->global_ctrl = 0;
     s->global_status = GPGPU_STATUS_READY;
     s->error_status = 0;
@@ -32,6 +34,8 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return gpgpu_kernel_read(s, addr);
     case GPGPU_REG_DMA_SRC_LO:
         return gpgpu_dma_read(s, addr);
+    case GPGPU_REG_CP_CTRL:
+        return gpgpu_cp_read(s, addr);
     }
 
     switch (addr) {
@@ -90,6 +94,9 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case GPGPU_REG_DMA_SRC_LO:
         gpgpu_dma_write(s, addr, val);
+        return;
+    case GPGPU_REG_CP_CTRL:
+        gpgpu_cp_write(s, addr, val);
         return;
     }
 

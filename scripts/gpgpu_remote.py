@@ -30,12 +30,10 @@ class RemoteDevice:
             "device": "gpu0", "socket": {"type": "unix", "path": self.socket},
         }
         command = [
-            str(self.binary), "-machine",
-            "x-remote,vfio-user=on,auto-shutdown=off",
+            str(self.binary), "-machine", "gpgpu-cp,auto-shutdown=off",
             "-accel", "tcg", "-run-with", "exit-with-parent=on",
             "-nodefaults", "-display", "none", "-monitor", "none",
-            "-serial", "none", "-device", "gpgpu,id=gpu0",
-            "-object", json.dumps(server),
+            "-serial", "none", "-object", json.dumps(server),
         ]
         (self.log_directory / "device-command.json").write_text(
             json.dumps(command, ensure_ascii=False, indent=2) + "\n")

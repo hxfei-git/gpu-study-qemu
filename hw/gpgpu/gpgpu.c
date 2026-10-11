@@ -29,17 +29,24 @@ static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
     return ldn_le_p(s->vram_ptr + addr, size);
 }
 
-static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
+void gpgpu_vram_store(GPGPUState *s, hwaddr addr, uint64_t val,
+                      unsigned size)
 {
-    GPGPUState *s = opaque;
+    uint8_t buf[8];
 
     if (!gpgpu_vram_contains(s, addr, size)) {
         gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
         return;
     }
 
-    stn_le_p(s->vram_ptr + addr, size, val);
+    stn_le_p(buf, size, val);
+    address_space_write(&s->vram_as, addr, MEMTXATTRS_UNSPECIFIED, buf, size);
+}
+
+static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    gpgpu_vram_store(opaque, addr, val, size);
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {
@@ -67,8 +74,14 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 
     pci_config_set_interrupt_pin(pci_conf, 1);
 
-    /* g_malloc0 分配失败时会终止进程，无需判断 NULL。 */
-    s->vram_ptr = g_malloc0(s->vram_size);
+    /* RAM 支持原生取指，BAR2 保留原访问语义。 */
+    if (!memory_region_init_ram_nomigrate(&s->vram_ram, OBJECT(s),
+                                          "gpgpu-vram-ram", s->vram_size,
+                                          errp)) {
+        return;
+    }
+    s->vram_ptr = memory_region_get_ram_ptr(&s->vram_ram);
+    address_space_init(&s->vram_as, &s->vram_ram, "gpgpu-vram-writes");
 
     /* BAR 0: control registers */
     memory_region_init_io(&s->ctrl_mmio, OBJECT(s), &gpgpu_ctrl_ops, s,
@@ -95,13 +108,13 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
                      &s->doorbell_mmio);
 
     if (!gpgpu_irq_init(s, errp)) {
-        g_free(s->vram_ptr);
+        address_space_destroy(&s->vram_as);
         return;
     }
     if (pcie_endpoint_cap_init(pdev, 0) < 0) {
         error_setg(errp, "GPGPU: cannot initialize PCIe endpoint capability");
         gpgpu_irq_cleanup(s);
-        g_free(s->vram_ptr);
+        address_space_destroy(&s->vram_as);
         return;
     }
     gpgpu_dma_init(s);
@@ -113,10 +126,11 @@ static void gpgpu_exit(PCIDevice *pdev)
 {
     GPGPUState *s = GPGPU(pdev);
 
+    gpgpu_cp_reset(s);
     gpgpu_dma_cleanup(s);
     gpgpu_irq_cleanup(s);
     pcie_cap_exit(pdev);
-    g_free(s->vram_ptr);
+    address_space_destroy(&s->vram_as);
 }
 
 static void gpgpu_reset(DeviceState *dev)
@@ -125,7 +139,8 @@ static void gpgpu_reset(DeviceState *dev)
 
     gpgpu_reset_state(s);
     /* 复位发生在 realize 成功之后，此时 VRAM 已分配。 */
-    memset(s->vram_ptr, 0, s->vram_size);
+    address_space_set(&s->vram_as, 0, 0, s->vram_size,
+                      MEMTXATTRS_UNSPECIFIED);
     gpgpu_irq_reset(s);
 }
 

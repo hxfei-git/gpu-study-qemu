@@ -61,6 +61,7 @@ help:
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
 	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
 	@echo "  test-gpgpu-remote-iommu  运行远端 GPGPU 的两项 SMMUv3 DMA QTest"
+	@echo "  test-gpgpu-cp      运行远端设备与 RV32 CP 的三项 QTest"
 	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
@@ -178,8 +179,8 @@ test-gpgpu-iommu:
 	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 
-# 远端测试使用已配置了 AArch64、RV32 与 vfio-user-server 的构建。
-.PHONY: test-gpgpu-remote-iommu
+# 三个目标共用已配置了 AArch64、RV32 与 vfio-user-server 的构建。
+.PHONY: test-gpgpu-remote-iommu test-gpgpu-cp
 test-gpgpu-remote-iommu:
 	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
 		qemu-system-aarch64 qemu-system-riscv32 tests/qtest/gpgpu-iommu-test
@@ -191,6 +192,18 @@ test-gpgpu-remote-iommu:
 	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log")" = 2
 	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
 	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
+
+test-gpgpu-cp:
+	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
+		qemu-system-aarch64 qemu-system-riscv32 tests/qtest/gpgpu-cp-test
+	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
+		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" \
+		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-cp-logs" \
+		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-cp-test" --tap \
+		2>&1 | tee "$(BUILD_DIR)/gpgpu-cp-qtest.log"
+	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-cp-qtest.log")" = 3
+	@grep -qx '1\.\.3' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
+	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
 
 # ─── GPGPU 软件栈（实际 Linux PCI 驱动与运行时）────────────
 

@@ -628,7 +628,7 @@ def main():
     parser.add_argument("--skip-prepare", action="store_true",
                         help="Test existing artifacts without rebuilding")
     parser.add_argument("--remote", action="store_true",
-                        help="连接远端 GPGPU")
+                        help="连接远端 GPGPU 与 RV32 CP")
     parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY,
                         help="远端设备 QEMU 路径")
     args = parser.parse_args()

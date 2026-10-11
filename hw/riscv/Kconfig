@@ -9,6 +9,12 @@ config IBEX
 
 # RISC-V machines in alphabetical order
 
+config GPGPU_CP
+    bool
+    default y
+    depends on RISCV32 && VFIO_USER_SERVER
+    select GPGPU
+
 config MICROCHIP_PFSOC
     bool
     default y
