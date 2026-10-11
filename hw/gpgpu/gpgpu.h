@@ -67,10 +67,16 @@ typedef struct GPGPUSIMTContext {
     uint32_t thread_mask;      /* 第 N 位对应 lane N。 */
 } GPGPUSIMTContext;
 
+/* machine 在目标 CPU 线程中同步完成复位和启动。 */
+typedef void (*GPGPUCPSetState)(void *opaque, bool reset_hold,
+                               uint32_t reset_vector);
+
 struct GPGPUState {
     PCIDevice parent_obj;
     MemoryRegion ctrl_mmio;    /* BAR0：gpgpu_regs.c 分发访问。 */
     MemoryRegion vram;         /* BAR2：vram_ptr 的 PCI 窗口。 */
+    MemoryRegion vram_ram;     /* BAR2 和 CP 共用的 RAM。 */
+    AddressSpace vram_as;      /* 外部写入触发 TCG 失效。 */
     MemoryRegion doorbell_mmio; /* BAR4：gpgpu_doorbell.c 中预留。 */
 
     uint32_t num_cus;          /* QOM 属性，通过 DEV_CAPS 返回。 */
@@ -78,6 +84,11 @@ struct GPGPUState {
     uint32_t warp_size;        /* QOM 属性；解释器使用 32 个 lane。 */
     uint64_t vram_size;        /* QOM 属性，单位为字节。 */
     uint8_t *vram_ptr;         /* 后备存储的 QEMU 进程指针。 */
+
+    GPGPUCPSetState cp_set_state;
+    void *cp_opaque;
+    bool cp_reset_hold;
+    uint32_t cp_reset_vector;
 
     GPGPUControl global_ctrl;  /* 保存 ENABLE 标志，不锁存 RESET。 */
     GPGPUStatus global_status; /* 只读的 GPGPUStatus 标志。 */
@@ -106,6 +117,14 @@ static inline bool gpgpu_vram_word_valid(GPGPUState *s, uint64_t addr)
 extern const MemoryRegionOps gpgpu_ctrl_ops;
 extern const MemoryRegionOps gpgpu_doorbell_ops;
 void gpgpu_reset_state(GPGPUState *s);
+
+/* CP 连接和寄存器不依赖具体 CPU 架构。 */
+void gpgpu_attach_cp(GPGPUState *s, GPGPUCPSetState set_state, void *opaque);
+void gpgpu_cp_reset(GPGPUState *s);
+uint32_t gpgpu_cp_read(GPGPUState *s, hwaddr addr);
+void gpgpu_cp_write(GPGPUState *s, hwaddr addr, uint32_t val);
+void gpgpu_vram_store(GPGPUState *s, hwaddr addr, uint64_t value,
+                      unsigned size);
 
 /* 中断寄存器访问与 PCI 中断通知。 */
 uint32_t gpgpu_irq_read(GPGPUState *s, hwaddr addr);

@@ -35,8 +35,7 @@ static inline void gpgpu_remote_start(GPGPURemote *remote)
     remote->log = g_strdup_printf("%s/device-%u.log",
                                   logs ? logs : remote->directory, ++sequence);
     quoted_log = g_shell_quote(remote->log);
-    args = g_strdup_printf("-machine x-remote,vfio-user=on,"
-                           "auto-shutdown=off -device gpgpu,id=gpu0 "
+    args = g_strdup_printf("-machine gpgpu-cp,auto-shutdown=off "
                            "-accel tcg -nodefaults -serial none 2>%s",
                            quoted_log);
     remote->qts = qtest_init_ext("QTEST_GPGPU_REMOTE_BINARY", args, NULL, true);

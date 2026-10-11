@@ -57,8 +57,17 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
         result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr,
                                    s->vram_ptr + vram_addr, s->dma.size, true);
     } else {
-        result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr,
-                                   s->vram_ptr + vram_addr, s->dma.size, false);
+        hwaddr mapped_size = s->dma.size;
+        void *vram = address_space_map(&s->vram_as, vram_addr, &mapped_size,
+                                       true, MEMTXATTRS_UNSPECIFIED);
+
+        /* 连续 RAM 范围已在上面检查，应始终完整映射。 */
+        assert(vram && mapped_size == s->dma.size);
+        result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr, vram,
+                                   s->dma.size, false);
+        /* 失败可能已有部分写入，因此失效整个范围。 */
+        address_space_unmap(&s->vram_as, vram, mapped_size, true,
+                            s->dma.size);
     }
     if (result != MEMTX_OK) {
         s->dma.status = GPGPU_DMA_ERROR;

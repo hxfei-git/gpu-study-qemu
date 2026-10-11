@@ -424,7 +424,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                     if (!gpgpu_vram_word_valid(s, addr)) {
                         return -1;
                     }
-                    stl_le_p(s->vram_ptr + addr, value);
+                    gpgpu_vram_store(s, addr, value, sizeof(value));
                     lane->pc += 4;
                     break;
                 }

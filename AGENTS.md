@@ -82,7 +82,9 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 根据用户反馈，进阶实验一已完成，并已搭配 A57、支持 SMMUv3 系统 IOMMU。
 当前进入第二阶段：用户 AQL Queue、Doorbell、CP 与 Signal。实现前先阅读
 [QEMU GPGPU 四阶段实验大纲](<../QEMU GPGPU 实验大纲.md>) 中的第二阶段 v1 规格，
-实验计划继续统一在该大纲维护。第二阶段尚未记录实现完成或运行验收通过。
+实验计划继续统一在该大纲维护。2026-10-11 已完成远端设备与原生 CP 基础接入，
+回归结果见 [验收记录](<../远端 GPGPU 与 RISC-V CP 验收记录.md>)。第二阶段
+队列功能尚未记录实现完成或整体运行验收通过。
 
 `hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支；
 `hxfei-qemu` 保留早期开发历史。第一阶段软件栈位于 `software/gpgpu/`，
