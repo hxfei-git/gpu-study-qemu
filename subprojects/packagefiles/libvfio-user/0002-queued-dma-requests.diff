@@ -1,0 +1,462 @@
+diff --git a/lib/tran_sock.c b/lib/tran_sock.c
+--- a/lib/tran_sock.c
++++ b/lib/tran_sock.c
+@@ -43,10 +43,48 @@
+ 
+ #include "tran_sock.h"
+ 
++typedef struct deferred_request {
++    struct vfio_user_header hdr;
++    void *body;
++    int *fds;
++    size_t nr_fds;
++    struct deferred_request *next;
++} deferred_request_t;
++
+ typedef struct {
+     int listen_fd;
+     int conn_fd;
++    deferred_request_t *head;
++    deferred_request_t *tail;
++    deferred_request_t *current;
+ } tran_sock_t;
++
++static void
++free_deferred(deferred_request_t *req)
++{
++    if (req == NULL) {
++        return;
++    }
++    for (size_t i = 0; i < req->nr_fds; i++) {
++        close(req->fds[i]);
++    }
++    free(req->fds);
++    free(req->body);
++    free(req);
++}
++
++static void
++clear_deferred(tran_sock_t *ts)
++{
++    while (ts->head != NULL) {
++        deferred_request_t *req = ts->head;
++        ts->head = req->next;
++        free_deferred(req);
++    }
++    ts->tail = NULL;
++    free_deferred(ts->current);
++    ts->current = NULL;
++}
+ 
+ int
+ tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
+@@ -137,6 +175,26 @@
+                                 ARRAY_SIZE(iovecs), NULL, 0, 0);
+ }
+ 
++/* recvmsg 已交付的 FD 不能因报文头不完整而泄漏。 */
++static void
++close_received_fds(struct msghdr *msg)
++{
++    struct cmsghdr *cmsg;
++
++    for (cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL;
++         cmsg = CMSG_NXTHDR(msg, cmsg)) {
++        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++            cmsg->cmsg_len >= CMSG_LEN(0)) {
++            size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++            int *received = (int *)CMSG_DATA(cmsg);
++
++            for (size_t i = 0; i < count; i++) {
++                close(received[i]);
++            }
++        }
++    }
++}
++
+ static int
+ get_msg(void *data, size_t len, int *fds, size_t *nr_fds, int sock_fd,
+         int sock_flags)
+@@ -159,10 +217,12 @@
+     } else if (ret == 0) {
+         return ERROR_INT(ENOMSG);
+     } else if ((size_t)ret < len) {
++        close_received_fds(&msg);
+         return ERROR_INT(ECONNRESET);
+     }
+ 
+     if (msg.msg_flags & MSG_CTRUNC || msg.msg_flags & MSG_TRUNC) {
++        close_received_fds(&msg);
+         return ERROR_INT(EFAULT);
+     }
+ 
+@@ -491,6 +551,28 @@
+         return ERROR_INT(ENOTCONN);
+     }
+ 
++    /* 上次请求可能在验证 header 或分配 msg 时失败，尚未接走 body。 */
++    free_deferred(ts->current);
++    ts->current = NULL;
++    if (ts->head != NULL) {
++        deferred_request_t *req = ts->head;
++
++        if (*nr_fds < req->nr_fds) {
++            return ERROR_INT(EMSGSIZE);
++        }
++        ts->head = req->next;
++        if (ts->head == NULL) {
++            ts->tail = NULL;
++        }
++        *hdr = req->hdr;
++        memcpy(fds, req->fds, req->nr_fds * sizeof(*fds));
++        *nr_fds = req->nr_fds;
++        /* FD 交给调用方的 alloc_msg/free_msg，禁止再次关闭。 */
++        req->nr_fds = 0;
++        ts->current = req;
++        return sizeof(*hdr);
++    }
++
+     /*
+      * TODO ideally we should set O_NONBLOCK on the fd so that the syscall is
+      * faster (?). I tried that and get short reads, so we need to store the
+@@ -520,6 +602,14 @@
+     }
+ 
+     assert(msg->in.iov.iov_len <= SERVER_MAX_MSG_SIZE);
++
++    if (ts->current != NULL) {
++        msg->in.iov.iov_base = ts->current->body;
++        ts->current->body = NULL;
++        free_deferred(ts->current);
++        ts->current = NULL;
++        return 0;
++    }
+ 
+     msg->in.iov.iov_base = malloc(msg->in.iov.iov_len);
+ 
+@@ -608,22 +698,100 @@
+     return ret;
+ }
+ 
++/* DMA 等待时完整接收请求，只暂存，不重入设备回调。 */
++static deferred_request_t *
++recv_deferred(tran_sock_t *ts)
++{
++    deferred_request_t *req = calloc(1, sizeof(*req));
++    size_t size;
++
++    if (req == NULL) {
++        return NULL;
++    }
++    req->fds = calloc(VFIO_USER_CLIENT_MAX_MSG_FDS_LIMIT, sizeof(int));
++    if (req->fds == NULL) {
++        free(req);
++        return NULL;
++    }
++    req->nr_fds = VFIO_USER_CLIENT_MAX_MSG_FDS_LIMIT;
++    if (get_msg(&req->hdr, sizeof(req->hdr), req->fds, &req->nr_fds,
++                ts->conn_fd, MSG_WAITALL) < 0) {
++        goto fail;
++    }
++    if (req->hdr.msg_size < sizeof(req->hdr) ||
++        req->hdr.msg_size > SERVER_MAX_MSG_SIZE) {
++        goto fail;
++    }
++    size = req->hdr.msg_size - sizeof(req->hdr);
++    if (size != 0) {
++        req->body = malloc(size);
++        if (req->body == NULL ||
++            recv(ts->conn_fd, req->body, size, MSG_WAITALL) != (ssize_t)size) {
++            goto fail;
++        }
++    }
++    return req;
++
++fail:
++    free_deferred(req);
++    /* 报文不完整后不能继续解释同一字节流。 */
++    errno = ECONNRESET;
++    return NULL;
++}
++
+ static int
+ tran_sock_send_msg(vfu_ctx_t *vfu_ctx, uint16_t msg_id,
+-              enum vfio_user_command cmd,
+-              void *send_data, size_t send_len,
+-              struct vfio_user_header *hdr,
+-              void *recv_data, size_t recv_len)
+-{
+-    tran_sock_t *ts;
+-
+-    assert(vfu_ctx != NULL);
+-    assert(vfu_ctx->tran_data != NULL);
+-
+-    ts = vfu_ctx->tran_data;
+-
+-    return tran_sock_msg(ts->conn_fd, msg_id, cmd, send_data, send_len,
+-                         hdr, recv_data, recv_len);
++                   enum vfio_user_command cmd,
++                   void *send_data, size_t send_len,
++                   struct vfio_user_header *hdr,
++                   void *recv_data, size_t recv_len)
++{
++    tran_sock_t *ts = vfu_ctx->tran_data;
++    deferred_request_t *reply;
++    int ret;
++
++    ret = tran_sock_send(ts->conn_fd, msg_id, false, cmd,
++                         send_data, send_len);
++    if (ret < 0) {
++        return ret;
++    }
++    for (;;) {
++        reply = recv_deferred(ts);
++        if (reply == NULL) {
++            return ERROR_INT(ECONNRESET);
++        }
++        if (reply->hdr.flags.type == VFIO_USER_F_TYPE_COMMAND) {
++            if (ts->tail != NULL) {
++                ts->tail->next = reply;
++            } else {
++                ts->head = reply;
++            }
++            ts->tail = reply;
++            continue;
++        }
++        if (reply->hdr.flags.type != VFIO_USER_F_TYPE_REPLY ||
++            reply->hdr.msg_id != msg_id || reply->nr_fds != 0) {
++            free_deferred(reply);
++            return ERROR_INT(ECONNRESET);
++        }
++        if (hdr != NULL) {
++            *hdr = reply->hdr;
++        }
++        if (reply->hdr.flags.error) {
++            ret = reply->hdr.error_no > 0 ? reply->hdr.error_no : EINVAL;
++            free_deferred(reply);
++            return ERROR_INT(ret);
++        }
++        if (reply->hdr.msg_size - sizeof(reply->hdr) != recv_len) {
++            free_deferred(reply);
++            return ERROR_INT(ECONNRESET);
++        }
++        if (recv_len != 0) {
++            memcpy(recv_data, reply->body, recv_len);
++        }
++        free_deferred(reply);
++        return 0;
++    }
+ }
+ 
+ static void
+@@ -635,6 +803,9 @@
+ 
+     ts = vfu_ctx->tran_data;
+ 
++    if (ts != NULL) {
++        clear_deferred(ts);
++    }
+     if (ts != NULL && ts->conn_fd != -1) {
+         // FIXME: handle EINTR
+         (void) close(ts->conn_fd);
+@@ -651,6 +822,9 @@
+ 
+     ts = vfu_ctx->tran_data;
+ 
++    if (ts != NULL) {
++        clear_deferred(ts);
++    }
+     if (ts != NULL && ts->listen_fd != -1) {
+         // FIXME: handle EINTR
+         (void) close(ts->listen_fd);
+diff --git a/test/py/test_dma_interleave.py b/test/py/test_dma_interleave.py
+new file mode 100644
+--- /dev/null
++++ b/test/py/test_dma_interleave.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# DMA 等待期间交错的 Host 请求必须完整暂存，不能被当成 DMA 回复。
++
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++from libvfio_user import *
++
++for fn in (lib.vfu_sgl_read, lib.vfu_sgl_write):
++    fn.argtypes = (c.c_void_p, c.POINTER(dma_sg_t), c.c_size_t, c.c_void_p)
++    fn.restype = c.c_int
++
++
++def recv_exact(sock, size):
++    data = b''
++    while len(data) < size:
++        chunk = sock.recv(size - len(data))
++        assert chunk
++        data += chunk
++    return data
++
++
++def receive(sock):
++    hdr = struct.unpack('HHIII', recv_exact(sock, 16))
++    return hdr, recv_exact(sock, hdr[2] - 16)
++
++
++def config_request():
++    body = struct.pack('QII', 0, VFU_PCI_DEV_CFG_REGION_IDX, 4)
++    return vfio_user_header(VFIO_USER_REGION_READ, len(body)) + body
++
++
++def respond_dma(sock, error=0):
++    hdr, body = receive(sock)
++    assert hdr[1] in (VFIO_USER_DMA_READ, VFIO_USER_DMA_WRITE)
++    addr, count = struct.unpack('QQ', body[:16])
++    if error:
++        # 错误回复也带 body，验证它不会留在流中污染下一条报文。
++        payload = b'error-body'
++    else:
++        payload = struct.pack('QQ', addr, count)
++        if hdr[1] == VFIO_USER_DMA_READ:
++            payload += b'\x5a' * count
++        else:
++            assert body[16:] == b'\x33' * count
++    flags = VFIO_USER_F_TYPE_REPLY | (0x20 if error else 0)
++    return struct.pack('HHIII', hdr[0], hdr[1], 16 + len(payload),
++                       flags, error) + payload
++
++
++@pytest.fixture
++def session():
++    ctx = prepare_ctx_for_dma(quiesce=None)
++    sock = connect_client(ctx)
++    sock.settimeout(3)
++    body = vfio_user_dma_map(argsz=len(vfio_user_dma_map()),
++        flags=VFIO_USER_F_DMA_REGION_READ | VFIO_USER_F_DMA_REGION_WRITE,
++        offset=0, addr=0x1000, size=4096)
++    msg(ctx, sock, VFIO_USER_DMA_MAP, body)
++    ret, sg = vfu_addr_to_sgl(ctx, 0x1000, 4)
++    assert ret == 1
++    yield ctx, sock, sg
++    sock.close()
++    vfu_destroy_ctx(ctx)
++
++
++def dma_roundtrip(session, peer, write=False):
++    ctx, sock, sg = session
++    data = c.create_string_buffer(b'\x33' * 4, 4)
++    fn = lib.vfu_sgl_write if write else lib.vfu_sgl_read
++    # 客户端线程只操作 socket，所有库调用仍由同一个线程执行。
++    def checked_peer():
++        try:
++            peer(sock)
++        except BaseException:
++            sock.shutdown(socket.SHUT_RDWR)
++            raise
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        future = pool.submit(checked_peer)
++        ret = fn(ctx, sg, 1, data)
++        saved_errno = c.get_errno()
++        future.result(timeout=3)
++    return ret, saved_errno, data.raw
++
++
++@pytest.mark.parametrize('write', [False, True])
++def test_command_before_dma_reply(session, write):
++    ctx, sock, sg = session
++
++    def peer(sock):
++        reply = respond_dma(sock)
++        sock.sendall(config_request() + reply)
++
++    ret, _, data = dma_roundtrip(session, peer, write)
++    assert ret == 0
++    assert data == (b'\x33' if write else b'\x5a') * 4
++    # 客户端没有再发新请求，仍应能从暂存队列得到一条请求。
++    assert vfu_run_ctx(ctx) == 1
++    hdr, body = receive(sock)
++    assert hdr[1] == VFIO_USER_REGION_READ
++    assert hdr[4] == 0 and len(body) == 20
++    assert vfu_run_ctx(ctx) == 0
++    ret, _, _ = dma_roundtrip(session,
++                              lambda s: s.sendall(respond_dma(s)), write)
++    assert ret == 0
++
++
++def test_error_reply_body_consumed(session):
++    ctx, sock, sg = session
++
++    def peer(sock):
++        reply = respond_dma(sock, errno.EFAULT)
++        sock.sendall(config_request() + reply)
++
++    ret, err, _ = dma_roundtrip(session, peer)
++    assert ret == -1 and err == errno.EFAULT
++    assert vfu_run_ctx(ctx) == 1
++    hdr, _ = receive(sock)
++    assert hdr[4] == 0
++    ret, _, _ = dma_roundtrip(session, lambda s: s.sendall(respond_dma(s)))
++    assert ret == 0
++
++
++def test_deferred_map_preserves_fd(session):
++    ctx, sock, sg = session
++    with tempfile.TemporaryFile() as backing:
++        backing.write(b'\x7b' * 4096)
++        backing.flush()
++        body = vfio_user_dma_map(argsz=len(vfio_user_dma_map()),
++            flags=VFIO_USER_F_DMA_REGION_READ | VFIO_USER_F_DMA_REGION_WRITE,
++            offset=0, addr=0x3000, size=4096)
++        request = vfio_user_header(VFIO_USER_DMA_MAP, len(body)) + bytes(body)
++
++        def peer(sock):
++            reply = respond_dma(sock)
++            sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
++                                      struct.pack('i', backing.fileno()))])
++            sock.sendall(reply)
++
++        ret, _, _ = dma_roundtrip(session, peer)
++        assert ret == 0
++        assert vfu_run_ctx(ctx) == 1
++        hdr, _ = receive(sock)
++        assert hdr[1] == VFIO_USER_DMA_MAP and hdr[4] == 0
++        ret, mapped = vfu_addr_to_sgl(ctx, 0x3000, 4)
++        assert ret == 1
++        iov = iovec_t()
++        assert vfu_sgl_get(ctx, mapped, iov) == 0
++        assert c.string_at(iov.iov_base, 4) == b'\x7b' * 4
++        vfu_sgl_put(ctx, mapped, iov)
++
++
++@pytest.mark.parametrize('partial', [False, True])
++def test_disconnect_discards_deferred_fd(session, partial):
++    ctx, sock, sg = session
++    with tempfile.TemporaryFile() as backing:
++        backing.truncate(4096)
++        before = len(os.listdir('/proc/self/fd'))
++        body = vfio_user_dma_map(argsz=len(vfio_user_dma_map()),
++            flags=VFIO_USER_F_DMA_REGION_READ, offset=0,
++            addr=0x3000, size=4096)
++        request = vfio_user_header(VFIO_USER_DMA_MAP, len(body)) + bytes(body)
++
++        def peer(sock):
++            receive(sock)
++            fragment = request[:8] if partial else request
++            sock.sendmsg([fragment], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
++                                      struct.pack('i', backing.fileno()))])
++            sock.shutdown(socket.SHUT_RDWR)
++
++        ret, err, _ = dma_roundtrip(session, peer)
++        assert ret == -1 and err == errno.ENOTCONN
++        # 服务端 conn_fd 也关闭了，暂存的 FD 不能泄漏。
++        assert len(os.listdir('/proc/self/fd')) <= before
+diff --git a/test/py/meson.build b/test/py/meson.build
+--- a/test/py/meson.build
++++ b/test/py/meson.build
+@@ -35,6 +35,7 @@
+     'test_device_set_irqs.py',
+     'test_dirty_pages.py',
+     'test_dma_map.py',
++    'test_dma_interleave.py',
+     'test_dma_unmap.py',
+     'test_irq_trigger.py',
+     'test_migration.py',

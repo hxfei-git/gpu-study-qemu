@@ -114,18 +114,22 @@ struct VfuObject {
 
     int vfu_poll_fd;
 
+    QEMUBH *dma_drain_bh;
+
     MSITriggerFunc *default_msi_trigger;
     MSIPrepareMessageFunc *default_msi_prepare_message;
     MSIxPrepareMessageFunc *default_msix_prepare_message;
 };
 
 typedef struct VfuDmaRegion {
+    Object parent;
     MemoryRegion mr;
     VfuObject *owner;
     hwaddr iova;
 } VfuDmaRegion;
 
 static const MemoryRegionOps vfu_dma_ops;
+static void vfu_object_ctx_run(void *opaque);
 
 static MemTxResult vfu_object_msg_dma_rw(VfuObject *o, hwaddr addr, void *buf,
                                          hwaddr len, bool is_write)
@@ -146,6 +150,8 @@ static MemTxResult vfu_object_msg_dma_rw(VfuObject *o, hwaddr addr, void *buf,
         }
         ret = is_write ? vfu_sgl_write(o->vfu_ctx, sg, 1, ptr) :
                          vfu_sgl_read(o->vfu_ctx, sg, 1, ptr);
+        /* socket 可能已空，仍需处理暂存的 Host 请求。 */
+        qemu_bh_schedule(o->dma_drain_bh);
         if (ret != 0) {
             return MEMTX_ERROR;
         }
@@ -398,6 +404,14 @@ static const MemoryRegionOps vfu_dma_ops = {
     .impl = { .max_access_size = 8 },
 };
 
+static void vfu_dma_region_free(void *opaque)
+{
+    VfuDmaRegion *region = opaque;
+
+    object_unref(OBJECT(region->owner));
+    g_free(region);
+}
+
 static void dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     VfuObject *o = vfu_get_private(vfu_ctx);
@@ -412,13 +426,16 @@ static void dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
     name = g_strdup_printf("mem-%s-%"PRIx64"", o->device,
                            (uint64_t)iov->iov_base);
     region = g_new0(VfuDmaRegion, 1);
+    object_initialize(region, sizeof(*region), TYPE_CONTAINER);
+    OBJECT(region)->free = vfu_dma_region_free;
     region->owner = o;
+    object_ref(OBJECT(o));
     region->iova = (uintptr_t)iov->iov_base;
     if (info->vaddr) {
-        memory_region_init_ram_ptr(&region->mr, OBJECT(o), name, iov->iov_len,
-                                   info->vaddr);
+        memory_region_init_ram_ptr(&region->mr, OBJECT(region), name,
+                                   iov->iov_len, info->vaddr);
     } else {
-        memory_region_init_io(&region->mr, OBJECT(o), &vfu_dma_ops, region,
+        memory_region_init_io(&region->mr, OBJECT(region), &vfu_dma_ops, region,
                               name, iov->iov_len);
     }
     memory_region_set_readonly(&region->mr, !(info->prot & PROT_WRITE));
@@ -439,9 +456,9 @@ static void dma_unregister(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
         return;
     }
     memory_region_del_subregion(dma_as->root, &region->mr);
-    object_unparent(OBJECT(&region->mr));
     g_hash_table_remove(o->dma_regions, info->iova.iov_base);
-    g_free(region);
+    /* 旧 FlatView 释放最后一个引用后，才销毁映射。 */
+    object_unref(OBJECT(region));
 
     trace_vfu_dma_unregister((uint64_t)info->iova.iov_base);
 }
@@ -966,6 +983,7 @@ static void vfu_object_init(Object *obj)
     k->nr_devs++;
     o->dma_regions = g_hash_table_new(g_direct_hash, g_direct_equal);
     o->vfu_poll_fd = -1;
+    o->dma_drain_bh = qemu_bh_new(vfu_object_ctx_run, o);
 
     if (!object_dynamic_cast(OBJECT(current_machine), TYPE_REMOTE_MACHINE)) {
         error_setg(&o->err, "vfu: %s only compatible with %s machine",
@@ -994,6 +1012,9 @@ static void vfu_object_finalize(Object *obj)
         qemu_set_fd_handler(o->vfu_poll_fd, NULL, NULL, NULL);
         o->vfu_poll_fd = -1;
     }
+
+    qemu_bh_delete(o->dma_drain_bh);
+    o->dma_drain_bh = NULL;
 
     if (o->vfu_ctx) {
         vfu_destroy_ctx(o->vfu_ctx);
