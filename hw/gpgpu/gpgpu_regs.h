@@ -61,6 +61,12 @@
 #define GPGPU_CP_RESET_HOLD         (1 << 0)
 #define GPGPU_CP_PRESENT            (1 << 1)
 
+/* CP 本地地址，非 BAR0 偏移；IOVA 基址按 64 KiB 对齐。 */
+#define GPGPU_CP_HOST_WINDOW_BASE   0x80000000
+#define GPGPU_CP_HOST_WINDOW_SIZE   0x00010000
+#define GPGPU_CP_IOVA_BASE_LO       0xfffe0000
+#define GPGPU_CP_IOVA_BASE_HI       0xfffe0004
+
 /* 可读写的教学寄存器，与 RV32 解释器控制窗口分开。 */
 #define GPGPU_REG_THREAD_ID_X       0x1000  /* threadIdx.x */
 #define GPGPU_REG_THREAD_ID_Y       0x1004  /* threadIdx.y */
