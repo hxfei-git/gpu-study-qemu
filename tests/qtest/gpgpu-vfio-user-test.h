@@ -101,13 +101,13 @@ static void interleave_write(int fd, uint16_t id, unsigned region,
 }
 
 static void interleave_read(int fd, uint16_t id, unsigned region,
-                            uint64_t offset)
+                            uint64_t offset, unsigned size)
 {
     uint8_t body[16];
 
     stq_le_p(body, offset);
     stl_le_p(body + 8, region);
-    stl_le_p(body + 12, 4);
+    stl_le_p(body + 12, size);
     interleave_send(fd, id, VFIO_USER_REGION_READ, VFIO_USER_REQUEST,
                     body, sizeof(body));
 }
@@ -121,17 +121,21 @@ static void test_window_interleave(void)
     uint8_t version[] = { 0, 0, 1, 0 };
     uint8_t map[32] = { 0 };
     const uint64_t iova = UINT64_C(0x112340000);
-    const uint32_t expected = 0x5a6b7c8d;
+    const uint64_t expected = UINT64_C(0xf12345675a6b7c8d);
     uint32_t firmware[] = {
         (GPGPU_CP_IOVA_BASE_LO & 0xfffff000u) | 0x2b7, /* t0 = 配置地址 */
+        0x02029293,                   /* slli t0, t0, 32 */
+        0x0202d293,                   /* srli t0, t0, 32，零扩展地址 */
         0x12345337,                   /* t1 = IOVA 低位 */
         0x0062a023,                   /* sw t1, 0(t0) */
         0x00100313,                   /* t1 = IOVA 高位 */
         0x0062a223,                   /* sw t1, 4(t0) */
         (GPGPU_CP_HOST_WINDOW_BASE & 0xfffff000u) | 0x2b7,
-        0x0002a303,                   /* lw t1, 0(t0)，发起 Host 读取 */
+        0x02029293,                   /* slli t0, t0, 32 */
+        0x0202d293,                   /* srli t0, t0, 32，零扩展地址 */
+        0x0002b303,                   /* ld t1, 0(t0)，发起 8 字节读取 */
         0x000062b7,                   /* t0 = 结果地址 0x6000 */
-        0x0062a023,                   /* sw t1, 0(t0) */
+        0x0062b023,                   /* sd t1, 0(t0) */
         0x10500073,                   /* wfi */
         0xffdff06f,                   /* 回到 wfi */
     };
@@ -175,6 +179,7 @@ static void test_window_interleave(void)
         interleave_write(fd, id++, 2, 0x4000 + i * 4, firmware[i], true);
     }
     interleave_write(fd, id++, 2, 0x6000, 0, true);
+    interleave_write(fd, id++, 2, 0x6004, 0, true);
     interleave_write(fd, id++, 0, GPGPU_REG_CP_RESET_VECTOR, 0x4000, true);
     start_id = id++;
     interleave_write(fd, start_id, 0, GPGPU_REG_CP_CTRL, 0, false);
@@ -186,7 +191,7 @@ static void test_window_interleave(void)
             g_assert_cmpuint(frame.command, ==, VFIO_USER_DMA_READ);
             g_assert_cmpuint(frame.size, ==, 16);
             g_assert_cmphex(ldq_le_p(frame.body), ==, iova);
-            g_assert_cmpuint(ldq_le_p(frame.body + 8), ==, 4);
+            g_assert_cmpuint(ldq_le_p(frame.body + 8), ==, 8);
             break;
         }
         g_assert_false(start_replied);
@@ -198,12 +203,12 @@ static void test_window_interleave(void)
 
     /* 先发 Host BAR 请求，再发 DMA 回复，强制发生交错。 */
     read_id = id++;
-    interleave_read(fd, read_id, 0, GPGPU_REG_DEV_ID);
+    interleave_read(fd, read_id, 0, GPGPU_REG_DEV_ID, 4);
     {
-        uint8_t reply[20];
+        uint8_t reply[24];
 
         memcpy(reply, frame.body, 16);
-        stl_le_p(reply + 16, expected);
+        stq_le_p(reply + 16, expected);
         interleave_send(fd, frame.id, VFIO_USER_DMA_READ, VFIO_USER_REPLY,
                         reply, sizeof(reply));
         g_free(frame.body);
@@ -228,13 +233,13 @@ static void test_window_interleave(void)
     }
     {
         int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
-        uint32_t result;
+        uint64_t result;
 
         do {
-            interleave_read(fd, id, 2, 0x6000);
+            interleave_read(fd, id, 2, 0x6000, 8);
             frame = interleave_reply(fd, id++);
-            g_assert_cmpuint(frame.size, ==, 20);
-            result = ldl_le_p(frame.body + 16);
+            g_assert_cmpuint(frame.size, ==, 24);
+            result = ldq_le_p(frame.body + 16);
             g_free(frame.body);
             if (result == expected) {
                 break;

@@ -12,7 +12,7 @@ config IBEX
 config GPGPU_CP
     bool
     default y
-    depends on RISCV32 && VFIO_USER_SERVER
+    depends on RISCV64 && VFIO_USER_SERVER
     select GPGPU
 
 config MICROCHIP_PFSOC

@@ -134,14 +134,14 @@ Command Line Options
 
 **[DESIGN]** 原单进程入口继续提供 A57 与 GPGPU 设备。本轮增加
 A57 Host 进程和 RISC-V 设备进程：Host 使用 ``vfio-user-pci``，设备进程使用
-``gpgpu-cp`` machine，自动创建 ``gpu0`` 和默认保持复位的原生 RV32 CP。
+``gpgpu-cp`` machine，自动创建 ``gpu0`` 和默认保持复位的原生 RV64 CP。
 CP 的指令由 TCG（Tiny Code Generator，QEMU 动态代码生成基础设施）执行；
-原计算解释器仍运行应用 kernel。
+CP 在 M-mode 执行裸机固件，不启用页表；原 RV32 计算解释器仍运行应用 kernel。
 
 ::
 
     进程 A：A57 Linux
-      └─ PCIe 代理 ── 配置空间、BAR 请求 ──→ 进程 B：gpu0 + RV32 CP
+      └─ PCIe 代理 ── 配置空间、BAR 请求 ──→ 进程 B：gpu0 + RV64 CP
            ├─ PCI DMA 接口 ←─ B 的 DMA 请求       └─ 同一份 VRAM
            │    └─ SMMUv3（启用时）→ Host RAM
            └─ Linux 驱动 ←─ B 的中断通知
@@ -160,16 +160,16 @@ MSI-X 表和屏蔽状态在两端同步，计算、DMA 完成和错误通知保�
 消息 DMA 窗口不绕过 A 的 IOMMU，也不表示所有地址已映射。
 
 构建需要 QEMU 原有依赖，以及 ``libjson-c-dev``、``libcmocka-dev``。
-从仓库根目录配置三目标，构建产物仍放在 ``build/``：
+从仓库根目录配置 AArch64 和 RV64 两个目标，构建产物仍放在 ``build/``：
 
 .. code-block:: sh
 
     mkdir -p build/arm64-qemu
     cd build/arm64-qemu
-    ../../configure --target-list=aarch64-softmmu,riscv32-softmmu,riscv64-softmmu \
+    ../../configure --target-list=aarch64-softmmu,riscv64-softmmu \
         --enable-vfio-user-server --disable-rust --disable-docs \
         --disable-tools --disable-guest-agent
-    ninja -j4 qemu-system-aarch64 qemu-system-riscv32 qemu-system-riscv64
+    ninja -j4 qemu-system-aarch64 qemu-system-riscv64
     cd ../..
     make -C software/gpgpu/linux prepare
     make -C software/gpgpu/linux run REMOTE=1 IOMMU=smmuv3
@@ -532,10 +532,15 @@ SMMUv3 时，由 Host 侧的系统内存管理单元翻译并检查权限。
       → SMMUv3（启用时）→ Host RAM
 
 CP 本地 ``0x8000_0000～0x8000_ffff`` 为 64 KiB 窗口，支持自然对齐的
-1、2、4 字节小端读写。``0xfffe_0000`` 与 ``0xfffe_0004`` 分别保存
+1、2、4、8 字节小端读写。``0xfffe_0000`` 与 ``0xfffe_0004`` 分别保存
 64 位 IOVA 基址的低、高 32 位，采用自然对齐的 32 位访问。基址按 64 KiB
 对齐，低 16 位读零、写入忽略。固件应写完两个寄存器后再使用窗口，更新
 期间中断处理程序也不能访问窗口。地址 ``0xffff_0000`` 留给后续 HQD。
+
+RV64 的通用寄存器为 64 位，本地地址仍按原有 4 GiB 布局解释。
+例如参数区保存 32 位本地地址 ``0x8000_1234``，固件用 ``LWU`` 读取，
+得到 ``0x0000_0000_8000_1234``，再访问 Host 窗口。使用 ``LUI`` 构造
+地址后也须清除高 32 位的符号扩展。Host 地址仍完整保存在基址高低寄存器中。
 
 只有实际访问的范围需要有效映射。访问失败返回原生 load/store access fault，
 成功返回读值或完成写请求；失败不保证撤销已经发生的写入。CP 复位将基址
@@ -547,7 +552,8 @@ CP 本地 ``0x8000_0000～0x8000_ffff`` 为 64 KiB 窗口，支持自然对齐�
 CP 的 VRAM 区域是原存储的别名，窗口和地址空间容器均不分配新的 RAM。
 
 当前沿用 PCIe 设备的 IOMMU 上下文；按队列 VMID 选页表、跨处理器原子操作、
-动态 64 位进度的一致访问仍未实现。固件代码与栈继续放在 VRAM。
+动态 64 位进度的发布与并发访问协议仍未实现。普通 ``LD/SD`` 不能提供
+Signal 的原子读改写。固件代码与栈继续放在 VRAM。
 
 Thread Context Registers (0x1000 - 0x1FFF)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -36,7 +36,7 @@ JOBS  ?= $(NPROC)
 IOMMU ?= none
 REMOTE ?= 0
 ARM64_BUILD_DIR ?= $(BUILD_DIR)/arm64-qemu
-DEVICE_QEMU ?= $(ARM64_BUILD_DIR)/qemu-system-riscv32
+DEVICE_QEMU ?= $(ARM64_BUILD_DIR)/qemu-system-riscv64
 
 # Use QEMU's bundled meson from pyvenv to avoid version mismatch
 MESON = $(BUILD_DIR)/pyvenv/bin/meson
@@ -61,7 +61,7 @@ help:
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
 	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
 	@echo "  test-gpgpu-remote-iommu  运行远端 GPGPU 的两项 SMMUv3 DMA QTest"
-	@echo "  test-gpgpu-cp      运行 RV32 CP、Host 访存与消息交错的八项 QTest"
+	@echo "  test-gpgpu-cp      运行 RV64 CP、Host 访存与消息交错的八项 QTest"
 	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
@@ -179,11 +179,11 @@ test-gpgpu-iommu:
 	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
 
-# 三个目标共用已配置了 AArch64、RV32 与 vfio-user-server 的构建。
+# 三个目标共用已配置了 AArch64、RV64 与 vfio-user-server 的构建。
 .PHONY: test-gpgpu-remote-iommu test-gpgpu-cp
 test-gpgpu-remote-iommu:
 	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
-		qemu-system-aarch64 qemu-system-riscv32 tests/qtest/gpgpu-iommu-test
+		qemu-system-aarch64 qemu-system-riscv64 tests/qtest/gpgpu-iommu-test
 	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
 		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" QTEST_GPGPU_REMOTE=1 \
 		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-remote-iommu-logs" \
@@ -195,7 +195,7 @@ test-gpgpu-remote-iommu:
 
 test-gpgpu-cp:
 	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
-		qemu-system-aarch64 qemu-system-riscv32 tests/qtest/gpgpu-cp-test
+		qemu-system-aarch64 qemu-system-riscv64 tests/qtest/gpgpu-cp-test
 	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
 		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" \
 		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-cp-logs" \

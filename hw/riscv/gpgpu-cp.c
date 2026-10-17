@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
- * 远端 GPGPU 与原生 RV32 命令处理器
+ * 远端 GPGPU 与原生 RV64 命令处理器
  */
 
 #include "qemu/osdep.h"
@@ -64,7 +64,7 @@ static MemTxResult gpgpu_cp_host_access(GPGPUCPMachineState *s, hwaddr addr,
 static MemTxResult gpgpu_cp_host_read(void *opaque, hwaddr addr, uint64_t *val,
                                      unsigned size, MemTxAttrs attrs)
 {
-    uint8_t buf[4];
+    uint8_t buf[8];
     MemTxResult result;
 
     *val = 0;
@@ -78,7 +78,7 @@ static MemTxResult gpgpu_cp_host_read(void *opaque, hwaddr addr, uint64_t *val,
 static MemTxResult gpgpu_cp_host_write(void *opaque, hwaddr addr, uint64_t val,
                                       unsigned size, MemTxAttrs attrs)
 {
-    uint8_t buf[4];
+    uint8_t buf[8];
 
     stn_le_p(buf, size, val);
     return gpgpu_cp_host_access(opaque, addr, buf, size, true);
@@ -90,11 +90,11 @@ static const MemoryRegionOps gpgpu_cp_host_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
     .impl = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
 };
 
@@ -229,7 +229,7 @@ static void gpgpu_cp_machine_init(MachineState *machine)
     gpgpu = GPGPU(gpu);
     s->gpgpu = gpgpu;
 
-    /* 地址分派容器不复制 VRAM。 */
+    /* RV64 CP 仍使用原有 4 GiB 物理布局；容器不复制 VRAM。 */
     memory_region_init(&s->cp_memory, OBJECT(machine), "gpgpu-cp-memory",
                        UINT64_C(1) << 32);
     memory_region_init_alias(&s->vram_alias, OBJECT(machine), "gpgpu-cp-vram",
@@ -275,12 +275,12 @@ static void gpgpu_cp_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     static const char * const valid_cpu_types[] = {
-        TYPE_RISCV_CPU_BASE32, NULL,
+        TYPE_RISCV_CPU_BASE64, NULL,
     };
 
     mc->init = gpgpu_cp_machine_init;
-    mc->desc = "Remote GPGPU with a native RV32 command processor";
-    mc->default_cpu_type = TYPE_RISCV_CPU_BASE32;
+    mc->desc = "Remote GPGPU with a native RV64 command processor";
+    mc->default_cpu_type = TYPE_RISCV_CPU_BASE64;
     mc->valid_cpu_types = valid_cpu_types;
     mc->max_cpus = 1;
     mc->no_serial = true;
