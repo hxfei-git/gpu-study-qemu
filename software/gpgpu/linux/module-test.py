@@ -27,7 +27,7 @@ ROOT = SOURCE.parents[2]
 IMAGES = ROOT / "build" / "gpgpu-arm64-linux"
 QEMU_DIRECTORY = ROOT / "build" / "arm64-qemu"
 QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-aarch64"
-DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv32"
+DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv64"
 sys.path.insert(0, str(ROOT / "scripts"))
 from gpgpu_remote import RemoteDevice
 ISO_NAME = "alpine-virt-3.24.2-aarch64.iso"
@@ -112,14 +112,15 @@ def ensure_qemu(output, remote=False):
         if remote and not configure:
             targets = (QEMU_DIRECTORY / "config-host.mak").read_text()
             config_path = (QEMU_DIRECTORY /
-                           "riscv32-softmmu-config-devices.h")
+                           "riscv64-softmmu-config-devices.h")
             config = config_path.read_text() if config_path.is_file() else ""
-            configure = ("riscv32-softmmu" not in targets or
-                         "#define CONFIG_VFIO_USER_SERVER 1" not in config)
+            configure = ("riscv64-softmmu" not in targets or
+                         "#define CONFIG_VFIO_USER_SERVER 1" not in config or
+                         "#define CONFIG_GPGPU_CP 1" not in config)
         if configure:
             target_list = "aarch64-softmmu"
             if remote:
-                target_list += ",riscv32-softmmu"
+                target_list += ",riscv64-softmmu"
             subprocess.run([
                 str(ROOT / "configure"), f"--target-list={target_list}",
                 "--disable-rust", "--disable-docs", "--disable-tools",
@@ -129,7 +130,7 @@ def ensure_qemu(output, remote=False):
                 cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
         binaries = ["qemu-system-aarch64"]
         if remote:
-            binaries += ["qemu-system-riscv32"]
+            binaries += ["qemu-system-riscv64"]
         subprocess.run(["ninja", "-j4"] + binaries,
                        cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
     subprocess.run([str(QEMU_BINARY), "-device", "gpgpu,help"],
@@ -628,7 +629,7 @@ def main():
     parser.add_argument("--skip-prepare", action="store_true",
                         help="Test existing artifacts without rebuilding")
     parser.add_argument("--remote", action="store_true",
-                        help="连接远端 GPGPU 与 RV32 CP")
+                        help="连接远端 GPGPU 与 RV64 CP")
     parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY,
                         help="远端设备 QEMU 路径")
     args = parser.parse_args()

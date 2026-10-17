@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
- * A57 Host 经 PCI 代理装载和启动原生 RV32 CP 固件。
+ * A57 Host 经 PCI 代理装载和启动原生 RV64 CP 固件。
  */
 
 #include "qemu/osdep.h"
@@ -122,7 +122,7 @@ static void test_reset_hold(void)
     cpus = qdict_get_qlist(reply, "return");
     g_assert_cmpuint(qlist_size(cpus), ==, 1);
     cpu = qobject_to(QDict, qlist_entry_obj(qlist_first(cpus)));
-    g_assert_cmpstr(qdict_get_str(cpu, "target"), ==, "riscv32");
+    g_assert_cmpstr(qdict_get_str(cpu, "target"), ==, "riscv64");
     qobject_unref(reply);
     g_assert_cmphex(qpci_io_readl(s.dev, s.regs, GPGPU_REG_CP_RESET_VECTOR),
                     ==, 0);
@@ -165,7 +165,7 @@ static void test_firmware_replace(void)
     cp_stop(&s);
 }
 
-/* 编码本测试需要的 32 位指令，无需外部交叉编译器。 */
+/* RV64 指令仍按 32 位指令字编码，无需外部交叉编译器。 */
 typedef struct WindowFirmware {
     uint32_t insns[128];
     size_t count;
@@ -205,6 +205,9 @@ static void fw_li(WindowFirmware *fw, unsigned rd, uint32_t value)
 {
     fw_emit(fw, ((value + 0x800) & 0xfffff000) | rd << 7 | 0x37);
     fw_emit(fw, rv_i(0x13, 0, rd, rd, value & 0xfff));
+    /* 清除 LUI/ADDI 的符号扩展，保留低 32 位。 */
+    fw_emit(fw, rv_i(0x13, 1, rd, rd, 32)); /* slli */
+    fw_emit(fw, rv_i(0x13, 5, rd, rd, 32)); /* srli */
 }
 
 static void fw_finish(WindowFirmware *fw)
@@ -224,7 +227,7 @@ static void fw_window_setup(WindowFirmware *fw)
     fw_emit(fw, rv_store(2, 5, 6, 0));
     fw_emit(fw, rv_i(0x03, 2, 5, 11, 4));
     fw_emit(fw, rv_store(2, 5, 6, 4));
-    fw_emit(fw, rv_i(0x03, 2, 7, 11, 8));
+    fw_emit(fw, rv_i(0x03, 6, 7, 11, 8)); /* lwu：本地窗口地址 */
 }
 
 static void fw_load(CPTest *s, const WindowFirmware *fw, uint32_t offset)
@@ -321,8 +324,11 @@ static void test_window_access(const void *opaque)
     CPTest s = {0};
     WindowFirmware fw = {0};
     uint64_t iova, gpa;
-    uint8_t input[16] = {0x80, 0x99, 0x34, 0x92, 0x78, 0x56, 0x34, 0x12};
-    uint8_t output[16], expected[16];
+    uint8_t input[32] = {
+        0x80, 0x99, 0x34, 0x92, 0x78, 0x56, 0x34, 0x12,
+        [16] = 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0xf1,
+    };
+    uint8_t output[32], expected[32];
 
     cp_start_mode(&s, smmu);
     window_memory(&s, smmu, &iova, &gpa);
@@ -343,6 +349,10 @@ static void test_window_access(const void *opaque)
     fw_emit(&fw, rv_i(0x03, 2, 5, 7, 4));
     fw_emit(&fw, rv_store(2, 5, 7, 12));
     fw_emit(&fw, rv_store(2, 5, 10, 20));
+    /* ld/sd 验证高半部与最高位均非零的完整 64 位值。 */
+    fw_emit(&fw, rv_i(0x03, 3, 5, 7, 16));
+    fw_emit(&fw, rv_store(3, 5, 7, 24));
+    fw_emit(&fw, rv_store(3, 5, 10, 24));
     fw_finish(&fw);
     fw_start(&s, &fw);
     fw_wait(&s, 0);
@@ -355,9 +365,12 @@ static void test_window_access(const void *opaque)
                    0x9234);
     g_assert_cmphex(qpci_io_readl(s.dev, s.vram, RESULT_OFFSET + 20), ==,
                    0x12345678);
+    g_assert_cmphex(qpci_io_readq(s.dev, s.vram, RESULT_OFFSET + 24), ==,
+                   UINT64_C(0xf123456789abcdef));
     memcpy(expected, input, sizeof(input));
     expected[8] = input[0];
     memcpy(expected + 10, input + 2, 6);
+    memcpy(expected + 24, input + 16, 8);
     qtest_memread(s.host, gpa + HOST_DATA_OFFSET, output, sizeof(output));
     g_assert_cmpmem(output, sizeof(output), expected, sizeof(expected));
     if (smmu) {
@@ -374,6 +387,8 @@ static void test_window_fault_recovery(void)
     uint64_t iova, gpa;
     uint32_t bad_address;
     uint32_t events;
+    /* 未映射的 8 字节请求产生两条 SMMU 记录。 */
+    const unsigned fault_offsets[] = {0, 0, 0, 4, 0, 4};
     WindowFirmware trap = {0};
 
     cp_start_mode(&s, true);
@@ -381,21 +396,24 @@ static void test_window_fault_recovery(void)
     bad_address = GPGPU_CP_HOST_WINDOW_BASE + (iova & 0xffff) + 0x1000;
     /* t3/t4 专供异常处理；a0 始终指向 VRAM 结果区。 */
     fw_emit(&trap, rv_i(0x73, 2, 28, 0, 0x342)); /* csrr mcause */
-    fw_emit(&trap, rv_store(2, 28, 10, 4));
+    fw_emit(&trap, rv_store(3, 28, 10, 8));
     fw_emit(&trap, rv_i(0x73, 2, 28, 0, 0x343)); /* csrr mtval */
-    fw_emit(&trap, rv_store(2, 28, 10, 8));
+    fw_emit(&trap, rv_store(3, 28, 10, 16));
     fw_emit(&trap, rv_i(0x73, 2, 29, 0, 0x341)); /* csrr mepc */
-    fw_emit(&trap, rv_store(2, 29, 10, 12));
+    fw_emit(&trap, rv_store(3, 29, 10, 24));
     fw_emit(&trap, rv_i(0x13, 0, 29, 29, 4));
     fw_emit(&trap, rv_i(0x73, 1, 0, 29, 0x341)); /* csrw mepc */
     fw_emit(&trap, 0x30200073);                  /* mret */
     fw_load(&s, &trap, TRAP_OFFSET);
 
-    for (unsigned store = 0; store < 2; store++) {
+    /* 覆盖 lw/sw 和 ld/sd 的异常与恢复。 */
+    for (unsigned access = 0; access < 4; access++) {
         WindowFirmware fw = {0};
+        bool store = access & 1;
+        unsigned funct3 = access < 2 ? 2 : 3;
         uint32_t fault_pc;
 
-        if (store) {
+        if (access) {
             qpci_io_writel(s.dev, s.regs, GPGPU_REG_CP_CTRL,
                            GPGPU_CP_RESET_HOLD);
         }
@@ -405,32 +423,34 @@ static void test_window_fault_recovery(void)
         fw_li(&fw, 7, bad_address);
         fw_li(&fw, 5, 0x5a5);
         fault_pc = FIRMWARE_OFFSET + fw.count * 4;
-        fw_emit(&fw, store ? rv_store(2, 5, 7, 0) : rv_i(0x03, 2, 6, 7, 0));
-        fw_emit(&fw, rv_i(0x03, 2, 7, 11, 8));
-        fw_emit(&fw, rv_store(2, 5, 7, 0));
-        fw_emit(&fw, rv_i(0x03, 2, 6, 7, 0));
-        fw_emit(&fw, rv_store(2, 6, 10, 16));
+        fw_emit(&fw, store ? rv_store(funct3, 5, 7, 0) :
+                            rv_i(0x03, funct3, 6, 7, 0));
+        fw_emit(&fw, rv_i(0x03, 6, 7, 11, 8)); /* lwu */
+        fw_emit(&fw, rv_store(funct3, 5, 7, 0));
+        fw_emit(&fw, rv_i(0x03, funct3, 6, 7, 0));
+        fw_emit(&fw, rv_store(3, 6, 10, 32));
         fw_finish(&fw);
         fw_start(&s, &fw);
         fw_wait(&s, 0);
-        g_assert_cmphex(qpci_io_readl(s.dev, s.vram, RESULT_OFFSET + 4), ==,
+        g_assert_cmphex(qpci_io_readq(s.dev, s.vram, RESULT_OFFSET + 8), ==,
                        store ? 7 : 5);
-        g_assert_cmphex(qpci_io_readl(s.dev, s.vram, RESULT_OFFSET + 8), ==,
+        g_assert_cmphex(qpci_io_readq(s.dev, s.vram, RESULT_OFFSET + 16), ==,
                        bad_address);
-        g_assert_cmphex(qpci_io_readl(s.dev, s.vram, RESULT_OFFSET + 12), ==,
+        g_assert_cmphex(qpci_io_readq(s.dev, s.vram, RESULT_OFFSET + 24), ==,
                        fault_pc);
-        g_assert_cmphex(qpci_io_readl(s.dev, s.vram, RESULT_OFFSET + 16), ==,
+        g_assert_cmphex(qpci_io_readq(s.dev, s.vram, RESULT_OFFSET + 32), ==,
                        0x5a5);
-        g_assert_cmphex(qtest_readl(s.host, gpa + HOST_DATA_OFFSET), ==, 0x5a5);
+        g_assert_cmphex(qtest_readq(s.host, gpa + HOST_DATA_OFFSET), ==, 0x5a5);
     }
     events = qtest_readl(s.host, VIRT_SMMU_BASE + A_EVENTQ_PROD);
-    g_assert_cmpuint(events, ==, 2);
+    g_assert_cmpuint(events, ==, ARRAY_SIZE(fault_offsets));
     for (unsigned i = 0; i < events; i++) {
         uint64_t event = QSMMU_SPACE_OFFS_NS + QSMMU_EVENTQ_BASE_ADDR + i * 32;
 
         g_assert_cmphex(qtest_readl(s.host, event) & 0xff, ==, 0x10);
         g_assert_cmphex(qtest_readl(s.host, event + 4), ==, s.dev->devfn);
-        g_assert_cmphex(qtest_readq(s.host, event + 16), ==, iova + 0x1000);
+        g_assert_cmphex(qtest_readq(s.host, event + 16), ==,
+                       iova + 0x1000 + fault_offsets[i]);
     }
     cp_stop(&s);
 }
