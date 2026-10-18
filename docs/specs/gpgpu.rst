@@ -26,6 +26,10 @@ The device reuses the RISC-V RV32IMF instruction set, avoiding custom GPU
 instructions. Thread divergence and synchronization are handled through
 a dedicated CTRL (Control) unit accessible via memory-mapped I/O.
 
+这里的 RV32 指应用 kernel 的计算执行器。双进程设备中的原生 CP 已迁移为
+RV64，执行独立的裸机固件；两者分别保存寄存器和取指位置。当前同步派发仍
+使用 RV32 kernel 和 VRAM 参数，CP 的队列调度与 Host 参数交接尚待接入。
+
 Architecture
 ------------
 
@@ -132,7 +136,7 @@ Command Line Options
 双进程与原生 CP
 ----------------
 
-**[DESIGN]** 原单进程入口继续提供 A57 与 GPGPU 设备。本轮增加
+**[DESIGN]** 原单进程入口继续提供 A57 与 GPGPU 设备。当前双进程入口使用
 A57 Host 进程和 RISC-V 设备进程：Host 使用 ``vfio-user-pci``，设备进程使用
 ``gpgpu-cp`` machine，自动创建 ``gpu0`` 和默认保持复位的原生 RV64 CP。
 CP 的指令由 TCG（Tiny Code Generator，QEMU 动态代码生成基础设施）执行；
@@ -145,6 +149,66 @@ CP 在 M-mode 执行裸机固件，不启用页表；原 RV32 计算解释器仍
            ├─ PCI DMA 接口 ←─ B 的 DMA 请求       └─ 同一份 VRAM
            │    └─ SMMUv3（启用时）→ Host RAM
            └─ Linux 驱动 ←─ B 的中断通知
+
+2026-10-17 的 RV64 迁移只涉及原生 CP。计算执行器的 lane 通用寄存器、
+取指位置及参数寄存器 ``a0`` 仍为 32 位；已有同步路径把参数块的 VRAM 偏移
+写入 ``a0``。计算执行器的 Host 参数访问入口已确认设计，尚待实现。
+
+**[DESIGN]** 第二阶段使用 16 字节 Kernel 描述对象，保存代码入口、代码长度、
+参数长度和填零的保留字段，四项均为 32 位小端值。计算执行器保存完整的
+64 位 Host 参数基址和 32 位长度，向各线程提供只读参数窗口
+``0x9000_0000～0x9000_ffff``，启动时 ``a0 = 0x9000_0000``。
+窗口只接受对齐的 4 字节读取，按实际参数长度检查越界，并拒绝写入；失败交给队列
+错误处理，不发布成功 Signal。完整字段、对齐、长度与生命周期约定见父仓库
+《CP/MEC 第一版规格》第 6.2 节。
+
+CP 分发接口已按同一规格第 6.3 节和 9.5.3 确认。CP 解析描述对象，按
+``0xfffd_0000 + BAR0 字节偏移`` 访问同一份原有启动配置；队列路径的
+``KERNEL_ADDR`` 继续保存代码入口，``KERNEL_ARGS`` 保存完整 Host 参数物理地址。
+新增 ``KERNEL_CODE_SIZE``（``0x032c``）、``KERNEL_ARGS_SIZE``（``0x0334``）
+用于实际范围检查，原 ``DISPATCH`` 保持 ``0x0330``。新增只读
+``DISPATCH_STATUS``（``0x0338``，``IDLE=0``、``BUSY=1``、``DONE=2``、``FAILED=3``）、
+只读 ``DISPATCH_ERROR``（``0x033c``）和写确认 ``DISPATCH_ACK``（``0x0340``）。
+寄存器采用对齐的 32 位小端访问，64 位地址分高、低两次填写。
+
+CP 只在空闲时填写配置，保证写入顺序后向 ``DISPATCH`` 写 ``1``；设备统一保存
+本次配置，校验通过后执行，失败返回 ``FAILED``。忙或结果未确认时拒绝覆盖配置
+和再次提交。执行器分段推进并保留线程状态和累计预算，队列仍逐个完整执行
+Dispatch；CP 读取结果并清理后，向 ``DISPATCH_ACK`` 写 ``1``，才回到 ``IDLE``。
+该确认操作不能中止执行。执行器须结束相关访问后发布终态，成功还须完成结果
+写回；CP 只有成功收尾后才发布 Signal。队列运行期间由 CP 独占提交和确认，旧
+Host 直接提交路径单独用于回归，继续使用 VRAM 参数偏移。
+
+上述映射、五个新增寄存器和分段执行尚未实现；后文现有寄存器表仍描述当前设备。
+
+第二阶段的 Signal 布局和通知、等待协议已按父仓库规格 9.5.4 确认，尚待实现。
+Signal 为 24 字节，至少按 8 字节对齐、多字节字段小端；偏移 ``0x00``、
+``0x08``、``0x0c``、``0x10`` 分别保存 64 位有符号 ``value``、32 位无符号
+``event_id``、填零的 32 位保留字段和 64 位 ``event_mailbox_ptr``。
+每个使用中的 Signal 独占事件和通知槽，事件编号在进程内非零且不与存活事件重复。
+通知槽占 8 字节、至少按 8 字节对齐，初值为 0，CP 完成时写入零扩展后的事件编号。
+驱动先保存“已通知”状态，再清零通知槽并唤醒等待者；登记后复查条件，等待返回
+不清除事件状态，同一任务可唤醒多个等待者。旧通知及相关处理结束后才可重新
+初始化。完成值 ``1 → 0`` 与先主动检查约 ``200 μs`` 再阻塞的默认等待方式沿用
+已有设计。
+
+任务可见性已按父仓库规格第 6.4 节和 9.5.5 确认，尚待实现。A57 运行时在输入
+准备完成后执行带编译器内存约束的 ``dmb sy``，再发布有效 Header；再次执行屏障
+后写 Doorbell。CP 使用带编译器内存约束的 ``fence iorw, iorw`` 衔接取包与输入
+读取、配置与提交，以及执行结果确认与完成通知。执行器后端结束相关访问后才
+发布终态，成功还须完成结果写回；跨线程交接用锁或 release/acquire 同步。CP 保存结果并
+清理、确认后，依次发布 Signal、通知槽和 IH 通知，每次访问成功后才继续。
+Host 完整读到 Signal 为 ``0`` 后执行 ``dmb sy``，再读取或复制结果。上传或
+结果复制使用 DMA 时，须先等待成功完成；内存屏障不能代替传输完成和后端同步。
+连续提交验证每轮改变输入，覆盖短暂轮询读到完成和阻塞唤醒后复查的路径。
+
+    **[SOURCE]** 固定提交 ``57543dd54b6b046b888277272fa84af81746b1ac``：
+    `hw/riscv/gpgpu-cp.c（274–288 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1>`_
+    将原生 CP 的默认及允许类型设为 ``TYPE_RISCV_CPU_BASE64``；
+    `hw/gpgpu/gpgpu_core.h（72–80 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1>`_
+    定义计算线程的 32 位状态；
+    `hw/gpgpu/gpgpu_core.c（615–624 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1>`_
+    在启动时填写各 lane 的 ``a0``。
 
 ``none`` 与 ``smmuv3`` 均使用 ``x-dma-via-socket=on``。B 发送完整设备
 DMA 地址、方向和数据请求，A 调用代理设备的 PCI DMA 接口，并返回结果或错误。
@@ -552,8 +616,13 @@ RV64 的通用寄存器为 64 位，本地地址仍按原有 4 GiB 布局解释�
 CP 的 VRAM 区域是原存储的别名，窗口和地址空间容器均不分配新的 RAM。
 
 当前沿用 PCIe 设备的 IOMMU 上下文；按队列 VMID 选页表、跨处理器原子操作、
-动态 64 位进度的发布与并发访问协议仍未实现。普通 ``LD/SD`` 不能提供
+动态 64 位共享值的发布与并发访问协议仍未实现。普通 ``LD/SD`` 不能提供
 Signal 的原子读改写。固件代码与栈继续放在 VRAM。
+
+该窗口属于 RV64 CP 的本地地址空间。RV32 计算解释器的读取函数仍只处理
+VRAM 和线程内建控制窗口，尚未接入 Host RAM 参数读取。CP 的寄存器位宽
+不改变已有 32 位控制寄存器，也不改变队列规格中已确定的 32 位生产、消费
+进度；Signal 完成值保持 64 位，队列接口仍待实现。
 
 Thread Context Registers (0x1000 - 0x1FFF)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
