@@ -10,7 +10,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | GPU | Graphics Processing Unit | 图形处理器 |
 | CUDA | Compute Unified Device Architecture | 统一计算设备架构 |
 | ARM64 | Arm 64-bit Architecture | Arm 64 位架构 |
-| RV32 / RISC-V | 32-bit RISC-V / Reduced Instruction Set Computer V | 本实验的 32 位精简指令集 |
+| RV32 / RISC-V | 32-bit RISC-V / Reduced Instruction Set Computer V | 本实验计算执行器使用的 32 位精简指令集 |
+| RV64 | 64-bit RISC-V | 本实验原生 CP 使用的 64 位 RISC-V 模型 |
 | API / ABI | Application Programming Interface / Application Binary Interface | 应用编程／二进制接口 |
 | PCI / BAR | Peripheral Component Interconnect / Base Address Register | 外设互连／基址寄存器 |
 | DMA | Direct Memory Access | 直接内存访问 |
@@ -26,6 +27,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | BF16 | Brain Floating Point 16-bit | 16 位浮点格式 |
 | ReLU | Rectified Linear Unit | 线性整流函数 |
 | CP | Command Processor | 命令处理器 |
+| ACK | Acknowledgment | 确认；本版用于确认已经读取执行结果 |
 | TCG | Tiny Code Generator | QEMU 动态翻译后端 |
 | TLS | Transport Layer Security | 传输层安全协议 |
 | JSON | JavaScript Object Notation | JavaScript 对象表示法 |
@@ -61,6 +63,52 @@ QEMU（gpgpu.c 注册 PCI 设备和 BAR）
                   ▼
   kernel 完成 → gpgpu_irq.c：MSI-X → 驱动 completion → ioctl 返回
 ```
+
+当前双进程设备中的原生 CP 已迁移至 RV64，通过 `qemu-system-riscv64`
+执行裸机固件；上图的应用 Kernel 仍由 `gpgpu_core.c` 中的 RV32 计算执行器
+运行。计算线程的寄存器和 `a0` 仍为 32 位，原同步路径继续把参数上传到 VRAM。
+CP 的 Host 访存窗口已实现，计算执行器直接读取 Host 参数的路径尚待接入。
+
+**[DESIGN]** 第二阶段已确认 16 字节 Kernel 描述对象和计算线程的只读参数
+窗口。执行器保存完整的 64 位 Host 参数基址和实际长度，各线程以
+`a0 = 0x9000_0000` 访问 `0x9000_0000～0x9000_ffff`，按需读取 Host RAM。
+窗口只接受对齐的 4 字节读取，并检查实际参数范围；该路径尚未实现，
+完整布局及错误规则见[规格 6.2 节](<../../../CP_MEC 第一版规格.md#spec-kernel-descriptor>)。
+
+CP 分发接口也已按[规格 6.3 节](<../../../CP_MEC 第一版规格.md#spec-executor-dispatch>)
+确认：由 CP 解析描述对象，通过 `0xfffd_0000 + BAR0 字节偏移` 配置执行器。
+保留原有启动配置和 `DISPATCH`，新增 `KERNEL_CODE_SIZE`、`KERNEL_ARGS_SIZE`
+用于范围检查，新增 `DISPATCH_STATUS`、`DISPATCH_ERROR`、`DISPATCH_ACK`
+用于返回和确认本次结果。CP 在空闲时填完配置，最后写 `DISPATCH=1`；
+执行器保存配置并分段推进，终态结果保留到 CP 读取并确认。
+正常队列路径由 CP 独占提交和确认，旧 Host 直接提交路径单独用于回归；
+两条路径的参数分别为 Host 物理地址与 VRAM 偏移。上述接口尚待实现和验证，
+本文后续运行时调用和同步完成流程仍描述当前软件栈。
+
+第二阶段的[Signal 布局与等待协议](<../../../CP_MEC 第一版规格.md#spec-signal-completion-protocol>)
+也已确认、尚待实现：Signal 为 24 字节，至少按 8 字节对齐；偏移 `0x00`、
+`0x08`、`0x0c`、`0x10` 分别保存 64 位有符号完成值、32 位事件编号、
+填零的 32 位保留字段和 64 位通知槽地址。每个使用中的 Signal 独占事件和通知槽，
+事件编号在所属进程内非零且不与存活事件重复。通知槽初值为 0，完成时写入
+零扩展到 64 位的事件编号；驱动保存“已通知”状态后清零通知槽并唤醒线程。
+等待登记后复查条件，等待返回不清除事件状态，同一任务可唤醒多个等待者；
+只有旧通知与相关处理结束后才可重新初始化。原有 `1 → 0` 完成规则和约
+`200 μs` 主动检查后转入阻塞的默认方式继续沿用。
+
+第二阶段的[可见性规则](<../../../CP_MEC 第一版规格.md#spec-dispatch-visibility>)
+已按 9.5.5 确认，尚待实现。A57 运行时在输入准备完成后执行带编译器内存约束的
+`dmb sy`，再发布有效 Header；再执行屏障后写 Doorbell。CP 使用带编译器内存
+约束的 `fence iorw, iorw` 衔接有效 Header 与输入读取、配置与提交，以及结果
+确认与完成通知。执行器后端结束相关访问后才发布终态，成功还须完成结果写回；
+跨线程交接用锁或 release/acquire 同步。CP 保存结果、清理并确认后，依次发布 Signal、
+通知槽和 IH 通知。Host 完整读到 Signal 为 `0` 后执行 `dmb sy`，再读取或复制
+结果。上传或结果复制使用 DMA 时须等待成功完成，不能用屏障代替等待；连续提交
+验证须每轮改变输入，覆盖短暂轮询和阻塞唤醒。
+
+> **[SOURCE]** 实验源码固定提交 `57543dd54b6b046b888277272fa84af81746b1ac`：
+>
+> - 原生 CP 的 CPU 类型：[hw/riscv/gpgpu-cp.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1)，[274–288 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1)。
+> - 计算线程的 32 位状态：[hw/gpgpu/gpgpu_core.h](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1)，[72–80 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1)；参数写入 `a0`：[hw/gpgpu/gpgpu_core.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1)，[615–624 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1)。
 
 阅读设备代码时，先从 `gpgpu_regs.c` 找到寄存器所属模块，再沿该模块的
 读写函数追踪操作。`gpgpu_regs.h` 保存寄存器偏移和枚举，`gpgpu.h` 保存
