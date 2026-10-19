@@ -167,7 +167,7 @@ static void test_firmware_replace(void)
 
 /* RV64 指令仍按 32 位指令字编码，无需外部交叉编译器。 */
 typedef struct WindowFirmware {
-    uint32_t insns[128];
+    uint32_t insns[256];
     size_t count;
 } WindowFirmware;
 
@@ -529,6 +529,9 @@ static void test_window_host_dma_coexist(void)
     cp_stop(&s);
 }
 
+#include "gpgpu-device-queue-test.inc"
+#include "gpgpu-firmware-test.inc"
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -544,5 +547,7 @@ int main(int argc, char **argv)
     qtest_add_func("/gpgpu/cp/window/host-dma-coexist",
                    test_window_host_dma_coexist);
     qtest_add_func("/gpgpu/cp/window-interleave", test_window_interleave);
+    register_device_queue_tests();
+    register_firmware_queue_tests();
     return g_test_run();
 }

@@ -137,6 +137,19 @@ static void vfio_user_msix_teardown(VFIOPCIDevice *vdev)
     vdev->msix->pba_region = NULL;
 }
 
+/* 动态共享字段保持 Host CPU 的访问宽度。 */
+static MemTxResult vfio_user_dma_rw(PCIDevice *pdev, dma_addr_t addr,
+                                  void *buf, dma_addr_t size, bool is_write)
+{
+    if ((size == 4 || size == 8) && !(addr & (size - 1))) {
+        return address_space_rw_atomic(pci_get_address_space(pdev), addr,
+                                       MEMTXATTRS_UNSPECIFIED, buf, size,
+                                       is_write);
+    }
+    return is_write ? pci_dma_write(pdev, addr, buf, size) :
+                      pci_dma_read(pdev, addr, buf, size);
+}
+
 static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 {
     PCIDevice *pdev = PCI_DEVICE(vdev);
@@ -161,7 +174,7 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
     memcpy(res, msg, sizeof(*res));
     g_free(msg);
 
-    r = pci_dma_read(pdev, res->offset, res->data, res->count);
+    r = vfio_user_dma_rw(pdev, res->offset, res->data, res->count, false);
 
     switch (r) {
     case MEMTX_OK:
@@ -204,7 +217,7 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         return;
     }
 
-    r = pci_dma_write(pdev, msg->offset, msg->data, msg->count);
+    r = vfio_user_dma_rw(pdev, msg->offset, msg->data, msg->count, true);
 
     switch (r) {
     case MEMTX_OK:

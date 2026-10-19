@@ -3422,6 +3422,71 @@ static MemTxResult flatview_read(FlatView *fv, hwaddr addr,
                                   mr_addr, l, mr);
 }
 
+/*
+ * 消息 DMA 与客体 CPU 并发访问共享字段时，
+ * memcpy 不能拆分 32/64 位访问。仅翻译一次，
+ * 失败仍沿原路径生成异常。
+ */
+MemTxResult address_space_rw_atomic(AddressSpace *as, hwaddr addr,
+                                    MemTxAttrs attrs, void *buf,
+                                    unsigned size, bool is_write)
+{
+    hwaddr length = size, translated;
+    MemoryRegion *mr;
+    FlatView *fv;
+    void *ptr;
+    RCU_READ_LOCK_GUARD();
+
+    assert((size == 4 || size == 8) && !(addr & (size - 1)));
+    fv = address_space_to_flatview(as);
+    mr = flatview_translate(fv, addr, &translated, &length, is_write, attrs);
+    if (!flatview_access_allowed(mr, attrs, translated, length)) {
+        return MEMTX_ACCESS_ERROR;
+    }
+    if (length == size && !(translated & (size - 1)) &&
+        memory_region_is_ram(mr) &&
+        memory_access_is_direct(mr, is_write, attrs)) {
+        memory_region_ref(mr);
+        fuzz_dma_read_cb(addr, size, mr);
+        ptr = qemu_ram_ptr_length(mr->ram_block, translated, &length,
+                                  false, is_write);
+        if (length == size && !((uintptr_t)ptr & (size - 1))) {
+            if (size == 4) {
+                uint32_t value;
+
+                if (is_write) {
+                    memcpy(&value, buf, size);
+                    qatomic_store_release((uint32_t *)ptr, value);
+                } else {
+                    value = qatomic_load_acquire((uint32_t *)ptr);
+                    memcpy(buf, &value, size);
+                }
+            } else {
+                uint64_t value;
+
+                if (is_write) {
+                    memcpy(&value, buf, size);
+                    qatomic_store_release((uint64_t *)ptr, value);
+                } else {
+                    value = qatomic_load_acquire((uint64_t *)ptr);
+                    memcpy(buf, &value, size);
+                }
+            }
+            if (is_write) {
+                invalidate_and_set_dirty(mr, translated, size);
+            }
+            memory_region_unref(mr);
+            return MEMTX_OK;
+        }
+        memory_region_unref(mr);
+    }
+    return is_write ?
+        flatview_write_continue(fv, addr, attrs, buf, size, translated,
+                                length, mr) :
+        flatview_read_continue(fv, addr, attrs, buf, size, translated,
+                               length, mr);
+}
+
 MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
                                     MemTxAttrs attrs, void *buf, hwaddr len)
 {

@@ -41,9 +41,17 @@ RISC-V 裸机编译器 `riscv64-unknown-elf-gcc`、Rust 和 `bindgen-cli`。
 
 遵循 `.editorconfig` 和 `docs/devel/style.rst`：C 使用四个空格缩进，
 Makefile 配方使用制表符，文件使用 LF 换行，每行尽量不超过 80 列。
+`hw/gpgpu/` 和 `software/` 下的自有 C 代码按用户要求采用 Linux 风格，
+以目录内的 `.editorconfig` 和 `.clang-format` 为准：使用 8 列制表符，
+函数左花括号另起一行，结构体每行只声明一个成员，每行尽量不超过 100 列。
+结构体、成员、枚举值和宏说明用途及单位；接口实现前说明作用、执行思路，
+涉及地址空间、锁、引用或发布顺序时一并写明。Python 和汇编入口也应有用途说明。
+固定版本的外部内核补丁、配置和打包文件保持原貌，不参与批量格式化。
 函数和变量使用 `snake_case`，类型使用 `CamelCase`，宏使用大写。
-C 源文件首先包含 `qemu/osdep.h`。
+QEMU 设备的 C 源文件首先包含 `qemu/osdep.h`。
 用 `scripts/checkpatch.pl --branch HEAD^..HEAD` 检查最新提交。
+上述两个目录使用 Linux 的 `checkpatch.pl` 和 `scripts/kernel-doc -none`
+核对风格及结构体说明；QEMU 检查器的四空格规则不适用于这两个目录。
 Rust 格式检查使用 `make -C build rustfmt`，需要 nightly rustfmt；
 Clippy 的 Meson 开发环境配置见 `docs/devel/rust.rst`。
 

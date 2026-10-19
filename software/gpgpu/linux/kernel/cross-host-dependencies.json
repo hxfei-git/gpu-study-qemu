@@ -1,0 +1,90 @@
+[
+  {
+    "name": "cpio",
+    "version": "2.15+dfsg-1ubuntu2.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/c/cpio/cpio_2.15+dfsg-1ubuntu2.1_amd64.deb",
+    "sha256": "fbac731755302d218d785b4c391530e7773527f553e24946f9580636a47641b2",
+    "file": "cpio_2.15+dfsg-1ubuntu2.1_amd64.deb"
+  },
+  {
+    "name": "libelf-dev",
+    "version": "0.190-1.1ubuntu0.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/e/elfutils/libelf-dev_0.190-1.1ubuntu0.1_amd64.deb",
+    "sha256": "81affb95c29f7323f2ae24386aaa1f61d311578e3e27c5f78ef7b7d55cd3cf49",
+    "file": "libelf-dev_0.190-1.1ubuntu0.1_amd64.deb"
+  },
+  {
+    "name": "libelf1t64",
+    "version": "0.190-1.1ubuntu0.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/e/elfutils/libelf1t64_0.190-1.1ubuntu0.1_amd64.deb",
+    "sha256": "b4aee123a37472d213647594b4f7d4a0d13615b0ca2a6fd33926b768d6b232c2",
+    "file": "libelf1t64_0.190-1.1ubuntu0.1_amd64.deb"
+  },
+  {
+    "name": "libgmp-dev",
+    "version": "2:6.3.0+dfsg-2ubuntu6.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/g/gmp/libgmp-dev_6.3.0+dfsg-2ubuntu6.1_amd64.deb",
+    "sha256": "a9847b5ecfff791a46cb198f29a06d9d23a20afdfdd434812f2b44ccfb61d46a",
+    "file": "libgmp-dev_2%3a6.3.0+dfsg-2ubuntu6.1_amd64.deb"
+  },
+  {
+    "name": "libgmp10",
+    "version": "2:6.3.0+dfsg-2ubuntu6.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/g/gmp/libgmp10_6.3.0+dfsg-2ubuntu6.1_amd64.deb",
+    "sha256": "285f8a505dfa8e1b33f357a9d8d3477ad35bf18c0b34771a6df4c25923f3ae0d",
+    "file": "libgmp10_2%3a6.3.0+dfsg-2ubuntu6.1_amd64.deb"
+  },
+  {
+    "name": "libgmpxx4ldbl",
+    "version": "2:6.3.0+dfsg-2ubuntu6.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/g/gmp/libgmpxx4ldbl_6.3.0+dfsg-2ubuntu6.1_amd64.deb",
+    "sha256": "6f59344240b6dc139ed23ef236b8aa146e5d25e23aa90e79f814e2e4cc4b5752",
+    "file": "libgmpxx4ldbl_2%3a6.3.0+dfsg-2ubuntu6.1_amd64.deb"
+  },
+  {
+    "name": "libmpc-dev",
+    "version": "1.3.1-1build1.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/m/mpclib3/libmpc-dev_1.3.1-1build1.1_amd64.deb",
+    "sha256": "42a911f2771637dc830f08c0e3b79d20107fa07498af2b49dc44821de94a209e",
+    "file": "libmpc-dev_1.3.1-1build1.1_amd64.deb"
+  },
+  {
+    "name": "libmpc3",
+    "version": "1.3.1-1build1.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/m/mpclib3/libmpc3_1.3.1-1build1.1_amd64.deb",
+    "sha256": "cebe6098bb3d66fdacac9dc6fe406a651216d9c00f27c3f9c159d15d96cdf864",
+    "file": "libmpc3_1.3.1-1build1.1_amd64.deb"
+  },
+  {
+    "name": "libmpfr-dev",
+    "version": "4.2.1-1build1.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/m/mpfr4/libmpfr-dev_4.2.1-1build1.1_amd64.deb",
+    "sha256": "362fcdeb7dff545af83e65a3a972519185efd4a231c23e13d519cf97a5c8e3e4",
+    "file": "libmpfr-dev_4.2.1-1build1.1_amd64.deb"
+  },
+  {
+    "name": "libmpfr6",
+    "version": "4.2.1-1build1.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/m/mpfr4/libmpfr6_4.2.1-1build1.1_amd64.deb",
+    "sha256": "aebc1c8b69a1f98bb43dfc268daecd181116dbf40b13ee4e822eb4bdd52b493a",
+    "file": "libmpfr6_4.2.1-1build1.1_amd64.deb"
+  },
+  {
+    "name": "zstd",
+    "version": "1.5.5+dfsg2-2build1.1",
+    "architecture": "amd64",
+    "url": "http://archive.ubuntu.com/ubuntu/pool/main/libz/libzstd/zstd_1.5.5+dfsg2-2build1.1_amd64.deb",
+    "sha256": "d7667f83e3a2caeaaecaca464d542ee6ccf537259a479622796c84afc96d6032",
+    "file": "zstd_1.5.5+dfsg2-2build1.1_amd64.deb"
+  }
+]

@@ -30,6 +30,8 @@ struct GPGPUCPMachineState {
     MemoryRegion vram_alias;
     MemoryRegion host_window;
     MemoryRegion host_window_regs;
+    MemoryRegion hqd_regs;
+    MemoryRegion dispatch_regs;
     uint64_t host_iova_base;
     bool reset_asserted;
     VMChangeStateEntry *vm_state;
@@ -244,6 +246,16 @@ static void gpgpu_cp_machine_init(MachineState *machine)
                           "gpgpu-cp-host-window-regs", 8);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_IOVA_BASE_LO,
                                 &s->host_window_regs);
+
+    memory_region_init_io(&s->hqd_regs, OBJECT(machine), &gpgpu_cp_hqd_ops,
+                          gpgpu, "gpgpu-cp-hqd", 4 * GPGPU_HQD_STRIDE);
+    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_HQD_BASE,
+                                &s->hqd_regs);
+    memory_region_init_io(&s->dispatch_regs, OBJECT(machine),
+                          &gpgpu_cp_regs_ops, gpgpu,
+                          "gpgpu-cp-registers", 0x1000);
+    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_REG_BASE,
+                                &s->dispatch_regs);
 
     object_initialize_child(OBJECT(machine), "cp", &s->cp,
                             machine->cpu_type);

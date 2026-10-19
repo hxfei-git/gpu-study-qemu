@@ -19,8 +19,18 @@
 | FP32 | Floating Point 32-bit | 32 位浮点格式 |
 | CP | Command Processor | 命令处理器 |
 | CSR | Control and Status Register | 控制与状态寄存器 |
+| RV64 | 64-bit RISC-V | 原生 CP 使用的 64 位 RISC-V 模型 |
+| CPU | Central Processing Unit | 中央处理器 |
+| GNU / GCC | GNU's Not Unix / GNU Compiler Collection | GNU 工具集／GNU 编译器集合 |
+| HSA | Heterogeneous System Architecture | 异构系统架构 |
+| HSAKMT | HSA Kernel Mode Thunk | HSA 内核接口封装层；此处借鉴接口风格 |
+| AQL | Architected Queuing Language | HSA 队列包格式 |
+| MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
+| KIQ / HIQ | Kernel Interface Queue / HSA Interface Queue | 内核接口／HSA 接口管理队列 |
+| IH | Interrupt Handler | 本实验的完成与错误通知模块 |
+| VMID | Virtual Memory Identifier | 虚拟地址空间编号；本阶段固定为 0 |
 
-本轮六项已完成，按下列顺序单独提交。提交正文说明做了什么、核心思想、
+第一阶段六项已完成，按下列顺序单独提交。提交正文说明做了什么、核心思想、
 完成方法和验证结果。运行命令、架构与能力覆盖见 [README.md](README.md)。
 
 设备结构重构提交 `b34b175` 放在软件栈 ABI 提交之前：拆分寄存器路由、
@@ -101,3 +111,58 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
 `build/gpgpu-linux-module/{none,smmuv3}/`，宿主机命令与退出码记录在
 `build/gpgpu-linux-validation.json`，专项日志为
 `build/gpgpu-iommu-qtest.log`。
+
+## 第二阶段工作区实现与验证
+
+2026-10-19 在实验基线 `57543dd54b6b046b888277272fa84af81746b1ac` 上接入
+用户队列实现。实现顺序和后续安排统一维护在[实验大纲第二阶段](<../../../QEMU GPGPU 实验大纲.md#22-第二阶段用户-aql-queuedoorbellcp-与-signal>)；
+本节记录代码落点与验证状态。
+
+队列模式使用双进程设备、`IOMMU=none、VMID=0`。Host 通过 HSAKMT 风格库
+申请对象并建立 Queue，RV64 裸机 CP 处理管理命令和 AQL，再把 Kernel
+交给原有 RV32 执行器。Host 参数地址完整保存为 64 位，计算线程的 `a0`
+仍为 32 位参数窗口入口。成功收尾按以下顺序发布：
+
+```text
+执行器终态与确认
+  → Signal=0 → 通知槽=事件编号 → IH 记录
+  → AQL Header=INVALID → 新 R
+  → Host 复查完成并读取结果，按引用寿命卸载和释放
+```
+
+- `include/gpgpu_queue.h` 集中保存布局、寄存器和错误编码；固件的
+  `start.S/link.ld` 固定末尾 4 MiB 范围，`memory.c` 保存 Host 访问上下文，
+  `management.c` 管理 MQD 绑定和请求配对，`aql.c` 处理计算与完成收尾。
+- 设备补齐 HQD、8 字节 Doorbell、IH、参数窗口和分段执行，保留原 RV32
+  指令解释器及同步路径。IH 使用第四个 MSI-X 向量。
+- 驱动入口改为 `linux/gpgpu_pci_main.c`，与内存、队列、事件实现共同生成
+  `gpgpu_pci.ko`。模块参数 `queue_mode=0/1` 选择互斥路径；队列模式按进程
+  管理对象引用，正常卸载后才释放资源，不能确认访问结束的退出上下文继续保留。
+- `hsakmt/` 提供设备、内存、队列、事件四组接口；实验的
+  `tests/queue_helpers.c` 完成原子取号、Header 发布、Doorbell 和默认
+  Signal 等待，不增加逐任务 ioctl。`tests/test-queue.c` 按五组验证计算、
+  并发、等待、错误和资源寿命，包含多进程管理及异常退出后的保留检查。
+- `linux/kernel/` 与 `linux/kernel-build.py` 保存独立内核重建材料和入口。
+  目标为 Linux `6.18.57-0-gpgpu-virt`、`GPU_BUDDY=y`。默认 `--build-mode cross`
+  使用固定 Arm GNU Toolchain `15.2.Rel1`（GCC `15.2.1`）及 `--jobs 16`，
+  输出到 `build/gpgpu-kernel-cross/`；功能开关保持一致，仅允许工具版本记录不同。
+  开发文件导入 ARM64 客体后，由 `guest-cross-prepare.sh` 原生重编构建工具
+  和 GCC 插件，保留配置、生成头及 `Module.symvers`。该客体默认使用 4 个
+  虚拟 CPU、4 GiB 内存和 32 GiB 磁盘，资源参数见 README。
+  `--build-mode native` 仍使用原 `build/gpgpu-kernel/` 输出，原发行版环境也保留。
+  构建参数和队列运行命令见 [README](README.md#重建内核与运行队列测试)。
+
+2026-10-19 本轮验收已通过。CP QTest 16/16，单／双进程 SMMUv3 专项
+各 2/2，ARM64／RISC-V 设备检查各 21/21，汇编检查 4/4。
+
+交叉内核 `6.18.57-0-gpgpu-virt` 已启动，开发文件完成 ARM64 工具转换，
+驱动及用户程序已在客体原生编译。双进程 `IOMMU=none` 队列五组通过 5/5，
+设备卸载通过 1/1，结果时间为 `2026-10-19T03:07:10Z`。单／双进程与
+`none/smmuv3` 四种同步组合各通过驱动检查 5/5、示例 3/3（17,953 个输出值）、
+运行时检查 68/68 和卸载重载 2/2，八次驱动／软件栈运行全部通过。
+
+结果保存在 `build/gpgpu-kernel-cross/remote/none/queue-test.json` 和
+`build/gpgpu-kernel-cross/stage1-validation.json`。本轮同时修复客体的悬空
+固件目录链接，并将非法参数用例地址移到客体 RAM 与 PCI 窗口之外。
+完整日志和代码依据见 [README](README.md#第二阶段本轮验证状态)；历史第一阶段
+记录保持原日期。
