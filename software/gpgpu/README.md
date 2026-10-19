@@ -34,12 +34,25 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | ISO | International Organization for Standardization | 此处指 ISO 9660 光盘镜像 |
 | SHA-256 | Secure Hash Algorithm 256-bit | 256 位安全散列算法 |
 | BDF | Bus, Device, Function | PCI 总线、设备、功能号 |
+| HSA | Heterogeneous System Architecture | 异构系统架构 |
+| ROCr | ROCm Runtime | ROCm 的异构计算运行时 |
+| HSAKMT | HSA Kernel Mode Thunk | HSA 内核接口封装层；此处仅借鉴接口风格 |
+| AQL | Architected Queuing Language | HSA 队列包格式 |
+| MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
+| KIQ / HIQ | Kernel Interface Queue / HSA Interface Queue | 内核接口／HSA 接口管理队列 |
+| IH | Interrupt Handler | 本实验中保存完成与错误通知的中断处理模块 |
+| VMID | Virtual Memory Identifier | 虚拟地址空间编号；第二阶段固定为 0 |
+| CPU | Central Processing Unit | 中央处理器 |
+| GNU / GCC | GNU's Not Unix / GNU Compiler Collection | GNU 工具集／GNU 编译器集合 |
 
-第一阶段的成果放在 `software/gpgpu/`。ARM64 Linux 应用通过 libgpgpu
-提交数据和 kernel，QEMU 中的 GPGPU 执行 RV32 代码，再把结果传回应用。
+同步软件栈和第二阶段队列软件栈都放在 `software/gpgpu/`。同步模式下，
+ARM64 Linux 应用通过 libgpgpu 提交数据和 Kernel，QEMU 中的 GPGPU 执行
+RV32 代码，再把结果传回应用。
 Host 在本文中指 Linux 客体里的应用；QEMU 进程运行在物理宿主机上。
 
 ## 架构与数据路径
+
+下图描述 `queue_mode=0` 的第一阶段同步调用。队列模式见下一节。
 
 ```text
 Linux 客体
@@ -49,7 +62,7 @@ Linux 客体
   runtime/gpgpu.c：libgpgpu
                   │ ioctl + mmap
                   ▼
-  linux/gpgpu_pci.c：/dev/gpgpu0
+  linux/gpgpu_pci_main.c：/dev/gpgpu0
                   │ BAR0 描述符与派发寄存器
                   │ PCI DMA：客体 RAM ↔ VRAM
                   ▼
@@ -64,62 +77,28 @@ QEMU（gpgpu.c 注册 PCI 设备和 BAR）
   kernel 完成 → gpgpu_irq.c：MSI-X → 驱动 completion → ioctl 返回
 ```
 
-当前双进程设备中的原生 CP 已迁移至 RV64，通过 `qemu-system-riscv64`
-执行裸机固件；上图的应用 Kernel 仍由 `gpgpu_core.c` 中的 RV32 计算执行器
-运行。计算线程的寄存器和 `a0` 仍为 32 位，原同步路径继续把参数上传到 VRAM。
-CP 的 Host 访存窗口已实现，计算执行器直接读取 Host 参数的路径尚待接入。
+双进程设备中的原生 CP 使用 `qemu-system-riscv64` 执行 RV64 裸机固件；
+应用 Kernel 继续由 `gpgpu_core.c` 的 RV32 计算执行器运行，计算线程的
+寄存器和 `a0` 仍为 32 位。同步路径把参数上传到 VRAM，队列路径则把完整的
+64 位 Host 参数地址交给执行器，计算线程用 `a0 = 0x9000_0000` 读取只读
+参数窗口。窗口检查对齐的 4 字节读取及本次参数范围。
 
-**[DESIGN]** 第二阶段已确认 16 字节 Kernel 描述对象和计算线程的只读参数
-窗口。执行器保存完整的 64 位 Host 参数基址和实际长度，各线程以
-`a0 = 0x9000_0000` 访问 `0x9000_0000～0x9000_ffff`，按需读取 Host RAM。
-窗口只接受对齐的 4 字节读取，并检查实际参数范围；该路径尚未实现，
-完整布局及错误规则见[规格 6.2 节](<../../../CP_MEC 第一版规格.md#spec-kernel-descriptor>)。
-
-CP 分发接口也已按[规格 6.3 节](<../../../CP_MEC 第一版规格.md#spec-executor-dispatch>)
-确认：由 CP 解析描述对象，通过 `0xfffd_0000 + BAR0 字节偏移` 配置执行器。
-保留原有启动配置和 `DISPATCH`，新增 `KERNEL_CODE_SIZE`、`KERNEL_ARGS_SIZE`
-用于范围检查，新增 `DISPATCH_STATUS`、`DISPATCH_ERROR`、`DISPATCH_ACK`
-用于返回和确认本次结果。CP 在空闲时填完配置，最后写 `DISPATCH=1`；
-执行器保存配置并分段推进，终态结果保留到 CP 读取并确认。
-正常队列路径由 CP 独占提交和确认，旧 Host 直接提交路径单独用于回归；
-两条路径的参数分别为 Host 物理地址与 VRAM 偏移。上述接口尚待实现和验证，
-本文后续运行时调用和同步完成流程仍描述当前软件栈。
-
-第二阶段的[Signal 布局与等待协议](<../../../CP_MEC 第一版规格.md#spec-signal-completion-protocol>)
-也已确认、尚待实现：Signal 为 24 字节，至少按 8 字节对齐；偏移 `0x00`、
-`0x08`、`0x0c`、`0x10` 分别保存 64 位有符号完成值、32 位事件编号、
-填零的 32 位保留字段和 64 位通知槽地址。每个使用中的 Signal 独占事件和通知槽，
-事件编号在所属进程内非零且不与存活事件重复。通知槽初值为 0，完成时写入
-零扩展到 64 位的事件编号；驱动保存“已通知”状态后清零通知槽并唤醒线程。
-等待登记后复查条件，等待返回不清除事件状态，同一任务可唤醒多个等待者；
-只有旧通知与相关处理结束后才可重新初始化。原有 `1 → 0` 完成规则和约
-`200 μs` 主动检查后转入阻塞的默认方式继续沿用。
-
-第二阶段的[可见性规则](<../../../CP_MEC 第一版规格.md#spec-dispatch-visibility>)
-已按 9.5.5 确认，尚待实现。A57 运行时在输入准备完成后执行带编译器内存约束的
-`dmb sy`，再发布有效 Header；再执行屏障后写 Doorbell。CP 使用带编译器内存
-约束的 `fence iorw, iorw` 衔接有效 Header 与输入读取、配置与提交，以及结果
-确认与完成通知。执行器后端结束相关访问后才发布终态，成功还须完成结果写回；
-跨线程交接用锁或 release/acquire 同步。CP 保存结果、清理并确认后，依次发布 Signal、
-通知槽和 IH 通知。Host 完整读到 Signal 为 `0` 后执行 `dmb sy`，再读取或复制
-结果。上传或结果复制使用 DMA 时须等待成功完成，不能用屏障代替等待；连续提交
-验证须每轮改变输入，覆盖短暂轮询和阻塞唤醒。
-
-> **[SOURCE]** 实验源码固定提交 `57543dd54b6b046b888277272fa84af81746b1ac`：
->
-> - 原生 CP 的 CPU 类型：[hw/riscv/gpgpu-cp.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1)，[274–288 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1)。
-> - 计算线程的 32 位状态：[hw/gpgpu/gpgpu_core.h](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1)，[72–80 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1)；参数写入 `a0`：[hw/gpgpu/gpgpu_core.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1)，[615–624 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1)。
+工作区已实现 HQD、Doorbell、IH、CP 队列固件、执行器分段执行和 Host 参数
+读取。固件与设备联合 QTest、重建内核上的 Linux 五组队列验收和四种同步
+组合回归均已通过，结果见下文。下述同步模式的独占会话、暂存区和超时复位
+继续用于第一阶段回归。
 
 阅读设备代码时，先从 `gpgpu_regs.c` 找到寄存器所属模块，再沿该模块的
 读写函数追踪操作。`gpgpu_regs.h` 保存寄存器偏移和枚举，`gpgpu.h` 保存
 设备状态与模块接口。`dma.status` 使用 `GPGPUDMAStatus` 枚举，取值为
 IDLE、BUSY、COMPLETE、ERROR；中断和全局状态使用可组合的枚举位标志。
-BAR4 的占位回调位于 `gpgpu_doorbell.c`。
+BAR4 的 8 字节 Doorbell 回调位于 `gpgpu_doorbell.c`。
 
-驱动匹配 PCI `1234:1337`，申请 BAR0、BAR2 和 BAR4。BAR0 用于控制、
-DMA 和 kernel 派发，BAR2 表示设备显存资源；驱动保留 BAR4，门铃和命令队列
-留到第二阶段。驱动申请三个 MSI-X 向量，分别处理计算完成、DMA 完成和设备
-错误。请求等待中断完成，超过 5 秒返回 `-ETIMEDOUT` 并复位寄存器状态。
+在同步模式中，驱动匹配 PCI `1234:1337`，申请 BAR0、BAR2 和 BAR4。
+BAR0 用于控制、DMA 和 Kernel 派发，BAR2 表示设备显存资源；BAR4 在同步
+模式中保留，在队列模式中用于 Doorbell。同步模式申请三个 MSI-X 向量，
+分别处理计算完成、DMA 完成和设备错误。请求等待中断完成，超过 5 秒返回
+`-ETIMEDOUT` 并复位寄存器状态。
 
 每次打开字符设备建立一个会话。驱动通过 gen_pool 分配 VRAM，以 256 字节
 为粒度管理空间；返回值是 32 位 VRAM 字节偏移。首个页保留，地址 0 不分配。
@@ -156,7 +135,88 @@ VRAM：描述符的显存端、应用设备指针和 kernel 参数仍为字节�
 成功时该次传输已完成；Launch 返回成功时所有线程已执行完毕，随后可调用
 D2H 获取结果。
 
+## 第二阶段队列路径与接口
+
+当前队列配置为 `REMOTE=1、IOMMU=none、VMID=0`。Host RAM 对象使用完整的
+64 位物理字节地址，VRAM 对象使用区内偏移。驱动装载 `gpgpu-cp.bin`，建立
+KIQ 和 IH，再启动 CP；CP 经 KIQ 建立 HIQ，由 HIQ 处理用户队列创建与卸载。
+全设备最多同时驻留两条用户队列。下面沿一次提交说明对象的使用顺序：
+
+```text
+实验调用方
+  → gpgpuKmtOpen：取得进程连接
+  → gpgpuKmtAllocMemory：申请 Ring、进度、Signal、参数与 VRAM
+  → gpgpuKmtCreateQueue：驱动准备 MQD，HIQ 请求 CP 装入空闲 HQD
+  → gpgpuKmtCreateEvent：把事件与源队列关联，返回通知槽地址
+  → 准备 Signal=1 与参数，原子取号后等待相应 Ring 槽可写
+  → 填写 AQL 包体
+  → 完整发布 32 位 Header，写 64 位 Doorbell
+       ↓
+RV64 CP 固件
+  → 读取 W 与 Header，解析 Dispatch 和 VRAM 中的 Kernel 描述对象
+  → 配置 RV32 执行器，等待整个 Dispatch 结束并确认结果
+  → Signal=0 → 通知槽=事件编号 → 提交 IH → Header=INVALID → 回报新 R
+       ↓
+Host 调用方
+  → 约 200 μs 主动检查后按需阻塞，唤醒后复查 Signal
+  → 同步读取结果，停止提交并排空队列
+  → 卸载 Queue，结束旧通知和映射引用，再销毁 Event、释放 Memory、关闭连接
+```
+
+驱动模块通过 `queue_mode` 选择互斥模式，默认 `0` 保留同步路径，`1` 使用
+队列路径。队列模式支持多个进程连接，DMA、IH 与错误状态分别处理；打开、
+关闭或等待超时不触发全局复位。成功的内存拷贝接口返回时，该次 DMA 已经
+完成；任务发布仍由调用方直接写 Ring，不增加逐 Dispatch ioctl。
+
+`hsakmt/gpgpu_kmt.h` 提供四组接口。`gpgpuKmtOpen/Close/GetInfo` 管理连接
+和查询版本；同进程重复打开增加连接引用，最后关闭前须释放存活对象。
+`gpgpuKmtAllocMemory/FreeMemory/CopyMemory` 管理内存与已有 DMA 通路，
+分别返回软件句柄、CPU 映射、Host 物理地址或 VRAM 偏移。
+`gpgpuKmtCreateQueue/QueryQueue/DestroyQueue` 管理队列与 Doorbell 映射。
+`gpgpuKmtCreateEvent/QueryEvent/WaitEvent/DestroyEvent` 管理通知和等待；
+事件等待返回后保留状态，可唤醒多个等待者。版本不匹配明确拒绝，管理结果、
+队列首次错误和接口状态分别保存。
+
+调用方的 AQL 发布和 Signal 等待放在 `tests/queue_helpers.c`。实验固定最多
+4 个提交线程，每线程只保留一个未发布编号；共享 W 使用 32 位原子取号，R/W
+存放位置各按 8 字节对齐。线程按自己的 P 等待 `(P-R) mod 2^32 < N`，
+因此全局 `W-R > N` 仍允许较早编号填包。填包和发布不由全局锁串行保护。
+等槽期间若队列故障，提交线程结束等待并保留已预留编号和资源，不回退 W
+或填补空洞。
+A57 在 Header 发布前、Doorbell 写入前和读到 Signal 完成后使用 `dmb sy`；
+CP 对应使用 `fence iorw, iorw`。默认 Signal 等待的约 `200 μs` 预算从本次
+等待开始计算，接口库中的事件等待不再重复这一轮主动检查。
+
+正常销毁前，调用方停止提交、完成已开始的发布并等待排空；驱动复核 R/W，
+再请求 CP 卸载。确认 MQD 保存、设备访问及旧通知处理结束后，才解除队列
+对 Ring、进度对象的引用。Doorbell 由驱动按进程分配独占页面；旧映射或事件
+仍在时，入口和 MQD 地址继续保留。外部内存映射未解除也会阻止释放。
+
+创建后 CPU 映射失败且卸载结果未确认时，库不返回可提交的队列标识，但保留
+内部引用，使相关内存释放及最后关闭返回暂不可用。等待超时只结束本次等待。
+进程异常退出后，驱动保留仍可能被设备访问的上下文和内存；本版通过设备
+移除停止访问后清理，不实现运行中复位恢复、取消预留空洞或强制中止。
+
+代码沿现有职责组织：设备的 HQD、IH 和参数访问分别位于
+`hw/gpgpu/gpgpu_hqd.c`、`gpgpu_ih.c`、`gpgpu_params.c`；分发和 RV32 执行器
+仍使用原有文件。`firmware/` 将启动与异常、Host 访存、管理命令、AQL 收尾
+分开。驱动的 PCI 入口改为 `linux/gpgpu_pci_main.c`，与 `gpgpu_memory.c`、
+`gpgpu_queue.c`、`gpgpu_event.c` 共同链接成原名 `gpgpu_pci.ko`。
+`include/gpgpu_queue.h` 集中定义 MQD、AQL、Signal、IH 和寄存器编码，
+编译期核对布局；`hsakmt/` 按设备、内存、队列、事件分文件实现接口库。
+
+> **[SOURCE]** 当前未提交工作区，基于实验子仓库 `57543dd54b6b046b888277272fa84af81746b1ac`：
+>
+> - 四组接口与创建失败时的引用保留：[software/gpgpu/hsakmt/gpgpu_kmt.h](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/hsakmt/gpgpu_kmt.h:48:1)，[第 48～82 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/hsakmt/gpgpu_kmt.h:48:1)。
+> - 固件固定布局、入口和栈范围：[software/gpgpu/firmware/link.ld](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:4:1)，[第 4～16 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:4:1)；AQL 执行、确认及完成收尾：[software/gpgpu/firmware/aql.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:60:1)，[第 60～166 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:60:1)。
+> - 调用方的原子取号、发布屏障和默认等待：[software/gpgpu/tests/queue_helpers.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/queue_helpers.c:11:1)，[第 11～132 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/queue_helpers.c:11:1)。
+
+以上接口遵循[CP/MEC 第一版规格](<../../../CP_MEC 第一版规格.md>)中的实验
+协议，采用 HSAKMT 风格的职责划分，未实现完整 ROCr 或原版 libhsakmt 的 ABI。
+
 ## 运行时接口
+
+本节列出 `queue_mode=0` 使用的原同步接口。
 
 公共 API 在 `runtime/gpgpu.h`，驱动 ABI 在 `include/gpgpu_uapi.h`。
 API 除 `gpgpuDestroy()` 外返回 0 或负 errno。每个 context 用互斥锁保护
@@ -277,6 +337,121 @@ for arch in aarch64 riscv64; do
 done
 ```
 
+### 重建内核与运行队列测试
+
+队列模式需要内置 `CONFIG_GPU_BUDDY=y`。固定构建材料保存在
+`linux/kernel/`，包括 Alpine 构建提交、源码校验值、配置和有序补丁。
+构建沿用已保存的 Alpine `6.18.57-0-virt` 开发盘及匹配的软件包缓存。
+`--base-environment` 默认指向 `build/gpgpu-linux-module/`，其中须包含原
+`developer.raw`、环境记录和通过清单校验的 `apk-cache/`。通用的
+`module-test.py prepare` 会按运行时的软件源取包，未来重跑不保证得到这一
+固定版本；重建时应保留并使用已核对的原环境。
+
+交叉流程按 x86_64 Ubuntu 24.04 宿主机准备，使用 `dpkg-deb` 解包固定的
+amd64 依赖包。宿主机须已有 `gcc`、`g++`、`make`、`flex`、`bison`、`bc`、
+`perl`、`pkg-config`、OpenSSL 开发文件、`tar`、`xz`、`patch` 和
+`e2fsprogs`。脚本只按 `cross-host-dependencies.json` 补充 11 个依赖包，
+上述基本工具由宿主环境提供。
+
+`linux/kernel-build.py` 默认使用 `--build-mode cross`，在物理宿主机上
+交叉编译 Linux `6.18.57-0-gpgpu-virt`，再将产物导入独立 ARM64 客体：
+
+```text
+物理宿主机：固定工具链交叉编译 ARM64 内核和模块
+  → 导出源码、配置、生成头及 Module.symvers
+  → 独立 ARM64 客体：安装模块、原生重编构建工具及 GCC 插件、生成启动镜像
+  → 新内核客体：原生编译驱动和用户程序，运行队列与同步路径验收
+```
+
+交叉工具链固定为 Arm GNU Toolchain `15.2.Rel1`，其中 GCC 为 `15.2.1`，
+下载地址和 SHA-256 保存在 `linux/kernel/cross-toolchain.json`。宿主机默认
+并发数为 `--jobs 16`，输出目录为 `build/gpgpu-kernel-cross/`。客体工具
+转换和导出默认使用 `--cpus 4 --memory 4G --disk-gib 32`，等待上限可用
+`--timeout` 调整。`--output-dir` 可指定另一套独立输出目录。
+原发行版环境 `build/gpgpu-linux-module/` 和原生构建输出
+`build/gpgpu-kernel/` 均保留；继续原生构建时使用 `--build-mode native`，
+其默认输出仍为 `build/gpgpu-kernel/`。
+
+原 Alpine 配置保存在 `linux/kernel/virt.aarch64.config`，实验增量见
+`linux/kernel/gpgpu.config`：启用内置伙伴分配器和固件加载，关闭未使用的
+设备、网络与文件系统模块，同时保留启动、PCI、IOMMU、virtio、9p 和
+ext4 依赖。交叉配置与已确认的 `linux/kernel/gpgpu.arm64.config` 核对，
+只允许编译器、汇编器和链接器的版本记录不同。当前差异仅为
+`CONFIG_CC_VERSION_TEXT` 和 `CONFIG_GCC_VERSION`，记录在输出目录的
+`cross-config-differences.json`；功能选项出现差异时脚本停止构建。
+
+交叉输出中的构建工具使用宿主机指令集。导入 ARM64 客体时，
+`linux/kernel/guest-cross-prepare.sh` 用客体的 Alpine GCC `15.2.0`
+定向重编 `fixdep`、`conf`、`modpost`、`mk_elfconfig`、`genksyms`、签名工具
+和已启用的 GCC 插件，并修复源码、输出及依赖文件中的绝对路径。脚本不重新
+配置或编译内核；转换前后核对 `.config`、生成头、`Module.symvers` 和模块
+链接脚本的内容，保持它们与交叉内核一致。路径元数据允许随安装位置调整。
+
+> **[SOURCE]** 当前未提交工作区，基于实验子仓库 `57543dd54b6b046b888277272fa84af81746b1ac`：
+>
+> - 工具链版本和校验值：[linux/kernel/cross-toolchain.json](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/cross-toolchain.json:1:1)，[第 1～10 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/cross-toolchain.json:1:1)。
+> - 保留环境的版本与缓存校验：[linux/kernel-build.py](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:311:1)，[第 311～323 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:311:1)；宿主依赖解包与路径设置：[第 74～95 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:74:1)。
+> - 功能配置差异检查：[linux/kernel-build.py](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:108:1)，[第 108～121 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:108:1)。
+> - 客体工具重编与最终校验：[linux/kernel/guest-cross-prepare.sh](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/guest-cross-prepare.sh:148:1)，[第 148～212 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/guest-cross-prepare.sh:148:1)。
+
+从实验子仓库根目录执行：
+
+```sh
+# 默认流程：宿主机交叉编译，再导入独立 ARM64 客体
+python3 software/gpgpu/linux/kernel-build.py --build-mode cross --jobs 16
+
+# 独立构建 RV64 裸机固件，产物为 build/gpgpu-firmware/gpgpu-cp.bin
+make -C software/gpgpu firmware
+
+# 使用重建内核，在双进程、IOMMU=none 配置运行五组队列测试
+make -C software/gpgpu/linux queue-test BUILD_DIR="$PWD/build/gpgpu-kernel-cross"
+
+# 原 8 项 CP 回归和新增 8 项设备／固件队列检查
+make -f Makefile.camp test-gpgpu-cp JOBS=4
+```
+
+固件链接到 `0x03c0_0000`，代码和静态数据上限为 `0x03ff_0000`，末尾
+64 KiB 作为栈。驱动通过 `request_firmware("gpgpu-cp.bin")` 从客体固件目录
+取得镜像，检查长度后装入固定保留区。应用分配池只管理前 60 MiB；显存池中
+的首个页按客体 `PAGE_SIZE` 保留，并登记到 `gpu_buddy`。
+
+队列脚本构建接口库与 `test-queue`，安装固件后以 `queue_mode=1` 装载模块。
+五组检查依次覆盖连续计算、并发发布、等待通知、基本错误退出和卸载与寿命；
+每组必须输出一条 `PASS queue-group-N`，总结果为
+`GPGPU queue tests: 5/5 PASS`。最后一组保留异常退出进程的队列与显存，
+再验证剩余名额和显存区间；脚本随后移除设备，确认资源停止访问后清理。
+原同步模式的单／双进程和 `none/smmuv3` 四种组合回归仍单独运行。
+
+### 第二阶段本轮验证状态
+
+2026-10-19，当前工作区的 RV64 固件与 Host 接口库已通过编译，汇编检查
+4/4。CP QTest 为 16/16，包含原 8 项、设备边界检查和真实队列固件流程；
+新增的 A57 与 RV64 CP 双向 64 位并发访问检查运行 2000 轮，高低半部同时
+交替变化。单／双进程 SMMUv3 专项各 2/2，ARM64／RISC-V 设备检查各 21/21。
+CP 日志为 `build/gpgpu-cp-qtest.log`，数量检查同时核对测试计划、PASS 数量
+及没有跳过项。
+
+交叉内核 `6.18.57-0-gpgpu-virt` 已启动，开发文件已完成 ARM64 工具转换，
+本机插件加载已通过验证，配置、生成头和 `Module.symvers` 在转换前后保持
+不变。驱动及用户程序已在新内核客体中原生编译。`REMOTE=1、IOMMU=none` 的队列验收通过
+5/5，设备卸载通过 1/1；结果完成时间为 `2026-10-19T03:07:10Z`。
+
+同一新内核还完成单／双进程与 `none/smmuv3` 四种同步组合。每种组合均通过
+驱动检查 5/5、三个示例 3/3（共 17,953 个输出值）、运行时检查 68/68 和
+卸载重载 2/2；八次驱动／软件栈运行全部通过，没有内核异常或非预期 SMMU
+故障。队列及同步测试共同使用 `build/gpgpu-kernel-cross/` 的内核与模块。
+
+本轮修复了 Alpine Live ISO 遗留的悬空 `/lib/firmware` 链接。非法参数用例
+也已改用客体 RAM 和 PCI 窗口之外的物理地址，避免误用 1 GiB 客体中的合法
+RAM。等待用例在提交前确认主线程和两个等待线程均阻塞在事件 ioctl，寿命
+用例分别验证旧映射与旧事件阻止入口复用。
+
+> **[SOURCE]** 2026-10-19 实际运行产物：[队列结果](../../build/gpgpu-kernel-cross/remote/none/queue-test.json)、[队列检查与卸载日志](../../build/gpgpu-kernel-cross/remote/none/queue-test.log)、[四种同步组合的八次运行汇总](../../build/gpgpu-kernel-cross/stage1-validation.json)及[内核构建清单](../../build/gpgpu-kernel-cross/kernel-build.json)。这些链接指向本地 `build/` 产物，未纳入 Git；复现构建和测试后生成。
+>
+> 当前工作区的等待与寿命检查见 [tests/test-queue.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:369:1) 的 [第 369～407 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:369:1)、[第 609～647 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:609:1)，非法参数地址见该文件的 [第 458～465 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:458:1)。固件目录修复见 [linux/guest-queue-test.sh](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/guest-queue-test.sh:8:1) 的 [第 8～14 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/guest-queue-test.sh:8:1)。
+
+下节的 2026-10-08 记录属于第一阶段历史结果。
+
 ## 本轮验证记录
 
 2026-10-08 在本仓库 `main` 分支运行。ARM64 Alpine 客体内核为
@@ -338,8 +513,9 @@ FP32 kernel 与 BF16、FP8 E4M3/E5M2、FP4 E2M1 转换继续由 RV32
 的用户态数值测试。当前执行器没有 FP16 转换指令。
 
 共享内存、block 屏障、ballot/shuffle 尚未实现。非零 shared_size 返回
-`-EOPNOTSUPP`。命令队列、Doorbell、stream、异步事件与多租户隔离留到后续
-阶段。驱动检查请求的分配范围，但 RV32 kernel 仍可访问设备 VRAM，不能
+`-EOPNOTSUPP`。命令队列、Doorbell 和完成事件已在当前队列路径实现；
+stream、多租户隔离及共享存储继续留作后续扩展。驱动检查请求的分配范围，
+但 RV32 Kernel 仍可访问设备 VRAM，不能
 作为不可信 kernel 的沙箱。设备已标记不可迁移，需补齐 VRAM、执行上下文
 和 DMA 状态保存后才能支持迁移。
 

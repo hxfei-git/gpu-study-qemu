@@ -1,0 +1,16 @@
+Subject: [PATCH] gpu: 允许教学设备独立启用 GPU_BUDDY
+
+实验驱动为树外模块，没有树内 Kconfig 的 select。只为分配器增加配置
+提示，使 olddefconfig 保留 CONFIG_GPU_BUDDY=y；不改变分配器实现。
+
+--- a/drivers/gpu/Kconfig
++++ b/drivers/gpu/Kconfig
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ config GPU_BUDDY
+-       bool
++       bool "GPU buddy allocator for the GPGPU teaching driver"
+        help
+          A page based buddy allocator for GPU memory.
+ 

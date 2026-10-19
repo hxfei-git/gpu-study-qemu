@@ -1,0 +1,43 @@
+# GPGPU 自有代码采用 Linux 风格；保留现有标识符和包含顺序。
+BasedOnStyle: LLVM
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+ContinuationIndentWidth: 8
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+IndentCaseLabels: false
+AllowShortEnumsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AlignAfterOpenBracket: Align
+AlignOperands: DontAlign
+BinPackArguments: true
+BinPackParameters: true
+Cpp11BracedListStyle: false
+SortIncludes: Never
+ReflowComments: false
+SpaceBeforeParens: ControlStatementsExceptControlMacros
+ForEachMacros:
+  - list_for_each_entry
+  - list_for_each_entry_safe
+  - QTAILQ_FOREACH
+StatementMacros:
+  - OBJECT_DECLARE_SIMPLE_TYPE
+  - type_init
+  - module_init
+  - module_exit
+  - module_param
+  - MODULE_PARM_DESC
+  - MODULE_DEVICE_TABLE
+  - MODULE_LICENSE
+  - MODULE_AUTHOR
+  - MODULE_DESCRIPTION
+AlignEscapedNewlines: Left
+BreakBeforeTernaryOperators: false
+SpaceAfterCStyleCast: false
+RemoveBracesLLVM: true
+SpaceBeforeCpp11BracedList: true

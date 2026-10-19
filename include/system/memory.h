@@ -2955,6 +2955,11 @@ void address_space_register_map_client(AddressSpace *as, QEMUBH *bh);
  */
 void address_space_unregister_map_client(AddressSpace *as, QEMUBH *bh);
 
+/* 对齐 RAM 字段等宽访问，其他区域沿用原语义。 */
+MemTxResult address_space_rw_atomic(AddressSpace *as, hwaddr addr,
+                                    MemTxAttrs attrs, void *buf,
+                                    unsigned size, bool is_write);
+
 /* Internal functions, part of the implementation of address_space_read.  */
 MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
                                     MemTxAttrs attrs, void *buf, hwaddr len);

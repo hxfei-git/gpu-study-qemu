@@ -19,4 +19,5 @@ GTAGS
 *.depend_raw
 *.swp
 *.patch
+!software/gpgpu/linux/kernel/*.patch
 *.gcov

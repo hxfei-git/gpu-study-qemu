@@ -1,0 +1,5 @@
+# GPGPU 自有 C 代码遵循 Linux 的 8 列制表符缩进。
+[*.{c,h}]
+indent_style = tab
+indent_size = 8
+tab_width = 8

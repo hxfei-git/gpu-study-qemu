@@ -2,6 +2,9 @@
 system_ss.add(when: 'CONFIG_GPGPU', if_true: files(
     'gpgpu.c',
     'gpgpu_cp.c',
+    'gpgpu_hqd.c',
+    'gpgpu_ih.c',
+    'gpgpu_params.c',
     'gpgpu_regs.c',
     'gpgpu_irq.c',
     'gpgpu_dma.c',

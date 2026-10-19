@@ -18,6 +18,7 @@ ABI_REGISTERS = (
 
 
 def register(name, floating=False):
+    """解析整数或浮点寄存器名称，核对编号范围后返回编码。"""
     prefix = "f" if floating else "x"
     if re.fullmatch(prefix + r"\d+", name):
         value = int(name[1:])
@@ -30,6 +31,7 @@ def register(name, floating=False):
 
 
 def immediate(text, symbols):
+    """从符号表或数值字面量取得立即数，未知名称作为汇编错误返回。"""
     if text in symbols:
         return symbols[text]
     try:
@@ -39,6 +41,7 @@ def immediate(text, symbols):
 
 
 def signed(value, bits, alignment=1):
+    """检查有符号立即数的位宽和对齐，再返回对应补码位段。"""
     if value % alignment or not -(1 << (bits - 1)) <= value < 1 << (bits - 1):
         raise ValueError(
             f"immediate {value} outside aligned signed {bits} bits")
@@ -46,6 +49,7 @@ def signed(value, bits, alignment=1):
 
 
 def memory(text, symbols):
+    """解析 offset(base) 操作数，分别校验 12 位偏移和基址寄存器。"""
     match = re.fullmatch(r"([^()]+)\(([^()]+)\)", text)
     if not match:
         raise ValueError(f"expected offset(base), got {text}")
@@ -53,6 +57,7 @@ def memory(text, symbols):
 
 
 def encode(line, pc, symbols):
+    """按助记符校验操作数，并将一条教学指令编码成 32 位 RV32 指令字。"""
     fields = line.replace(",", " ").split()
     op, operands = fields[0], fields[1:]
     counts = {"ebreak": 0, "lui": 2, "jal": 2}
@@ -112,6 +117,7 @@ def encode(line, pc, symbols):
 
 
 def source_lines(path, visited=None):
+    """展开相对 include 并保留源码位置，拒绝递归包含。"""
     visited = set() if visited is None else visited
     path = path.resolve()
     if path in visited:
@@ -130,6 +136,7 @@ def source_lines(path, visited=None):
 
 
 def assemble(path):
+    """先收集符号和 PC，再编码指令，输出连续的小端字节串。"""
     symbols, instructions = {}, []
     pc = 0
     for location, line in source_lines(path):
@@ -163,6 +170,7 @@ def assemble(path):
 
 
 def main():
+    """解析输出路径并汇编源文件，同时生成二进制和用户态 C 数组头文件。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("--bin", type=Path, required=True)
