@@ -165,6 +165,7 @@ static void gpgpu_reset(DeviceState *dev)
 }
 
 static const Property gpgpu_properties[] = {
+	DEFINE_PROP_BOOL("gpuvm", GPGPUState, gpuvm, false),
 	DEFINE_PROP_UINT32("num_cus", GPGPUState, num_cus, GPGPU_DEFAULT_NUM_CUS),
 	DEFINE_PROP_UINT32("warps_per_cu", GPGPUState, warps_per_cu, GPGPU_DEFAULT_WARPS_PER_CU),
 	DEFINE_PROP_UINT32("warp_size", GPGPUState, warp_size, GPGPU_DEFAULT_WARP_SIZE),

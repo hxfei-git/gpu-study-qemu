@@ -2,6 +2,8 @@
 #ifndef GPGPU_QUEUE_H
 #define GPGPU_QUEUE_H
 
+#include "gpgpu_vm.h"
+
 /* 同一份小端协议供设备、RV64 裸机固件、内核和用户态使用。 */
 typedef __UINT16_TYPE__ gpgpu_q_u16;
 typedef __UINT32_TYPE__ gpgpu_q_u32;

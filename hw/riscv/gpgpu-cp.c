@@ -33,6 +33,10 @@ struct GPGPUCPMachineState {
     MemoryRegion hqd_regs;
     MemoryRegion dispatch_regs;
     uint64_t host_iova_base;
+    uint32_t vm_domain;
+    uint32_t vm_id;
+    uint32_t vm_slot;
+    uint32_t vm_phase;
     bool reset_asserted;
     VMChangeStateEntry *vm_state;
 };
@@ -59,6 +63,14 @@ static MemTxResult gpgpu_cp_host_access(GPGPUCPMachineState *s, hwaddr addr,
         return MEMTX_ERROR;
     }
 
+    if (s->vm_domain == GPGPU_VM_DOMAIN_USER) {
+        return gpgpu_vm_access(s->gpgpu, s->vm_id, s->vm_slot, iova, buf,
+                               size, is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ,
+                               s->vm_phase) ? MEMTX_OK : MEMTX_ERROR;
+    }
+    if (s->vm_domain != GPGPU_VM_DOMAIN_MANAGEMENT) {
+        return MEMTX_ERROR;
+    }
     /* 直接访存，不使用 Host DMA 描述符、状态或完成中断。 */
     return vfu_object_dma_rw(PCI_DEVICE(s->gpgpu), iova, buf, size, is_write);
 }
@@ -105,7 +117,15 @@ static uint64_t gpgpu_cp_host_regs_read(void *opaque, hwaddr addr,
 {
     GPGPUCPMachineState *s = opaque;
 
-    return addr == 0 ? (uint32_t)s->host_iova_base : s->host_iova_base >> 32;
+    switch (addr) {
+    case 0: return (uint32_t)s->host_iova_base;
+    case 4: return s->host_iova_base >> 32;
+    case 8: return s->vm_domain;
+    case 12: return s->vm_id;
+    case 16: return s->vm_slot;
+    case 20: return s->vm_phase;
+    default: return 0;
+    }
 }
 
 static void gpgpu_cp_host_regs_write(void *opaque, hwaddr addr, uint64_t val,
@@ -113,6 +133,15 @@ static void gpgpu_cp_host_regs_write(void *opaque, hwaddr addr, uint64_t val,
 {
     GPGPUCPMachineState *s = opaque;
 
+    if (addr >= 8) {
+        switch (addr) {
+        case 8: s->vm_domain = val; break;
+        case 12: s->vm_id = val; break;
+        case 16: s->vm_slot = val; break;
+        case 20: s->vm_phase = val; break;
+        }
+        return;
+    }
     if (addr == 0) {
         /* 低 16 位读零；写完高低位后再访存。 */
         val &= ~(GPGPU_CP_HOST_WINDOW_SIZE - 1);
@@ -149,6 +178,8 @@ static void gpgpu_cp_set_state_on_cpu(CPUState *cs, run_on_cpu_data data)
         s->cp.env.resetvec = change->reset_vector;
         resettable_assert_reset(OBJECT(cs), RESET_TYPE_COLD);
         s->host_iova_base = 0;
+        s->vm_domain = s->vm_id = s->vm_slot = s->vm_phase = 0;
+        s->gpgpu->vm_firmware = 0;
         s->reset_asserted = true;
         cs->halted = true;
         /* 暂停取指，防止复位前残留的 pending IRQ 唤醒 CPU。 */
@@ -243,7 +274,7 @@ static void gpgpu_cp_machine_init(MachineState *machine)
                                 &s->host_window);
     memory_region_init_io(&s->host_window_regs, OBJECT(machine),
                           &gpgpu_cp_host_regs_ops, s,
-                          "gpgpu-cp-host-window-regs", 8);
+                          "gpgpu-cp-host-window-regs", 24);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_IOVA_BASE_LO,
                                 &s->host_window_regs);
 

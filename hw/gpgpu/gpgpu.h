@@ -54,13 +54,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
 
 /**
  * struct GPGPUKernelParams - 一次派发的配置快照，队列模式在提交时固定
- * @kernel_addr: RV32 代码的 VRAM 字节偏移，按 4 字节对齐。
- * @kernel_args: 同步模式为 VRAM 偏移；队列模式为完整 Host 物理地址。
+ * @kernel_addr: RV32 代码入口；GPUVM 模式为 GPUVA，旧模式为 VRAM 偏移。
+ * @kernel_args: 同步模式为 VRAM 偏移；物理队列为 DMA 地址；GPUVM 队列为 GPUVA。
  * @grid_dim: X/Y/Z 方向的工作组数，均非零。
  * @block_dim: 工作组 X/Y/Z 方向的线程数，均非零。
  * @code_size: 代码范围的字节数，队列模式用于取指边界检查。
  * @args_size: 参数块字节数，队列模式用于只读参数窗口检查。
  * @shared_mem_size: 每工作组共享内存字节数，本版只接受零。
+ * @vmid: 本对象所属的设备地址空间编号，管理访问为零。
+ * @source_slot: 本次任务所属的 HQD 槽号。
  */
 typedef struct GPGPUKernelParams {
 	uint64_t kernel_addr;
@@ -70,6 +72,8 @@ typedef struct GPGPUKernelParams {
 	uint32_t code_size;
 	uint32_t args_size;
 	uint32_t shared_mem_size;
+	uint32_t vmid;	      /* 本次任务的用户地址空间编号。 */
+	uint32_t source_slot; /* 本次任务所属 HQD 槽。 */
 } GPGPUKernelParams;
 
 /**
@@ -133,6 +137,29 @@ typedef struct GPGPUIHState {
 	uint32_t status;
 } GPGPUIHState;
 
+/* GPUVM 上下文由 Host 配置，所有访问在设备主锁下同步执行。 */
+typedef struct GPGPUVMContext {
+	uint64_t root;	       /* VRAM 中的根目录字节偏移。 */
+	bool enabled;	       /* 发布页表和失效后才启用。 */
+	unsigned int accesses; /* 正在进行的访问，含跨进程 DMA。 */
+} GPGPUVMContext;
+
+/* 直接映射的小型 TLB，权限与目标一起缓存。 */
+typedef struct GPGPUVMTlb {
+	uint64_t pte;  /* 叶子表项的完整快照。 */
+	uint32_t page; /* GPU 页号。 */
+	uint32_t vmid; /* 所属上下文。 */
+} GPGPUVMTlb;
+
+/* 首次故障读不清；槽位安全卸载后才能复用。 */
+typedef struct GPGPUVMFault {
+	uint64_t address; /* 原始 GPUVA，保留非法高位。 */
+	uint32_t reason;  /* 非零故障原因。 */
+	uint32_t vmid;	  /* 请求所属 VMID。 */
+	uint32_t access;  /* READ、WRITE 或 EXEC。 */
+	uint32_t phase;	  /* 取包、参数、取指或数据阶段。 */
+} GPGPUVMFault;
+
 /**
  * struct GPGPUState - PCI 教学加速器的寄存器、内存与执行状态
  * @parent_obj: QOM 的 PCI 父对象，必须位于结构体首部。
@@ -168,6 +195,12 @@ typedef struct GPGPUIHState {
  * @dispatch_error: 本次派发的细分错误码，确认结果时清除。
  * @dma: DMA 描述符、状态与完成定时器。
  * @simt: Host 可读写的 SIMT 教学寄存器。
+ * @gpuvm: 本连接或设备是否采用 GPUVM 地址语义。
+ * @vm_firmware: 固件启动时发布的 GPUVM 接口版本。
+ * @vm_status: 最近一次同步失效的忙、ACK 或错误状态。
+ * @vm: 三个编号对应的根、使能和在途访问记录。
+ * @tlb: 按 VMID 和 GPU 页号区分的 64 项翻译缓存。
+ * @vm_fault: 按 HQD 槽分别锁存的首次用户访问故障。
  */
 struct GPGPUState {
 	PCIDevice parent_obj;
@@ -188,6 +221,12 @@ struct GPGPUState {
 	bool cp_reset_hold;
 	bool cp_started;
 	bool queue_mode;
+	bool gpuvm;	      /* QOM 启动属性，设备寿命内不变。 */
+	uint32_t vm_firmware; /* 固件版本握手。 */
+	uint32_t vm_status;   /* 本次失效状态。 */
+	GPGPUVMContext vm[3];
+	GPGPUVMTlb tlb[64];
+	GPGPUVMFault vm_fault[4];
 	uint32_t cp_reset_vector;
 
 	GPGPUControl global_ctrl;
@@ -208,6 +247,16 @@ struct GPGPUState {
 	GPGPUDMAState dma;
 	GPGPUSIMTContext simt;
 };
+
+/* 保存调用参数快照，翻译后访问完整标量或逐页搬运。 */
+bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, void *data,
+		     size_t length, uint32_t access, uint32_t phase);
+/* 读取/更新 GPUVM Host 管理寄存器。 */
+uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr addr);
+void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value);
+/* 为参数窗/控制页的非法访问记录源队列故障。 */
+bool gpgpu_vm_fail(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, uint32_t access,
+		   uint32_t phase, uint32_t reason);
 
 /*
  * gpgpu_vram_contains() - 检查字节范围是否位于 VRAM 内

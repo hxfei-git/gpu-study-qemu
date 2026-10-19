@@ -41,7 +41,8 @@ BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
 BUILD_INPUTS = ("gpgpu_pci_main.c", "gpgpu_memory.c", "gpgpu_queue.c",
                 "gpgpu_event.c", "gpgpu_queue_drv.h", "gpgpu_regs.h",
                 "Makefile", "guest-compile.sh", "../include/gpgpu_uapi.h",
-                "../include/gpgpu_queue.h")
+                "../include/gpgpu_queue.h", "../include/gpgpu_vm.h",
+                "../include/gpgpu_drm.h", "gpgpu_gpuvm.c")
 BUILD_VERSION = 3
 ENVIRONMENT_INPUTS = ("guest-build.sh", "developer-init.sh",
                       "guest-dev-init.sh", "module-init.sh")

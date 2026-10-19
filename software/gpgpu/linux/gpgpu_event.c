@@ -19,6 +19,7 @@ void gpgpu_events_fault(struct gpgpu_qdev *dev, struct gpgpu_user_queue *queue, 
 			if (!q->dead && (!queue || q == queue)) {
 				if (queue && !q->error)
 					q->error = error;
+				gpgpu_vm_save_fault(q);
 				q->state = GPGPU_QUEUE_FAULTED;
 			}
 		}
@@ -208,7 +209,11 @@ static struct gpgpu_qevent *find_event(struct gpgpu_qclient *client, u32 id)
  */
 static void delete_event(struct gpgpu_qclient *client, struct gpgpu_qevent *e)
 {
-	dma_free_coherent(&client->dev->pdev->dev, sizeof(*e->mailbox), e->mailbox, e->mailbox_dma);
+	if (client->dev->gpuvm)
+		clear_bit(e->mailbox_slot, client->notify_slots);
+	else
+		dma_free_coherent(&client->dev->pdev->dev, sizeof(*e->mailbox), e->mailbox,
+				  e->mailbox_dma);
 	list_del(&e->node);
 	kfree(e);
 }
@@ -234,11 +239,22 @@ int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
 		e = kzalloc(sizeof(*e), GFP_KERNEL);
 		if (!e)
 			return -ENOMEM;
-		e->mailbox = dma_alloc_coherent(&dev->pdev->dev, sizeof(*e->mailbox),
-						&e->mailbox_dma, GFP_KERNEL);
-		if (!e->mailbox) {
-			kfree(e);
-			return -ENOMEM;
+		if (dev->gpuvm) {
+			e->mailbox_slot = find_first_zero_bit(client->notify_slots, 512);
+			if (!client->notify_cpu || e->mailbox_slot >= 512) {
+				kfree(e);
+				return -ENOSPC;
+			}
+			set_bit(e->mailbox_slot, client->notify_slots);
+			e->mailbox = (u64 *)client->notify_cpu + e->mailbox_slot;
+			e->mailbox_dma = GPGPU_VM_NOTIFY_VA + e->mailbox_slot * 8;
+		} else {
+			e->mailbox = dma_alloc_coherent(&dev->pdev->dev, sizeof(*e->mailbox),
+							&e->mailbox_dma, GFP_KERNEL);
+			if (!e->mailbox) {
+				kfree(e);
+				return -ENOMEM;
+			}
 		}
 		*e->mailbox = 0;
 		e->queue = q;

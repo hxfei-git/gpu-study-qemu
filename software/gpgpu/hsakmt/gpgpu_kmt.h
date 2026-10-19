@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "gpgpu_uapi.h"
 #include "gpgpu_queue.h"
+#include "gpgpu_drm.h"
 
 typedef struct GpgpuKmtContext GpgpuKmtContext;
 /**
@@ -45,6 +46,9 @@ typedef enum GpgpuKmtStatus {
  * @mmap_offset: 传给 mmap 的字节偏移令牌；VRAM 对象不映射。
  * @cpu: Host 对象的用户态映射；VRAM 对象为 NULL。
  * @queue_users: 库内队列持有的引用数，由 gpgpu_kmt_lock 保护。
+ * @gpu_va: 整对象 GPUVA；零表示没有映射。
+ * @mapped_size: CPU/GPU 可见的 4 KiB 对齐字节数。
+ * @next: 连接中同类对象的下一个节点，供正常关闭使用。
  */
 typedef struct GpgpuKmtMemory {
 	GpgpuKmtContext *context;
@@ -56,6 +60,9 @@ typedef struct GpgpuKmtMemory {
 	uint64_t mmap_offset;
 	void *cpu;
 	unsigned int queue_users;
+	uint64_t gpu_va;	     /* GPUVM 模式的整对象起始地址。 */
+	uint64_t mapped_size;	     /* CPU mmap 与 GPU 映射长度。 */
+	struct GpgpuKmtMemory *next; /* 连接中的正常关闭清理链。 */
 } GpgpuKmtMemory;
 
 /**
@@ -71,6 +78,7 @@ typedef struct GpgpuKmtMemory {
  * @doorbell: 映射后的 8 字节 MMIO 入口，发布后写包编号。
  * @doorbell_mapping: Doorbell 整页映射的起始地址，用于 munmap。
  * @doorbell_map_size: Doorbell 映射的字节长度。
+ * @next: 连接中同类对象的下一个节点，供正常关闭使用。
  */
 typedef struct GpgpuKmtQueue {
 	GpgpuKmtContext *context;
@@ -84,6 +92,7 @@ typedef struct GpgpuKmtQueue {
 	volatile uint64_t *doorbell;
 	void *doorbell_mapping;
 	size_t doorbell_map_size;
+	struct GpgpuKmtQueue *next;
 } GpgpuKmtQueue;
 
 /**
@@ -92,12 +101,14 @@ typedef struct GpgpuKmtQueue {
  * @id: 会话内非零事件编号，存活期间不复用。
  * @queue_id: 产生此事件通知的队列编号。
  * @mailbox_address: 驱动分配的 8 字节通知槽的 Host 物理地址。
+ * @next: 连接中同类对象的下一个节点，供正常关闭使用。
  */
 typedef struct GpgpuKmtEvent {
 	GpgpuKmtContext *context;
 	uint32_t id;
 	uint32_t queue_id;
 	uint64_t mailbox_address;
+	struct GpgpuKmtEvent *next;
 } GpgpuKmtEvent;
 
 /*
@@ -119,6 +130,14 @@ const char *gpgpuKmtStatusName(GpgpuKmtStatus status);
 /* 申请 Host 或 VRAM 内存对象。 */
 GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
 				   uint64_t alignment, GpgpuKmtMemory *memory);
+/* GPUVM 分配并同步映射；fixed_va=0 自动选址，其余值供固定地址验收。 */
+GpgpuKmtStatus gpgpuKmtAllocMemoryEx(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
+				     uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
+				     GpgpuKmtMemory *memory);
+/* 查询 GPUVM 可分配区间和限制。 */
+GpgpuKmtStatus gpgpuKmtGetVmInfo(GpgpuKmtContext *context, struct gpgpu_vm_info *info);
+/* 读取所属队列首次 GPUVM 故障。 */
+GpgpuKmtStatus gpgpuKmtGetVmFault(GpgpuKmtQueue *queue, struct gpgpu_vm_fault *fault);
 /* 释放不再使用的内存对象。 */
 GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory);
 /* 在 Host 与 VRAM 对象间同步拷贝。 */

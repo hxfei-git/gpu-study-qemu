@@ -18,6 +18,10 @@ void gpgpu_reset_state(GPGPUState *s)
 	gpgpu_cp_reset(s);
 	gpgpu_dispatch_reset(s);
 	s->cp_started = false;
+	memset(s->vm, 0, sizeof(s->vm));
+	memset(s->tlb, 0, sizeof(s->tlb));
+	memset(s->vm_fault, 0, sizeof(s->vm_fault));
+	s->vm_status = s->vm_firmware = 0;
 	s->queue_mode = false;
 	s->hqd_select = 0;
 	memset(s->hqd, 0, sizeof(s->hqd));
@@ -47,6 +51,8 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
 		return 0;
 	}
+	if (addr >= 0x0900 && addr < 0x0b00)
+		return gpgpu_vm_read(s, addr);
 	if (addr == GPGPU_REG_HQD_SELECT)
 		return s->hqd_select;
 	if ((addr & ~0xffULL) == GPGPU_REG_HQD_WINDOW)
@@ -120,6 +126,10 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
+		return;
+	}
+	if (addr >= 0x0900 && addr < 0x0b00) {
+		gpgpu_vm_write(s, addr, val);
 		return;
 	}
 	if (addr == GPGPU_REG_HQD_SELECT) {
@@ -228,6 +238,8 @@ static uint64_t cp_regs_read(void *opaque, hwaddr addr, unsigned int size)
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
 		return 0;
 	}
+	if (addr >= 0x0900 && addr < 0x0a00)
+		return gpgpu_vm_read(s, addr);
 	if ((addr & ~0xffULL) == GPGPU_REG_KERNEL_ADDR_LO)
 		return gpgpu_kernel_read(s, addr);
 	if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
@@ -251,6 +263,10 @@ static void cp_regs_write(void *opaque, hwaddr addr, uint64_t val, unsigned int 
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
+		return;
+	}
+	if (addr == GPGPU_REG_VM_FIRMWARE && s->gpuvm && val == GPGPU_VM_VERSION) {
+		s->vm_firmware = val;
 		return;
 	}
 	if ((addr & ~0xffULL) == GPGPU_REG_KERNEL_ADDR_LO)

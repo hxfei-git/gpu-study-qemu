@@ -14,10 +14,12 @@ typedef gpgpu_q_u64 u64;
  * @occupied: 占用标记，ACTIVE 清零不代表该槽可重新分配。
  * @pending: 管理操作已结束，正在等待相邻 WRITE_COMPLETION 回报。
  * @result: 暂存的 GpgpuManagementStatus，由完成命令写入 Host。
+ * @vmid: 本对象所属的设备地址空间编号，管理访问为零。
  */
 typedef struct CpSlot {
 	u64 mqd;
 	u32 occupied;
+	u32 vmid; /* 普通队列访问的上下文；MQD 本体显式使用管理域。 */
 	u32 pending;
 	u32 result;
 } CpSlot;
@@ -47,6 +49,7 @@ typedef struct CpAccess {
 extern CpSlot cp_slots[GPGPU_QUEUE_SLOTS];
 extern volatile CpAccess cp_access;
 extern volatile u32 cp_stopped;
+extern u32 cp_gpuvm;
 
 /*
  * cp_fence() - 建立 CP 内存与 MMIO 的访问顺序
@@ -133,15 +136,15 @@ static inline int cp_range(u64 address, u64 size, u32 align)
 
 /* 从当前队列 Host 地址读写一个完整标量；成功返回 1。 */
 /* 从 Host RAM 完整读取一个 32 位标量。 */
-int cp_read32(u32 slot, u32 phase, u64 address, u32 *value);
+int cp_read32(u32 slot, u32 vmid, u32 phase, u64 address, u32 *value);
 /* 从 Host RAM 完整读取一个 64 位标量。 */
-int cp_read64(u32 slot, u32 phase, u64 address, u64 *value);
+int cp_read64(u32 slot, u32 vmid, u32 phase, u64 address, u64 *value);
 /* 向 Host RAM 完整写入一个 32 位标量。 */
-int cp_write32(u32 slot, u32 phase, u64 address, u32 value);
+int cp_write32(u32 slot, u32 vmid, u32 phase, u64 address, u32 value);
 /* 向 Host RAM 完整写入一个 64 位标量。 */
-int cp_write64(u32 slot, u32 phase, u64 address, u64 value);
+int cp_write64(u32 slot, u32 vmid, u32 phase, u64 address, u64 value);
 /* 读取初始化后固定的 Host 对象。 */
-int cp_read_object(u32 slot, u32 phase, u64 address, void *dest, u32 size);
+int cp_read_object(u32 slot, u32 vmid, u32 phase, u64 address, void *dest, u32 size);
 /* 通过设备同步发布一条 IH 记录。 */
 int cp_ih_submit(u32 slot, u32 type, u32 data);
 /* 保存指定队列的首次错误并停止取包。 */

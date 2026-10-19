@@ -19,6 +19,14 @@
  * @calls: 正在执行的库调用数，防止最后关闭与调用并发。
  * @info: 首次打开时查询到的队列 ABI 信息。
  * @path: 打开的设备路径，用于核对重复打开的目标。
+ * @closing: 正在由最后关闭调用清理对象，拒绝其他线程进入。
+ * @closer: 执行关闭清理的线程，允许其调用对象销毁接口。
+ * @gpuvm: 本连接或设备是否采用 GPUVM 地址语义。
+ * @uncertain: 存在结果未知的资源，最后关闭不能报告成功。
+ * @vm_info: 首次打开时取得的 GPUVM 能力及可分配区间。
+ * @memory: 连接持有的用户内存对象链表。
+ * @queues: 连接持有的用户 Queue 链表。
+ * @events: 连接持有的事件链表。
  */
 struct GpgpuKmtContext {
 	int fd;
@@ -28,6 +36,14 @@ struct GpgpuKmtContext {
 	unsigned int calls;
 	struct gpgpu_queue_info info;
 	char *path;
+	bool closing;
+	pthread_t closer;
+	bool gpuvm;
+	bool uncertain; /* 半成品映射结果未知，阻止正常关闭误报成功。 */
+	struct gpgpu_vm_info vm_info;
+	GpgpuKmtMemory *memory;
+	GpgpuKmtQueue *queues;
+	GpgpuKmtEvent *events;
 };
 extern pthread_mutex_t gpgpu_kmt_lock;
 /* 将正 errno 转换为库状态码。 */
@@ -40,6 +56,8 @@ void gpgpu_kmt_end(GpgpuKmtContext *context);
 void gpgpu_kmt_objects(GpgpuKmtContext *context, int change);
 /* 执行一次带连接保护的 ioctl。 */
 GpgpuKmtStatus gpgpu_kmt_ioctl(GpgpuKmtContext *context, unsigned long command, void *request);
+/* 将既有队列/事件操作明确路由到独立 DRM 编号。 */
+int gpgpu_kmt_raw_ioctl(GpgpuKmtContext *context, unsigned long command, void *request);
 /*
  * gpgpu_kmt_range() - 校验内存对象中的一个非空范围
  *

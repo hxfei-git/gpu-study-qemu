@@ -203,8 +203,8 @@ test-gpgpu-cp:
 		QTEST_GPGPU_FIRMWARE="$(BUILD_DIR)/gpgpu-firmware/gpgpu-cp.bin" \
 		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-cp-test" --tap \
 		2>&1 | tee "$(BUILD_DIR)/gpgpu-cp-qtest.log"
-	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-cp-qtest.log")" = 16
-	@grep -qx '1\.\.16' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
+	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-cp-qtest.log")" = 18
+	@grep -qx '1\.\.18' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
 	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
 
 # ─── GPGPU 软件栈（实际 Linux PCI 驱动与运行时）────────────

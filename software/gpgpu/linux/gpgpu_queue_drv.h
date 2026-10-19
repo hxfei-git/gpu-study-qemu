@@ -15,11 +15,19 @@
 #include "gpgpu_regs.h"
 #include "gpgpu_uapi.h"
 #include "gpgpu_queue.h"
+#include "gpgpu_drm.h"
+#if IS_REACHABLE(CONFIG_DRM)
+#include <drm/drm_gem.h>
+#endif
+struct drm_device;
+struct drm_file;
 
 /* 驱动管理请求与队列模式 DMA 的等待上限，单位毫秒。 */
 #define GPGPU_Q_TIMEOUT_MS 5000U
 /* mmap 页偏移中的 Doorbell 令牌，与内存句柄区分。 */
 #define GPGPU_DB_MMAP_PAGE 0x100000UL
+/* GPUVM 的 Doorbell 令牌低于 GEM 的 4 GiB 偏移起点。 */
+#define GPGPU_VM_DB_MMAP_PAGE 0x10000UL
 /* 队列模式使用的四类中断位掩码。 */
 #define GPGPU_Q_IRQ_ALL 15U
 /* 驱动分配的 IH Ring 字节容量。 */
@@ -39,13 +47,29 @@ struct gpgpu_qclient;
  * @users: 队列和进行中的 DMA 持有的引用数。
  * @size: 实际分配的字节数。
  * @cpu: Host 对象的内核虚拟地址，VRAM 对象不使用。
- * @dma: Host 对象的完整 DMA 地址，队列模式下为物理地址。
+ * @dma: Host 对象的完整 DMA 地址；启用系统 IOMMU 时为 IOVA。
  * @maps: 仍存活的用户 VMA 数，非零时禁止释放。
  * @blocks: VRAM 对象持有的 gpu_buddy 块链表。
+ * @dev: 独立持有引用的设备状态。
+ * @gem: 包装固定存储的 GEM 对象。
+ * @gem_ready: 已建立 GEM 创建引用，列表持有该引用。
+ * @logical_size: 应用请求的逻辑字节数。
+ * @mapped_size: CPU/GPU 可见的 4 KiB 对齐字节数。
+ * @gpu_va: 整对象 GPUVA；零表示没有映射。
+ * @permissions: GPU 读、写和取指权限位。
  */
 struct gpgpu_qmemory {
 	struct list_head node;
 	struct gpgpu_qclient *client;
+	struct gpgpu_qdev *dev; /* GEM 最后释放不依赖文件上下文。 */
+#if IS_REACHABLE(CONFIG_DRM)
+	struct drm_gem_object gem; /* 固定存储的 GEM 包装。 */
+#endif
+	bool gem_ready;	  /* 创建引用由会话列表持有。 */
+	u64 logical_size; /* 应用申请长度。 */
+	u64 mapped_size;  /* GPU 映射与 CPU mmap 可见的页对齐长度。 */
+	u64 gpu_va;	  /* 已映射时的 GPUVA，零表示未映射。 */
+	u32 permissions;  /* GPU 读写取指权限。 */
 	u32 id;
 	u32 kind;
 	u32 offset;
@@ -66,7 +90,7 @@ struct gpgpu_qmemory {
  * @rptr: 内核映射中的 32 位消费进度地址。
  * @wptr: 内核映射中的 32 位预留进度地址。
  * @mqd: 独占 MQD 的内核虚拟地址。
- * @mqd_dma: MQD 的完整 Host 物理地址，也是 IH 队列匹配键。
+ * @mqd_dma: MQD 的完整管理 DMA 地址，也是 IH 队列匹配键。
  * @id: 会话内唯一队列编号。
  * @db_index: 会话 Doorbell 页内的 8 字节入口编号。
  * @state: 对用户回报的 READY/UNLOADING/FAULTED 状态。
@@ -74,6 +98,7 @@ struct gpgpu_qmemory {
  * @management_status: 最近一次管理请求的 CP 结果码。
  * @dead: 已确认卸载，并已放下 Ring 和进度内存引用。
  * @uncertain: 尚不能确认映射或卸载结果，禁止普通回收。
+ * @fault: 软件保存的源队列首次 GPUVM 故障。
  */
 struct gpgpu_user_queue {
 	struct list_head node;
@@ -91,6 +116,7 @@ struct gpgpu_user_queue {
 	u32 management_status;
 	bool dead;
 	bool uncertain;
+	struct gpgpu_vm_fault fault; /* 槽复用前保存诊断。 */
 };
 
 /**
@@ -98,12 +124,13 @@ struct gpgpu_user_queue {
  * @node: 所属会话 events 链表节点。
  * @queue: 产生通知的源队列，事件存活期间不能删除该对象。
  * @mailbox: 8 字节一致性通知槽的内核映射。
- * @mailbox_dma: 通知槽的完整 Host 物理地址。
+ * @mailbox_dma: 通知槽的设备地址；GPUVM 模式为内部通知页 GPUVA。
  * @id: 会话内非零且不复用的存活事件编号。
  * @state: 先保存状态再唤醒，多个等待者均可观察。
  * @error: 事件失败时保存的错误值。
  * @waiters: 当前等待调用数，非零时禁止销毁事件。
  * @wait: 阻塞等待者登记的 Linux 等待队列。
+ * @mailbox_slot: 通知页内的 8 字节槽编号。
  */
 struct gpgpu_qevent {
 	struct list_head node;
@@ -113,6 +140,7 @@ struct gpgpu_qevent {
 	u32 id;
 	u32 state;
 	u32 error;
+	u32 mailbox_slot; /* GPUVM 通知页内槽号。 */
 	unsigned int waiters;
 	wait_queue_head_t wait;
 };
@@ -131,6 +159,14 @@ struct gpgpu_qevent {
  * @db_maps: 本会话 Doorbell 页的存活用户 VMA 数。
  * @orphan: 文件已关闭但设备访问未结束，保留到设备停机。
  * @owner: 创建会话的线程组 ID，用于拒绝其他进程复用。
+ * @drm_file: GPUVM 文件上下文，旧模式为 NULL。
+ * @vmid: 本对象所属的设备地址空间编号，管理访问为零。
+ * @root: 根目录在 VRAM 中的字节偏移。
+ * @vm_failed: 页表更新失败或结果未知，禁止重建 Queue。
+ * @tables: 驱动私有页表页链表。
+ * @notify_cpu: 内部通知页的内核映射，不映射给应用。
+ * @notify_dma: 内部通知页的 DMA 字节地址。
+ * @notify_slots: 通知页的 512 个槽占用位图。
  */
 struct gpgpu_qclient {
 	struct list_head node;
@@ -145,6 +181,14 @@ struct gpgpu_qclient {
 	atomic_t db_maps;
 	bool orphan;
 	pid_t owner;
+	struct drm_file *drm_file; /* GPUVM 文件上下文，旧模式为 NULL。 */
+	u32 vmid;		   /* 首次映射取得并持有到 VM 销毁。 */
+	u32 root;		   /* VRAM 页表根偏移。 */
+	bool vm_failed;		   /* 更新结果未知时禁止重建队列。 */
+	struct list_head tables;   /* 驱动私有表页，不进入用户对象链表。 */
+	void *notify_cpu;	   /* 内部 4 KiB 通知页。 */
+	dma_addr_t notify_dma;
+	DECLARE_BITMAP(notify_slots, 512);
 };
 
 /**
@@ -211,6 +255,10 @@ struct gpgpu_management_request {
  * @ih: Host IH Ring 的内核虚拟地址。
  * @ih_dma: IH Ring 的完整 Host 物理地址。
  * @ih_rptr: Host 下一条待消费的 32 位记录编号。
+ * @vm_serial: 跨管理等待串行队列和映射变更，不阻塞事件等待。
+ * @gpuvm: 本连接或设备是否采用 GPUVM 地址语义。
+ * @vmids: 用户 VMID 1、2 的占用位图。
+ * @drm: GPUVM 模式注册的 DRM 设备。
  */
 struct gpgpu_qdev {
 	struct pci_dev *pdev;
@@ -224,6 +272,7 @@ struct gpgpu_qdev {
 	 */
 	struct mutex lock;
 	struct mutex management_lock;
+	struct mutex vm_serial; /* 跨管理等待串行 GPUVM 队列和页表变更。 */
 	struct mutex dma_lock;
 	spinlock_t irq_lock;
 	struct work_struct ih_work;
@@ -234,6 +283,9 @@ struct gpgpu_qdev {
 	bool dma_failed;
 	bool dma_uncertain;
 	bool started;
+	bool gpuvm;		/* 本次启动使用 GPUVM。 */
+	unsigned long vmids;	/* 固定用户 VMID 占用位图。 */
+	struct drm_device *drm; /* 仅 GPUVM 模式注册。 */
 	struct list_head clients;
 	struct list_head requests;
 	struct list_head reserved_blocks;
@@ -253,7 +305,7 @@ struct gpgpu_qdev {
  */
 /* 建立队列模式设备上下文。 */
 struct gpgpu_qdev *gpgpu_qdev_create(struct pci_dev *pdev, void __iomem *regs,
-				     void __iomem *doorbell);
+				     void __iomem *doorbell, bool gpuvm);
 /* 加载固件并建立 KIQ 到 HIQ 的管理路径。 */
 int gpgpu_qdev_start(struct gpgpu_qdev *dev);
 /* 在移除或启动失败时停止设备访问。 */
@@ -304,6 +356,19 @@ int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
 void gpgpu_event_release_all(struct gpgpu_qclient *client);
 /* 按队列编号查找会话对象。 */
 struct gpgpu_user_queue *gpgpu_queue_find(struct gpgpu_qclient *client, u32 id);
+/* 供 DRM 入口复用的队列对象操作；调用方持设备锁。 */
+int gpgpu_queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r);
+int gpgpu_queue_operation(struct gpgpu_qclient *c, unsigned int command,
+			  struct gpgpu_queue_state *r);
+/* GEM 存储回收及句柄验证。 */
+void gpgpu_memory_storage_free(struct gpgpu_qmemory *m);
+/* GPUVM 生命周期和 DRM 入口；不支持 DRM 的旧内核使用空实现。 */
+int gpgpu_drm_register(struct gpgpu_qdev *dev);
+void gpgpu_drm_unregister(struct gpgpu_qdev *dev);
+void gpgpu_gem_drop(struct gpgpu_qmemory *m);
+int gpgpu_vm_cleanup(struct gpgpu_qclient *c);
+bool gpgpu_vm_queue_live(struct gpgpu_qclient *c);
+void gpgpu_vm_save_fault(struct gpgpu_user_queue *q);
 /*
  * gpgpu_qwrite64() - 写入一对 32 位地址配置寄存器
  *

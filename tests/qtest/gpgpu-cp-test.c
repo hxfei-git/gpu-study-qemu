@@ -29,6 +29,7 @@ typedef struct CPTest {
     QPCIDevice *dev;
     QPCIBar regs;
     QPCIBar vram;
+    bool gpuvm;
 } CPTest;
 
 static void save_device(QPCIDevice *dev, int devfn, void *opaque)
@@ -41,7 +42,7 @@ static void cp_start_mode(CPTest *s, bool smmu)
     g_autofree char *device = NULL;
     g_autofree char *args = NULL;
 
-    gpgpu_remote_start(&s->remote);
+    gpgpu_remote_start_mode(&s->remote, s->gpuvm);
     device = gpgpu_remote_device_option(&s->remote);
     args = g_strdup_printf("-machine virt,gic-version=3%s -cpu cortex-a57 "
                            "-m 512M -nodefaults -device %s",
@@ -531,6 +532,7 @@ static void test_window_host_dma_coexist(void)
 
 #include "gpgpu-device-queue-test.inc"
 #include "gpgpu-firmware-test.inc"
+#include "gpgpu-gpuvm-test.inc"
 
 int main(int argc, char **argv)
 {
@@ -549,5 +551,6 @@ int main(int argc, char **argv)
     qtest_add_func("/gpgpu/cp/window-interleave", test_window_interleave);
     register_device_queue_tests();
     register_firmware_queue_tests();
+    register_gpuvm_tests();
     return g_test_run();
 }

@@ -1,0 +1,66 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef GPGPU_VM_H
+#define GPGPU_VM_H
+
+/* GPUVM 固定版本；旧物理队列不使用这些寄存器和地址语义。 */
+#define GPGPU_VM_VERSION 1U
+#define GPGPU_VM_PAGE_SIZE 4096U
+#define GPGPU_VM_USERS 2U
+#define GPGPU_VM_ADDRESS_LIMIT 0x100000000ULL
+#define GPGPU_VM_NOTIFY_VA 0xfffff000U
+#define GPGPU_VM_CTRL_VA 0x80000000U
+#define GPGPU_VM_ARGS_VA 0x90000000U
+#define GPGPU_VM_ARGS_END 0x90010000U
+#define GPGPU_VM_ADDR_MASK 0x0000fffffffff000ULL
+/* 表项沿用有效、Host 域及读写取指位，其他位必须为零。 */
+#define GPGPU_VM_VALID (1ULL << 0)
+#define GPGPU_VM_SYSTEM (1ULL << 1)
+#define GPGPU_VM_EXEC (1ULL << 4)
+#define GPGPU_VM_READ (1ULL << 5)
+#define GPGPU_VM_WRITE (1ULL << 6)
+#define GPGPU_VM_PERMS (GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_EXEC)
+#define GPGPU_VM_FLAGS (GPGPU_VM_VALID | GPGPU_VM_SYSTEM | GPGPU_VM_PERMS)
+/* BAR0：只读版本/启动模式、固件握手、同步失效和固定上下文窗口。 */
+#define GPGPU_REG_VM_VERSION 0x0900
+#define GPGPU_REG_VM_MODE 0x0904
+#define GPGPU_REG_VM_FIRMWARE 0x0908
+#define GPGPU_REG_VM_INVALIDATE 0x0910
+#define GPGPU_REG_VM_STATUS 0x0914
+#define GPGPU_VM_BUSY 1U
+#define GPGPU_VM_ACK 2U
+#define GPGPU_VM_ERROR 4U
+#define GPGPU_REG_VM_CONTEXT(vmid) (0x0940 + (vmid) * 0x20)
+#define GPGPU_VM_ROOT_LO 0x00
+#define GPGPU_VM_ROOT_HI 0x04
+#define GPGPU_VM_ENABLE 0x08
+/* 每 HQD 独立保存首次访问故障，Host 安全卸载后写 CLEAR。 */
+#define GPGPU_REG_VM_FAULT(slot) (0x0a00 + (slot) * 0x40)
+#define GPGPU_VM_FAULT_REASON 0x00
+#define GPGPU_VM_FAULT_VMID 0x04
+#define GPGPU_VM_FAULT_ADDR_LO 0x08
+#define GPGPU_VM_FAULT_ADDR_HI 0x0c
+#define GPGPU_VM_FAULT_ACCESS 0x10
+#define GPGPU_VM_FAULT_PHASE 0x14
+#define GPGPU_VM_FAULT_CLEAR 0x18
+#define GPGPU_VM_FAULT_CONTEXT 1U
+#define GPGPU_VM_FAULT_RANGE 2U
+#define GPGPU_VM_FAULT_UNMAPPED 3U
+#define GPGPU_VM_FAULT_TABLE 4U
+#define GPGPU_VM_FAULT_PERMISSION 5U
+#define GPGPU_VM_FAULT_STORAGE 6U
+/* CP 本地窗口：域为 0 时管理 DMA 直通，域为 1 时必须按 VMID 翻译。 */
+#define GPGPU_CP_VM_DOMAIN 0xfffe0008U
+#define GPGPU_CP_VM_ID 0xfffe000cU
+#define GPGPU_CP_VM_SLOT 0xfffe0010U
+#define GPGPU_CP_VM_PHASE 0xfffe0014U
+#define GPGPU_VM_DOMAIN_MANAGEMENT 0U
+#define GPGPU_VM_DOMAIN_USER 1U
+/* 分发上下文与既有配置一起锁存在任务中。 */
+#define GPGPU_REG_DISPATCH_VMID 0x0344
+#define GPGPU_REG_DISPATCH_SLOT 0x0348
+/* 执行器故障阶段；CP 访存沿用固件自己的阶段编号。 */
+#define GPGPU_VM_PHASE_FETCH 0x100U
+#define GPGPU_VM_PHASE_ARGS 0x101U
+#define GPGPU_VM_PHASE_DATA 0x102U
+
+#endif

@@ -48,6 +48,10 @@ static void gpgpu_dispatch_kernel(GPGPUState *s)
 uint32_t gpgpu_kernel_read(GPGPUState *s, hwaddr addr)
 {
 	switch (addr) {
+	case GPGPU_REG_DISPATCH_VMID:
+		return s->kernel.vmid;
+	case GPGPU_REG_DISPATCH_SLOT:
+		return s->kernel.source_slot;
 	case GPGPU_REG_KERNEL_ADDR_LO:
 		return (uint32_t)s->kernel.kernel_addr;
 	case GPGPU_REG_KERNEL_ADDR_HI:
@@ -91,6 +95,12 @@ uint32_t gpgpu_kernel_read(GPGPUState *s, hwaddr addr)
 static void kernel_config_write(GPGPUState *s, hwaddr addr, uint32_t val)
 {
 	switch (addr) {
+	case GPGPU_REG_DISPATCH_VMID:
+		s->kernel.vmid = val;
+		break;
+	case GPGPU_REG_DISPATCH_SLOT:
+		s->kernel.source_slot = val;
+		break;
 	case GPGPU_REG_KERNEL_ADDR_LO:
 		s->kernel.kernel_addr = deposit64(s->kernel.kernel_addr, 0, 32, val);
 		break;
@@ -142,7 +152,7 @@ static void kernel_config_write(GPGPUState *s, hwaddr addr, uint32_t val)
  */
 void gpgpu_kernel_write(GPGPUState *s, hwaddr addr, uint32_t val)
 {
-	if (s->queue_mode || s->dispatch_status != GPGPU_DISPATCH_IDLE) {
+	if (s->gpuvm || s->queue_mode || s->dispatch_status != GPGPU_DISPATCH_IDLE) {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return;
 	}
@@ -164,11 +174,21 @@ static bool dispatch_validate(GPGPUState *s, GPGPUDispatchTask *task)
 
 	if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) || p->shared_mem_size || (p->kernel_addr & 3) ||
 	    !p->code_size || (p->code_size & 3) ||
-	    !gpgpu_vram_contains(s, p->kernel_addr, p->code_size) || (p->kernel_args & 7) ||
-	    p->args_size < 4 || p->args_size > GPGPU_KERNEL_ARGS_MAX || (p->args_size & 3) ||
-	    p->kernel_args > UINT64_MAX - (p->args_size - 1)) {
+	    !(s->gpuvm ? (p->kernel_addr < GPGPU_VM_ADDRESS_LIMIT &&
+			  p->code_size <= GPGPU_VM_ADDRESS_LIMIT - p->kernel_addr) :
+			 gpgpu_vram_contains(s, p->kernel_addr, p->code_size)) ||
+	    (p->kernel_args & 7) || p->args_size < 4 || p->args_size > GPGPU_KERNEL_ARGS_MAX ||
+	    (p->args_size & 3) || p->kernel_args > UINT64_MAX - (p->args_size - 1)) {
 		return false;
 	}
+	if (s->gpuvm &&
+	    (p->vmid < 1 || p->vmid > GPGPU_VM_USERS || !s->vm[p->vmid].enabled ||
+	     p->source_slot < 2 || p->source_slot >= 4 ||
+	     !s->hqd[p->source_slot][GPGPU_HQD_ACTIVE / 4] ||
+	     s->hqd[p->source_slot][GPGPU_HQD_VMID / 4] != p->vmid ||
+	     p->kernel_args >= GPGPU_VM_ADDRESS_LIMIT ||
+	     p->args_size > GPGPU_VM_ADDRESS_LIMIT - p->kernel_args))
+		return false;
 	task->block_count = task->threads_per_block = 1;
 	for (unsigned int i = 0; i < 3; i++) {
 		if (!p->grid_dim[i] || !p->block_dim[i] ||
@@ -251,7 +271,8 @@ void gpgpu_kernel_cp_write(GPGPUState *s, hwaddr addr, uint32_t val)
 		timer_mod(s->dispatch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000);
 		return;
 	}
-	if (addr < GPGPU_REG_KERNEL_ADDR_LO || addr > GPGPU_REG_KERNEL_ARGS_SIZE)
+	if ((addr < GPGPU_REG_KERNEL_ADDR_LO || addr > GPGPU_REG_KERNEL_ARGS_SIZE) &&
+	    !(s->gpuvm && (addr == GPGPU_REG_DISPATCH_VMID || addr == GPGPU_REG_DISPATCH_SLOT)))
 		goto invalid;
 	kernel_config_write(s, addr, val);
 	return;

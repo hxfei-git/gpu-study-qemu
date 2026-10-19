@@ -116,9 +116,18 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 		break;
 	case GPGPU_HQD_ACTIVE:
 		valid = val <= 1 && (!val || hqd_complete(hqd));
+		if (valid && val && s->gpuvm && slot >= 2) {
+			unsigned int vmid = hqd[GPGPU_HQD_VMID / 4];
+
+			valid = vmid >= 1 && vmid <= GPGPU_VM_USERS && s->vm[vmid].enabled &&
+				hqd_address(hqd, GPGPU_HQD_RING_LO) <=
+					GPGPU_VM_ADDRESS_LIMIT - hqd[GPGPU_HQD_CONTROL / 4] &&
+				hqd_address(hqd, GPGPU_HQD_RPTR_ADDR_LO) < GPGPU_VM_ADDRESS_LIMIT &&
+				hqd_address(hqd, GPGPU_HQD_WPTR_ADDR_LO) < GPGPU_VM_ADDRESS_LIMIT;
+		}
 		break;
 	case GPGPU_HQD_VMID:
-		valid = val == 0;
+		valid = s->gpuvm && slot >= 2 ? val <= GPGPU_VM_USERS : val == 0;
 		break;
 	case GPGPU_HQD_AQL:
 		valid = val <= 1;

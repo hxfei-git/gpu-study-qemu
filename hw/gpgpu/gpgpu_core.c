@@ -160,7 +160,18 @@ static bool gpgpu_core_load_word(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_i
 	    addr - GPGPU_KERNEL_ARGS_WINDOW < GPGPU_KERNEL_ARGS_MAX) {
 		return gpgpu_param_read(s, addr, value);
 	}
-	if (gpgpu_vram_word_valid(s, addr)) {
+	if (s->gpuvm && s->task && !(addr >= GPGPU_VM_CTRL_VA && addr < GPGPU_VM_CTRL_VA + 4096)) {
+		uint8_t data[4];
+
+		if (!gpgpu_vm_access(s, params->vmid, params->source_slot, addr, data, sizeof(data),
+				     GPGPU_VM_READ, GPGPU_VM_PHASE_DATA)) {
+			s->dispatch_error = GPGPU_EXEC_ERR_VRAM;
+			return false;
+		}
+		*value = ldl_le_p(data);
+		return true;
+	}
+	if (!s->gpuvm && gpgpu_vram_word_valid(s, addr)) {
 		*value = ldl_le_p(s->vram_ptr + addr);
 		return true;
 	}
@@ -191,8 +202,13 @@ static bool gpgpu_core_load_word(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_i
 		*value = params->grid_dim[(addr - GPGPU_CORE_CTRL_GRID_DIM_X) / 4];
 		break;
 	default:
-		if (s->task)
+		if (s->task) {
 			s->dispatch_error = GPGPU_EXEC_ERR_VRAM;
+			if (s->gpuvm)
+				gpgpu_vm_fail(s, params->vmid, params->source_slot, addr,
+					      GPGPU_VM_READ, GPGPU_VM_PHASE_DATA,
+					      GPGPU_VM_FAULT_RANGE);
+		}
 		return false;
 	}
 
@@ -263,14 +279,33 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 			     (uint64_t)lane->pc - s->task->params.kernel_addr >
 				     s->task->params.code_size - 4)) {
 				s->dispatch_error = GPGPU_EXEC_ERR_CODE_RANGE;
+				if (s->gpuvm)
+					gpgpu_vm_fail(s, s->task->params.vmid,
+						      s->task->params.source_slot, lane->pc,
+						      GPGPU_VM_EXEC, GPGPU_VM_PHASE_FETCH,
+						      GPGPU_VM_FAULT_RANGE);
 				return -1;
 			}
-			if (!gpgpu_vram_word_valid(s, lane->pc)) {
-				s->dispatch_error = GPGPU_EXEC_ERR_CODE_RANGE;
-				return -1;
-			}
+			uint32_t inst;
 
-			uint32_t inst = ldl_le_p(s->vram_ptr + lane->pc);
+			if (s->gpuvm && s->task) {
+				uint8_t data[4];
+				const GPGPUKernelParams *p = &s->task->params;
+
+				if (!gpgpu_vm_access(s, p->vmid, p->source_slot, lane->pc, data,
+						     sizeof(data), GPGPU_VM_EXEC,
+						     GPGPU_VM_PHASE_FETCH)) {
+					s->dispatch_error = GPGPU_EXEC_ERR_CODE_RANGE;
+					return -1;
+				}
+				inst = ldl_le_p(data);
+			} else {
+				if (!gpgpu_vram_word_valid(s, lane->pc)) {
+					s->dispatch_error = GPGPU_EXEC_ERR_CODE_RANGE;
+					return -1;
+				}
+				inst = ldl_le_p(s->vram_ptr + lane->pc);
+			}
 
 			uint32_t opcode = inst & 0x7F;
 			uint32_t rd = (inst >> 7) & 0x1F;
@@ -450,6 +485,33 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 					uint32_t value =
 						opcode == 0x27 ? lane->fpr[rs2] : lane->gpr[rs2];
 
+					if (s->gpuvm && s->task) {
+						const GPGPUKernelParams *p = &s->task->params;
+						uint8_t data[4];
+
+						stl_le_p(data, value);
+						if ((addr >= GPGPU_VM_ARGS_VA &&
+						     addr < GPGPU_VM_ARGS_END) ||
+						    (addr >= GPGPU_VM_CTRL_VA &&
+						     addr < GPGPU_VM_CTRL_VA + 4096)) {
+							gpgpu_vm_fail(s, p->vmid, p->source_slot,
+								      addr, GPGPU_VM_WRITE,
+								      GPGPU_VM_PHASE_DATA,
+								      GPGPU_VM_FAULT_PERMISSION);
+							s->dispatch_error =
+								GPGPU_EXEC_ERR_ARG_WRITE;
+							return -1;
+						}
+						if (!gpgpu_vm_access(s, p->vmid, p->source_slot,
+								     addr, data, sizeof(data),
+								     GPGPU_VM_WRITE,
+								     GPGPU_VM_PHASE_DATA)) {
+							s->dispatch_error = GPGPU_EXEC_ERR_VRAM;
+							return -1;
+						}
+						lane->pc += 4;
+						break;
+					}
 					if (!gpgpu_vram_word_valid(s, addr)) {
 						s->dispatch_error =
 							addr >= GPGPU_KERNEL_ARGS_WINDOW &&

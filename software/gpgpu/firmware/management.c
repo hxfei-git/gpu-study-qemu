@@ -12,11 +12,23 @@ static int cp_mqd_valid(const GpgpuMqd *mqd, u32 kind)
 	u32 offset = db & GPGPU_DOORBELL_OFFSET_MASK;
 	u32 capacity = mqd->pq_control;
 
+	if (cp_gpuvm && kind == GPGPU_QUEUE_USER_AQL) {
+		if (mqd->vmid < 1 || mqd->vmid > GPGPU_VM_USERS ||
+		    !cp_reg_read(GPGPU_REG_VM_CONTEXT(mqd->vmid) + GPGPU_VM_ENABLE) ||
+		    mqd->ring_base >= GPGPU_VM_ADDRESS_LIMIT ||
+		    capacity > GPGPU_VM_ADDRESS_LIMIT - mqd->ring_base ||
+		    mqd->rptr_report_addr >= GPGPU_VM_ADDRESS_LIMIT ||
+		    mqd->wptr_poll_addr >= GPGPU_VM_ADDRESS_LIMIT)
+			return 0;
+	} else if (mqd->vmid) {
+		return 0;
+	}
+
 	return capacity >= GPGPU_QUEUE_RING_MIN && capacity <= GPGPU_QUEUE_RING_MAX &&
 		!(capacity & (capacity - 1)) && cp_range(mqd->ring_base, capacity, 64) &&
 		cp_range(mqd->rptr_report_addr, 4, 8) && cp_range(mqd->wptr_poll_addr, 4, 8) &&
 		!(db & ~(GPGPU_DOORBELL_ENABLE | GPGPU_DOORBELL_OFFSET_MASK)) && !(offset & 7) &&
-		offset <= GPGPU_QUEUE_DOORBELL_SIZE - 8 && !mqd->vmid &&
+		offset <= GPGPU_QUEUE_DOORBELL_SIZE - 8 &&
 		mqd->aql_control == (kind == GPGPU_QUEUE_USER_AQL) && !(mqd->saved_rptr >> 32) &&
 		!mqd->saved_error && !mqd->reserved[0] && !mqd->reserved[1] && !mqd->reserved[2];
 }
@@ -68,7 +80,7 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 	cp_access.source = source;
 	cp_access.kind = packet->queue_kind;
 	cp_access.mqd = packet->address;
-	if (!cp_read_object(slot, GPGPU_QUEUE_ERROR_DESCRIPTOR, packet->address, &mqd,
+	if (!cp_read_object(slot, 0, GPGPU_QUEUE_ERROR_DESCRIPTOR, packet->address, &mqd,
 			    sizeof(mqd))) {
 		cp_slots[slot].occupied = 0;
 		cp_slots[slot].mqd = 0;
@@ -79,7 +91,7 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 		cp_slots[slot].mqd = 0;
 		return GPGPU_MANAGEMENT_INVALID;
 	}
-	if (!cp_read32(slot, GPGPU_QUEUE_ERROR_RING, mqd.wptr_poll_addr, &wptr)) {
+	if (!cp_read32(slot, mqd.vmid, GPGPU_QUEUE_ERROR_RING, mqd.wptr_poll_addr, &wptr)) {
 		cp_slots[slot].occupied = 0;
 		cp_slots[slot].mqd = 0;
 		return GPGPU_MANAGEMENT_MQD_FAULT;
@@ -97,7 +109,8 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 	cp_hqd_set_address(slot, GPGPU_HQD_WPTR_ADDR_LO, mqd.wptr_poll_addr);
 	cp_hqd_write(slot, GPGPU_HQD_CONTROL, mqd.pq_control);
 	cp_hqd_write(slot, GPGPU_HQD_DOORBELL, mqd.doorbell_control);
-	cp_hqd_write(slot, GPGPU_HQD_VMID, 0);
+	cp_slots[slot].vmid = mqd.vmid;
+	cp_hqd_write(slot, GPGPU_HQD_VMID, mqd.vmid);
 	cp_hqd_write(slot, GPGPU_HQD_AQL, mqd.aql_control);
 	cp_hqd_write(slot, GPGPU_HQD_RPTR, (u32)mqd.saved_rptr);
 	cp_slots[slot].pending = 0;
@@ -134,7 +147,7 @@ static u32 cp_unmap(const GpgpuManagementPacket *packet)
 	}
 	if (!error) {
 		poll = cp_hqd_address(slot, GPGPU_HQD_WPTR_ADDR_LO);
-		if (!cp_read32(slot, GPGPU_QUEUE_ERROR_RING, poll, &wptr)) {
+		if (!cp_read32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING, poll, &wptr)) {
 			cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 			return GPGPU_MANAGEMENT_MQD_FAULT;
 		}
@@ -148,8 +161,8 @@ static u32 cp_unmap(const GpgpuManagementPacket *packet)
 	 * 本固件等待整个 Dispatch 终态后才调度管理，故没有遗留计算访问。
 	 */
 	cp_fence();
-	if (!cp_write64(slot, GPGPU_QUEUE_ERROR_SAVE, packet->address + 0x28, rptr) ||
-	    !cp_write32(slot, GPGPU_QUEUE_ERROR_SAVE, packet->address + 0x30, error)) {
+	if (!cp_write64(slot, 0, GPGPU_QUEUE_ERROR_SAVE, packet->address + 0x28, rptr) ||
+	    !cp_write32(slot, 0, GPGPU_QUEUE_ERROR_SAVE, packet->address + 0x30, error)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SAVE);
 		return GPGPU_MANAGEMENT_MQD_FAULT;
 	}
@@ -173,7 +186,8 @@ void cp_management(u32 slot)
 
 	if (!cp_next_packet(slot, &address, sizeof(packet)))
 		return;
-	if (!cp_read_object(slot, GPGPU_QUEUE_ERROR_RING, address, &packet, sizeof(packet))) {
+	if (!cp_read_object(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING, address, &packet,
+			    sizeof(packet))) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return;
 	}
@@ -187,13 +201,14 @@ void cp_management(u32 slot)
 			cp_queue_error(slot, GPGPU_QUEUE_ERROR_COMPLETION);
 			return;
 		}
-		if (!cp_write32(slot, GPGPU_QUEUE_ERROR_COMPLETION, packet.address + 8,
-				cp_slots[slot].result)) {
+		if (!cp_write32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_COMPLETION,
+				packet.address + 8, cp_slots[slot].result)) {
 			cp_queue_error(slot, GPGPU_QUEUE_ERROR_COMPLETION);
 			return;
 		}
 		cp_fence();
-		if (!cp_write64(slot, GPGPU_QUEUE_ERROR_COMPLETION, packet.address, packet.value)) {
+		if (!cp_write64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_COMPLETION,
+				packet.address, packet.value)) {
 			cp_queue_error(slot, GPGPU_QUEUE_ERROR_COMPLETION);
 			return;
 		}
