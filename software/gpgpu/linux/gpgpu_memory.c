@@ -52,7 +52,7 @@ struct gpgpu_qmemory *gpgpu_memory_find(struct gpgpu_qclient *client, u32 id)
 	struct gpgpu_qmemory *m;
 
 	list_for_each_entry(m, &client->memory, node) {
-		if (m->id == id)
+		if (id && m->id == id)
 			return m;
 	}
 	return NULL;
@@ -65,7 +65,9 @@ struct gpgpu_qmemory *gpgpu_memory_find(struct gpgpu_qclient *client, u32 id)
  */
 bool gpgpu_memory_range(struct gpgpu_qmemory *m, u64 offset, u64 size)
 {
-	return m && size && size <= m->size && offset <= m->size - size;
+	u64 length = m && m->gem_ready ? m->logical_size : (m ? m->size : 0);
+
+	return m && size && size <= length && offset <= length - size;
 }
 
 /*
@@ -73,9 +75,9 @@ bool gpgpu_memory_range(struct gpgpu_qmemory *m, u64 offset, u64 size)
  *
  * 持锁调用；Host 释放一致性 DMA 内存，VRAM 将块归还 buddy。
  */
-static void gpgpu_memory_delete(struct gpgpu_qmemory *m)
+void gpgpu_memory_storage_free(struct gpgpu_qmemory *m)
 {
-	struct gpgpu_qdev *dev = m->client->dev;
+	struct gpgpu_qdev *dev = m->dev;
 
 	if (m->kind == GPGPU_MEMORY_HOST) {
 		dma_free_coherent(&dev->pdev->dev, m->size, m->cpu, m->dma);
@@ -84,8 +86,18 @@ static void gpgpu_memory_delete(struct gpgpu_qmemory *m)
 		gpu_buddy_free_list(&dev->buddy, &m->blocks, 0);
 #endif
 	}
-	list_del(&m->node);
 	kfree(m);
+}
+
+/* 持锁移除会话拥有的引用，GEM 其余引用继续保护存储。 */
+static void gpgpu_memory_delete(struct gpgpu_qmemory *m)
+{
+	if (m->gem_ready) {
+		gpgpu_gem_drop(m);
+		return;
+	}
+	list_del(&m->node);
+	gpgpu_memory_storage_free(m);
 }
 
 /*
@@ -109,6 +121,9 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 	if (!m)
 		return -ENOMEM;
 	m->client = client;
+	m->dev = dev;
+	m->logical_size = r->size;
+	m->mapped_size = ALIGN(r->size, PAGE_SIZE);
 	m->kind = r->kind;
 	m->size = ALIGN(r->size, PAGE_SIZE);
 	INIT_LIST_HEAD(&m->blocks);
@@ -142,6 +157,8 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 			goto fail;
 		block = list_first_entry(&m->blocks, struct gpu_buddy_block, link);
 		m->offset = gpu_buddy_block_offset(block);
+		if (dev->gpuvm)
+			memset_io(dev->vram + m->offset, 0, m->size);
 #else
 		ret = -EOPNOTSUPP;
 		goto fail;

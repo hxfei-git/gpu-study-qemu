@@ -85,6 +85,40 @@ void gpgpu_kmt_objects(GpgpuKmtContext *context, int change)
 	pthread_mutex_unlock(&gpgpu_kmt_lock);
 }
 
+/* 只转换明确共用的操作，不把旧物理地址接口带入 GPUVM 模式。 */
+int gpgpu_kmt_raw_ioctl(GpgpuKmtContext *context, unsigned long command, void *request)
+{
+	if (context->gpuvm) {
+		switch (command) {
+		case GPGPU_IOC_MEMORY_COPY:
+			command = GPGPU_DRM_COPY;
+			break;
+		case GPGPU_IOC_QUEUE_CREATE:
+			command = GPGPU_DRM_QUEUE_CREATE;
+			break;
+		case GPGPU_IOC_QUEUE_QUERY:
+			command = GPGPU_DRM_QUEUE_QUERY;
+			break;
+		case GPGPU_IOC_QUEUE_DESTROY:
+			command = GPGPU_DRM_QUEUE_DESTROY;
+			break;
+		case GPGPU_IOC_EVENT_CREATE:
+			command = GPGPU_DRM_EVENT_CREATE;
+			break;
+		case GPGPU_IOC_EVENT_QUERY:
+			command = GPGPU_DRM_EVENT_QUERY;
+			break;
+		case GPGPU_IOC_EVENT_WAIT:
+			command = GPGPU_DRM_EVENT_WAIT;
+			break;
+		case GPGPU_IOC_EVENT_DESTROY:
+			command = GPGPU_DRM_EVENT_DESTROY;
+			break;
+		}
+	}
+	return ioctl(context->fd, command, request);
+}
+
 /*
  * gpgpu_kmt_ioctl() - 执行一次带连接保护的 ioctl
  *
@@ -96,8 +130,8 @@ GpgpuKmtStatus gpgpu_kmt_ioctl(GpgpuKmtContext *context, unsigned long command, 
 
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
-	status = ioctl(context->fd, command, request) < 0 ? gpgpu_kmt_error(errno) :
-							    GPGPU_KMT_SUCCESS;
+	status = gpgpu_kmt_raw_ioctl(context, command, request) < 0 ? gpgpu_kmt_error(errno) :
+								      GPGPU_KMT_SUCCESS;
 	gpgpu_kmt_end(context);
 	return status;
 }
@@ -111,15 +145,20 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *device, GpgpuKmtContext **context)
 {
 	GpgpuKmtStatus status = GPGPU_KMT_SUCCESS;
 	struct gpgpu_queue_info info = { .version = GPGPU_QABI_VERSION };
+	struct gpgpu_vm_info vm_info = { .version = GPGPU_DRM_VERSION };
+	bool gpuvm = false;
 	int fd;
 
 	if (!context)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	*context = NULL;
-	device = device ? device : "/dev/gpgpu0";
+	device = device ?
+		device :
+		(access("/dev/dri/renderD128", F_OK) == 0 ? "/dev/dri/renderD128" : "/dev/gpgpu0");
 	pthread_mutex_lock(&gpgpu_kmt_lock);
 	if (connection.fd >= 0) {
-		if (connection.process != getpid() || strcmp(connection.path, device)) {
+		if (connection.closing || connection.process != getpid() ||
+		    strcmp(connection.path, device)) {
 			status = GPGPU_KMT_UNAVAILABLE;
 		} else {
 			connection.references++;
@@ -132,13 +171,16 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *device, GpgpuKmtContext **context)
 		status = gpgpu_kmt_error(errno);
 		goto done;
 	}
-	if (ioctl(fd, GPGPU_IOC_QINFO, &info) < 0) {
+	if (ioctl(fd, GPGPU_DRM_INFO, &vm_info) == 0) {
+		gpuvm = true;
+		if (vm_info.version != GPGPU_DRM_VERSION || vm_info.page_size != 4096 ||
+		    vm_info.range_count != 3) {
+			status = GPGPU_KMT_VERSION_MISMATCH;
+			close(fd);
+			goto done;
+		}
+	} else if (ioctl(fd, GPGPU_IOC_QINFO, &info) < 0 || info.version != GPGPU_QABI_VERSION) {
 		status = gpgpu_kmt_error(errno);
-		close(fd);
-		goto done;
-	}
-	if (info.version != GPGPU_QABI_VERSION) {
-		status = GPGPU_KMT_VERSION_MISMATCH;
 		close(fd);
 		goto done;
 	}
@@ -152,16 +194,58 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *device, GpgpuKmtContext **context)
 	connection.process = getpid();
 	connection.references = 1;
 	connection.info = info;
+	connection.gpuvm = gpuvm;
+	connection.vm_info = vm_info;
 	*context = &connection;
 done:
 	pthread_mutex_unlock(&gpgpu_kmt_lock);
 	return status;
 }
 
+/* 调用方已停止提交；最多等待五秒，故障 Queue 直接使用错误卸载协议。 */
+static GpgpuKmtStatus vm_close_objects(GpgpuKmtContext *c)
+{
+	GpgpuKmtStatus status;
+
+	while (c->queues) {
+		GpgpuKmtQueue *q = c->queues;
+		unsigned int attempts = 0;
+
+		while (__atomic_load_n(q->rptr, __ATOMIC_ACQUIRE) !=
+		       __atomic_load_n(q->wptr, __ATOMIC_ACQUIRE)) {
+			struct gpgpu_queue_state state;
+
+			status = gpgpuKmtQueryQueue(q, &state);
+			if (status != GPGPU_KMT_SUCCESS)
+				return status;
+			if (state.state == GPGPU_QUEUE_FAULTED)
+				break;
+			if (++attempts >= 5000)
+				return GPGPU_KMT_WAIT_TIMEOUT;
+			usleep(1000);
+		}
+		status = gpgpuKmtDestroyQueue(q);
+		if (status != GPGPU_KMT_SUCCESS)
+			return status;
+	}
+	while (c->events) {
+		status = gpgpuKmtDestroyEvent(c->events);
+		if (status != GPGPU_KMT_SUCCESS)
+			return status;
+	}
+	while (c->memory) {
+		status = gpgpuKmtFreeMemory(c->memory);
+		if (status != GPGPU_KMT_SUCCESS)
+			return status;
+	}
+	return GPGPU_KMT_SUCCESS;
+}
+
 /*
  * gpgpuKmtClose() - 释放一个共享连接引用
  *
- * 最后关闭须确认没有存活对象和调用，否则返回暂不可用。
+ * GPUVM 最后关闭按队列、事件、映射顺序清理；有并发调用或未知状态时保留。
+ * 旧模式仍要求调用方先显式销毁全部对象。
  */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 {
@@ -171,9 +255,23 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 	if (context != &connection || connection.fd < 0 || connection.process != getpid() ||
 	    !connection.references) {
 		status = GPGPU_KMT_INVALID_PARAMETER;
+	} else if (connection.closing && !pthread_equal(connection.closer, pthread_self())) {
+		status = GPGPU_KMT_UNAVAILABLE;
 	} else if (connection.references > 1) {
 		connection.references--;
-	} else if (connection.objects || connection.calls) {
+	} else if (connection.gpuvm && connection.objects && !connection.calls &&
+		   !connection.uncertain) {
+		connection.closing = true;
+		connection.closer = pthread_self();
+		pthread_mutex_unlock(&gpgpu_kmt_lock);
+		status = vm_close_objects(context);
+		if (status == GPGPU_KMT_SUCCESS)
+			return gpgpuKmtClose(context);
+		pthread_mutex_lock(&gpgpu_kmt_lock);
+		connection.closing = false;
+		pthread_mutex_unlock(&gpgpu_kmt_lock);
+		return status;
+	} else if (connection.objects || connection.calls || connection.uncertain) {
 		status = GPGPU_KMT_UNAVAILABLE;
 	} else {
 		close(connection.fd);
@@ -197,6 +295,23 @@ GpgpuKmtStatus gpgpuKmtGetInfo(GpgpuKmtContext *context, struct gpgpu_queue_info
 	memset(info, 0, sizeof(*info));
 	info->version = GPGPU_QABI_VERSION;
 	return gpgpu_kmt_ioctl(context, GPGPU_IOC_QINFO, info);
+}
+
+GpgpuKmtStatus gpgpuKmtGetVmInfo(GpgpuKmtContext *context, struct gpgpu_vm_info *info)
+{
+	if (!info)
+		return GPGPU_KMT_INVALID_PARAMETER;
+	memset(info, 0, sizeof(*info));
+	info->version = GPGPU_DRM_VERSION;
+	return gpgpu_kmt_ioctl(context, GPGPU_DRM_INFO, info);
+}
+
+GpgpuKmtStatus gpgpuKmtGetVmFault(GpgpuKmtQueue *queue, struct gpgpu_vm_fault *fault)
+{
+	if (!queue || !queue->context || !fault)
+		return GPGPU_KMT_INVALID_PARAMETER;
+	*fault = (struct gpgpu_vm_fault) { .version = GPGPU_DRM_VERSION, .queue_id = queue->id };
+	return gpgpu_kmt_ioctl(queue->context, GPGPU_DRM_FAULT, fault);
 }
 
 /*

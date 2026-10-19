@@ -21,11 +21,9 @@
 #include "gpgpu_uapi.h"
 #include "gpgpu_queue_drv.h"
 
-static bool queue_mode;
-module_param(queue_mode, bool, 0444);
-MODULE_PARM_DESC(queue_mode,
-		 "启用 RV64 CP 队列模式；"
-		 "默认使用第一阶段同步模式");
+static unsigned int queue_mode;
+module_param(queue_mode, uint, 0444);
+MODULE_PARM_DESC(queue_mode, "0=同步，1=物理队列，2=DRM GPUVM；加载后固定");
 
 /* gen_pool 的最小分配单元为 2^8 字节。 */
 /* 同步模式 gen_pool 的最小分配粒度，以 2 的幂表示。 */
@@ -628,7 +626,7 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		ret = -ENODEV;
 		goto regions;
 	}
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(queue_mode == 2 ? 48 : 64));
 	if (ret)
 		goto regions;
 	pci_set_master(pdev);
@@ -636,6 +634,11 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	gpu->doorbell = pci_iomap(pdev, 4, 0);
 	if (!gpu->regs || !gpu->doorbell) {
 		ret = -ENOMEM;
+		goto unmap;
+	}
+	if (queue_mode > 2 || (queue_mode == 2) != (readl(gpu->regs + GPGPU_REG_VM_MODE) == 2) ||
+	    (queue_mode == 2 && readl(gpu->regs + GPGPU_REG_VM_VERSION) != GPGPU_VM_VERSION)) {
+		ret = -EPROTONOSUPPORT;
 		goto unmap;
 	}
 	gpu->vram_size = readl(gpu->regs + GPGPU_REG_VRAM_SIZE_LO);
@@ -664,7 +667,7 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, gpu);
 	gpgpu_reset(gpu);
 	if (queue_mode) {
-		gpu->queue = gpgpu_qdev_create(pdev, gpu->regs, gpu->doorbell);
+		gpu->queue = gpgpu_qdev_create(pdev, gpu->regs, gpu->doorbell, queue_mode == 2);
 		if (IS_ERR(gpu->queue)) {
 			ret = PTR_ERR(gpu->queue);
 			gpu->queue = NULL;
@@ -674,13 +677,13 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		if (ret)
 			goto irqs;
 	}
-	ret = misc_register(&gpu->misc);
+	ret = queue_mode == 2 ? gpgpu_drm_register(gpu->queue) : misc_register(&gpu->misc);
 	if (ret) {
 		writel(0, gpu->regs + GPGPU_REG_IRQ_ENABLE);
 		goto irqs;
 	}
-	dev_info(&pdev->dev, "gpgpu_pci: /dev/gpgpu0, VRAM %u, MSI-X %u\n", gpu->vram_size,
-		 gpu->vector_count);
+	dev_info(&pdev->dev, "gpgpu_pci: %s, VRAM %u, MSI-X %u\n",
+		 queue_mode == 2 ? "DRM render" : "/dev/gpgpu0", gpu->vram_size, gpu->vector_count);
 	return 0;
 
 irqs:
@@ -719,7 +722,10 @@ static void gpgpu_remove(struct pci_dev *pdev)
 {
 	struct gpgpu_device *gpu = pci_get_drvdata(pdev);
 
-	misc_deregister(&gpu->misc);
+	if (queue_mode == 2)
+		gpgpu_drm_unregister(gpu->queue);
+	else
+		misc_deregister(&gpu->misc);
 	mutex_lock(&gpu->lock);
 	gpu->present = false;
 	if (gpu->queue) {

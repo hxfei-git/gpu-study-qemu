@@ -40,7 +40,9 @@ GpgpuKmtStatus gpgpuKmtCreateQueue(GpgpuKmtContext *context, GpgpuKmtMemory *rin
 	status = gpgpu_kmt_begin(context);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
-	if (ioctl(context->fd, GPGPU_IOC_QUEUE_CREATE, &request) < 0) {
+	if (gpgpu_kmt_raw_ioctl(context, GPGPU_IOC_QUEUE_CREATE, &request) < 0) {
+		if (context->gpuvm && (errno == EPROTO || errno == EIO || errno == ETIMEDOUT))
+			context->uncertain = true;
 		status = gpgpu_kmt_error(errno);
 		goto done;
 	}
@@ -74,6 +76,12 @@ GpgpuKmtStatus gpgpuKmtCreateQueue(GpgpuKmtContext *context, GpgpuKmtMemory *rin
 	}
 	queue->doorbell_mapping = mapping;
 	queue->doorbell = (void *)((char *)mapping + request.doorbell_offset);
+	if (context->gpuvm) {
+		pthread_mutex_lock(&gpgpu_kmt_lock);
+		queue->next = context->queues;
+		context->queues = queue;
+		pthread_mutex_unlock(&gpgpu_kmt_lock);
+	}
 	goto done;
 rollback:
 	/*
@@ -125,13 +133,21 @@ GpgpuKmtStatus gpgpuKmtDestroyQueue(GpgpuKmtQueue *queue)
 		.version = GPGPU_QABI_VERSION,
 		.queue_id = queue->id,
 	};
-	if (ioctl(context->fd, GPGPU_IOC_QUEUE_DESTROY, &request) < 0) {
+	if (gpgpu_kmt_raw_ioctl(context, GPGPU_IOC_QUEUE_DESTROY, &request) < 0) {
 		status = gpgpu_kmt_error(errno);
 		goto done;
 	}
 	if (queue->doorbell_mapping)
 		munmap(queue->doorbell_mapping, queue->doorbell_map_size);
 	pthread_mutex_lock(&gpgpu_kmt_lock);
+	if (context->gpuvm) {
+		GpgpuKmtQueue **link;
+
+		for (link = &context->queues; *link && *link != queue; link = &(*link)->next) {
+		}
+		if (*link)
+			*link = queue->next;
+	}
 	queue->ring_memory->queue_users--;
 	queue->progress_memory->queue_users--;
 	context->objects--;

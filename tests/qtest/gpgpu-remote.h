@@ -18,7 +18,7 @@ typedef struct GPGPURemote {
     char *log;
 } GPGPURemote;
 
-static inline void gpgpu_remote_start(GPGPURemote *remote)
+static inline void gpgpu_remote_start_mode(GPGPURemote *remote, bool gpuvm)
 {
     static unsigned int sequence;
     const char *logs = g_getenv("QTEST_GPGPU_REMOTE_LOG_DIR");
@@ -36,8 +36,8 @@ static inline void gpgpu_remote_start(GPGPURemote *remote)
                                   logs ? logs : remote->directory, ++sequence);
     quoted_log = g_shell_quote(remote->log);
     args = g_strdup_printf("-machine gpgpu-cp,auto-shutdown=off "
-                           "-accel tcg -nodefaults -serial none 2>%s",
-                           quoted_log);
+                           "-accel tcg -nodefaults -serial none %s 2>%s",
+                           gpuvm ? "-global gpgpu.gpuvm=on" : "", quoted_log);
     remote->qts = qtest_init_ext("QTEST_GPGPU_REMOTE_BINARY", args, NULL, true);
 
     /* 先建立 QMP，再创建服务端，避免握手被阻塞。 */
@@ -46,6 +46,11 @@ static inline void gpgpu_remote_start(GPGPURemote *remote)
         "'qom-type': 'x-vfio-user-server', 'id': 'vfu0', 'device': 'gpu0',"
         "'socket': { 'type': 'unix', 'path': %s } } }", remote->socket);
     g_assert_true(g_file_test(remote->socket, G_FILE_TEST_EXISTS));
+}
+
+static inline void gpgpu_remote_start(GPGPURemote *remote)
+{
+    gpgpu_remote_start_mode(remote, false);
 }
 
 static inline char *gpgpu_remote_device_option(GPGPURemote *remote)

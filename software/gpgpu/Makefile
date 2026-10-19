@@ -13,7 +13,7 @@ KERNEL_BINARIES = $(addprefix $(BUILD_DIR)/,$(addsuffix .bin,$(KERNELS)))
 
 .PHONY: all kernels check-assembler firmware clean
 all: $(BUILD_DIR)/libgpgpu.a $(BUILD_DIR)/gpgpu-demo $(BUILD_DIR)/test-runtime \
-     $(BUILD_DIR)/libgpgpu-kmt.a $(BUILD_DIR)/test-queue
+     $(BUILD_DIR)/libgpgpu-kmt.a $(BUILD_DIR)/test-queue $(BUILD_DIR)/test-gpuvm
 
 kernels: $(KERNEL_HEADERS) $(KERNEL_BINARIES)
 
@@ -49,7 +49,7 @@ clean:
 	rm -f $(KMT_OBJECTS) $(BUILD_DIR)/libgpgpu-kmt.a $(BUILD_DIR)/test-queue
 
 KMT_OBJECTS = $(addprefix $(BUILD_DIR)/kmt-,device.o memory.o queue.o event.o)
-$(BUILD_DIR)/kmt-%.o: hsakmt/%.c hsakmt/gpgpu_kmt.h hsakmt/internal.h include/gpgpu_queue.h include/gpgpu_uapi.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmt-%.o: hsakmt/%.c hsakmt/gpgpu_kmt.h hsakmt/internal.h include/gpgpu_queue.h include/gpgpu_uapi.h include/gpgpu_vm.h include/gpgpu_drm.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 $(BUILD_DIR)/libgpgpu-kmt.a: $(KMT_OBJECTS)
 	$(AR) rcs $@ $^
@@ -57,3 +57,6 @@ $(BUILD_DIR)/test-queue: tests/test-queue.c tests/queue_helpers.c tests/queue_he
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test-queue.c tests/queue_helpers.c $(BUILD_DIR)/libgpgpu-kmt.a $(LDLIBS) -o $@
 firmware:
 	$(MAKE) -C firmware
+
+$(BUILD_DIR)/test-gpuvm: tests/test-gpuvm.c tests/queue_helpers.c tests/queue_helpers.h $(KERNEL_HEADERS) $(BUILD_DIR)/libgpgpu-kmt.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test-gpuvm.c tests/queue_helpers.c $(BUILD_DIR)/libgpgpu-kmt.a $(LDLIBS) -o $@

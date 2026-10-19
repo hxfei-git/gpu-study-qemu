@@ -110,6 +110,9 @@ unlock_publish:
 		if (!ret) {
 			dma_rmb();
 			*status = le32_to_cpu(READ_ONCE(request->result->status));
+			/* 完成序号不能证明未知状态下的设备访问已经结束。 */
+			if (*status > GPGPU_MANAGEMENT_RECOVERY_REQUIRED)
+				ret = -EPROTO;
 		}
 	}
 	mutex_lock(&dev->lock);
@@ -200,6 +203,7 @@ static void client_delete(struct gpgpu_qclient *client)
 	list_for_each_entry_safe(q, next, &client->queues, node) {
 		delete_queue(q);
 	}
+	gpgpu_vm_cleanup(client);
 	gpgpu_memory_release_all(client);
 	if (client->db_page)
 		clear_bit(client->db_page, &client->dev->db_pages);
@@ -235,7 +239,7 @@ static void qdev_destroy(struct kref *refs)
  * 要求无系统 IOMMU、缓存一致性 RAM 与冷启动 CP，再分配管理及 IH 资源。
  */
 struct gpgpu_qdev *gpgpu_qdev_create(struct pci_dev *pdev, void __iomem *regs,
-				     void __iomem *doorbell)
+				     void __iomem *doorbell, bool gpuvm)
 {
 	struct gpgpu_qdev *dev;
 	int ret;
@@ -243,7 +247,7 @@ struct gpgpu_qdev *gpgpu_qdev_create(struct pci_dev *pdev, void __iomem *regs,
 	 * 第二阶段使用直通物理地址
 	 * 及可原子读改写的缓存一致性 RAM。
 	 */
-	if (iommu_get_domain_for_dev(&pdev->dev) || !dev_is_dma_coherent(&pdev->dev) ||
+	if ((!gpuvm && iommu_get_domain_for_dev(&pdev->dev)) || !dev_is_dma_coherent(&pdev->dev) ||
 	    readl(regs + CP_CTRL) != 3 ||
 	    readl(regs + GPGPU_REG_VRAM_SIZE_LO) != GPGPU_FIRMWARE_STACK_TOP ||
 	    PAGE_SIZE > GPGPU_QUEUE_DOORBELL_SIZE / 3) {
@@ -253,11 +257,13 @@ struct gpgpu_qdev *gpgpu_qdev_create(struct pci_dev *pdev, void __iomem *regs,
 	if (!dev)
 		return ERR_PTR(-ENOMEM);
 	dev->pdev = pci_dev_get(pdev);
+	dev->gpuvm = gpuvm;
 	dev->regs = regs;
 	dev->doorbell = doorbell;
 	kref_init(&dev->refs);
 	mutex_init(&dev->lock);
 	mutex_init(&dev->management_lock);
+	mutex_init(&dev->vm_serial);
 	mutex_init(&dev->dma_lock);
 	spin_lock_init(&dev->irq_lock);
 	init_completion(&dev->dma_done);
@@ -352,6 +358,8 @@ int gpgpu_qdev_start(struct gpgpu_qdev *dev)
 	ret = management_submit(dev, 0, GPGPU_MAP_QUEUES, GPGPU_QUEUE_HIQ,
 				dev->management[1].mqd_dma, &status, &published);
 	mutex_unlock(&dev->lock);
+	if (!ret && dev->gpuvm && readl(dev->regs + GPGPU_REG_VM_FIRMWARE) != GPGPU_VM_VERSION)
+		ret = -EPROTONOSUPPORT;
 	return ret ? ret : (status ? -EIO : 0);
 #else
 	/*
@@ -437,6 +445,7 @@ int gpgpu_qopen(struct gpgpu_qdev *dev, struct file *file)
 	c->owner = task_tgid_nr(current);
 	c->next_memory = c->next_queue = c->next_event = 1;
 	INIT_LIST_HEAD(&c->memory);
+	INIT_LIST_HEAD(&c->tables);
 	INIT_LIST_HEAD(&c->queues);
 	INIT_LIST_HEAD(&c->events);
 	atomic_set(&c->db_maps, 0);
@@ -464,6 +473,8 @@ int gpgpu_qrelease(struct inode *inode, struct file *file)
 	list_for_each_entry(q, &c->queues, node) {
 		retain |= !q->dead;
 	}
+	if (!retain && c->drm_file && gpgpu_vm_cleanup(c))
+		retain = true;
 	if (retain && !dev->stopped) {
 		/*
 		 * file/VMA 引用结束仍可能有设备访问，
@@ -534,7 +545,7 @@ static bool overlap(u64 a, u64 asize, u64 b, u64 bsize)
  *
  * 校验 Ring/进度独占与对齐，创建 MQD 并请求 HIQ 映射，成功后交付 Doorbell。
  */
-static int queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
+int gpgpu_queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
 {
 	struct gpgpu_qdev *dev = c->dev;
 	struct gpgpu_qmemory *ring = gpgpu_memory_find(c, r->ring_handle);
@@ -546,6 +557,10 @@ static int queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
 	int ret;
 
 	queue_collect(c);
+	if (dev->gpuvm &&
+	    (c->vm_failed || !c->vmid || !ring || !p || !ring->gpu_va || !p->gpu_va ||
+	     gpgpu_vm_queue_live(c)))
+		return -EBUSY;
 	if (r->reserved || !ring || !p || ring->kind != GPGPU_MEMORY_HOST ||
 	    p->kind != GPGPU_MEMORY_HOST || !is_power_of_2(r->ring_size) ||
 	    r->ring_size < GPGPU_QUEUE_RING_MIN || r->ring_size > GPGPU_QUEUE_RING_MAX ||
@@ -605,13 +620,14 @@ static int queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
 	ring->users++;
 	p->users++;
 	*q->mqd = (GpgpuMqd) {
-		.ring_base = cpu_to_le64(ring->dma + r->ring_offset),
-		.rptr_report_addr = cpu_to_le64(p->dma + r->rptr_offset),
-		.wptr_poll_addr = cpu_to_le64(p->dma + r->wptr_offset),
+		.ring_base = cpu_to_le64((dev->gpuvm ? ring->gpu_va : ring->dma) + r->ring_offset),
+		.rptr_report_addr = cpu_to_le64((dev->gpuvm ? p->gpu_va : p->dma) + r->rptr_offset),
+		.wptr_poll_addr = cpu_to_le64((dev->gpuvm ? p->gpu_va : p->dma) + r->wptr_offset),
 		.pq_control = cpu_to_le32(r->ring_size),
 		.doorbell_control = cpu_to_le32(GPGPU_DOORBELL_ENABLE |
 						(c->db_page * PAGE_SIZE + q->db_index * 8)),
 		.aql_control = cpu_to_le32(1),
+		.vmid = cpu_to_le32(c->vmid),
 		.saved_rptr = cpu_to_le64(initial),
 	};
 	for (u32 i = 0; i < r->ring_size; i += sizeof(GpgpuAqlPacket)) {
@@ -640,7 +656,8 @@ static int queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
 	q->state = GPGPU_QUEUE_READY;
 	r->queue_id = q->id;
 	r->doorbell_offset = q->db_index * 8;
-	r->doorbell_mmap_offset = (u64)GPGPU_DB_MMAP_PAGE << PAGE_SHIFT;
+	r->doorbell_mmap_offset = (u64)(dev->gpuvm ? GPGPU_VM_DB_MMAP_PAGE : GPGPU_DB_MMAP_PAGE)
+		<< PAGE_SHIFT;
 	r->doorbell_map_size = PAGE_SIZE;
 	return 0;
 }
@@ -650,8 +667,8 @@ static int queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
  *
  * 持设备锁检查排空条件，CP 确认卸载后消费旧 IH 并放下内存引用。
  */
-static int queue_operation(struct gpgpu_qclient *c, unsigned int command,
-			   struct gpgpu_queue_state *r)
+int gpgpu_queue_operation(struct gpgpu_qclient *c, unsigned int command,
+			  struct gpgpu_queue_state *r)
 {
 	struct gpgpu_qdev *dev = c->dev;
 	struct gpgpu_user_queue *q = gpgpu_queue_find(c, r->queue_id);
@@ -661,6 +678,7 @@ static int queue_operation(struct gpgpu_qclient *c, unsigned int command,
 
 	if (!q || q->dead || r->reserved)
 		return -EINVAL;
+	gpgpu_vm_save_fault(q);
 	if (command == GPGPU_IOC_QUEUE_DESTROY) {
 		if (q->uncertain || q->state == GPGPU_QUEUE_UNLOADING)
 			return -EBUSY;
@@ -774,7 +792,7 @@ int gpgpu_qmmap(struct file *file, struct vm_area_struct *vma)
 	}
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
 	vm_flags_clear(vma, VM_MAYEXEC);
-	if (token == GPGPU_DB_MMAP_PAGE) {
+	if (token == (dev->gpuvm ? GPGPU_VM_DB_MMAP_PAGE : GPGPU_DB_MMAP_PAGE)) {
 		if (!c->db_page || vma->vm_end - vma->vm_start != PAGE_SIZE)
 			goto out;
 		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
@@ -901,11 +919,11 @@ long gpgpu_qioctl(struct file *file, unsigned int command, unsigned long argumen
 		ret = gpgpu_memory_copy(c, &r.copy);
 		break;
 	case GPGPU_IOC_QUEUE_CREATE:
-		ret = queue_create(c, &r.queue);
+		ret = gpgpu_queue_create(c, &r.queue);
 		break;
 	case GPGPU_IOC_QUEUE_QUERY:
 	case GPGPU_IOC_QUEUE_DESTROY:
-		ret = queue_operation(c, command, &r.state);
+		ret = gpgpu_queue_operation(c, command, &r.state);
 		break;
 	default:
 		ret = gpgpu_event_operation(c, command, &r.event);

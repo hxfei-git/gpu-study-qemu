@@ -15,10 +15,24 @@ bool gpgpu_param_read(GPGPUState *s, uint32_t addr, uint32_t *value)
 	uint32_t offset = addr - GPGPU_KERNEL_ARGS_WINDOW;
 	uint8_t data[4];
 
-	if ((offset & 3) || offset > params->args_size - 4 ||
+	if ((offset & 3) || params->args_size < 4 || offset > params->args_size - 4 ||
 	    params->kernel_args > UINT64_MAX - offset - 3) {
 		s->dispatch_error = GPGPU_EXEC_ERR_ARG_RANGE;
+		if (s->gpuvm)
+			gpgpu_vm_fail(s, params->vmid, params->source_slot,
+				      params->kernel_args + offset, GPGPU_VM_READ,
+				      GPGPU_VM_PHASE_ARGS, GPGPU_VM_FAULT_RANGE);
 		return false;
+	}
+	if (s->gpuvm) {
+		if (!gpgpu_vm_access(s, params->vmid, params->source_slot,
+				     params->kernel_args + offset, data, sizeof(data),
+				     GPGPU_VM_READ, GPGPU_VM_PHASE_ARGS)) {
+			s->dispatch_error = GPGPU_EXEC_ERR_ARG_READ;
+			return false;
+		}
+		*value = ldl_le_p(data);
+		return true;
 	}
 	if (vfu_object_dma_rw(PCI_DEVICE(s), params->kernel_args + offset, data, sizeof(data),
 			      false) != MEMTX_OK) {
