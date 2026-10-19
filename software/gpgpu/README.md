@@ -205,11 +205,11 @@ CP 对应使用 `fence iorw, iorw`。默认 Signal 等待的约 `200 μs` 预算
 `include/gpgpu_queue.h` 集中定义 MQD、AQL、Signal、IH 和寄存器编码，
 编译期核对布局；`hsakmt/` 按设备、内存、队列、事件分文件实现接口库。
 
-> **[SOURCE]** 当前未提交工作区，基于实验子仓库 `57543dd54b6b046b888277272fa84af81746b1ac`：
+> **[SOURCE]** 实验子仓库固定提交 `6325a87e4c500f4930c4e0b502a1ec241f83bf26`：
 >
-> - 四组接口与创建失败时的引用保留：[software/gpgpu/hsakmt/gpgpu_kmt.h](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/hsakmt/gpgpu_kmt.h:48:1)，[第 48～82 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/hsakmt/gpgpu_kmt.h:48:1)。
-> - 固件固定布局、入口和栈范围：[software/gpgpu/firmware/link.ld](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:4:1)，[第 4～16 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:4:1)；AQL 执行、确认及完成收尾：[software/gpgpu/firmware/aql.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:60:1)，[第 60～166 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:60:1)。
-> - 调用方的原子取号、发布屏障和默认等待：[software/gpgpu/tests/queue_helpers.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/queue_helpers.c:11:1)，[第 11～132 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/queue_helpers.c:11:1)。
+> - 四组接口与创建失败时的引用保留：[software/gpgpu/hsakmt/gpgpu_kmt.h](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/hsakmt/gpgpu_kmt.h#L103)，[第 103～152 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/hsakmt/gpgpu_kmt.h#L103)。
+> - 固件固定布局、入口和栈范围：[software/gpgpu/firmware/link.ld](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/firmware/link.ld#L4)，[第 4～16 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/firmware/link.ld#L4)；AQL 执行、确认及完成收尾：[software/gpgpu/firmware/aql.c](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/firmware/aql.c#L72)，[第 72～173 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/firmware/aql.c#L72)。
+> - 调用方的原子取号、发布屏障和默认等待：[software/gpgpu/tests/queue_helpers.c](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/queue_helpers.c#L16)，[第 16～171 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/queue_helpers.c#L16)。
 
 以上接口遵循[CP/MEC 第一版规格](<../../../CP_MEC 第一版规格.md>)中的实验
 协议，采用 HSAKMT 风格的职责划分，未实现完整 ROCr 或原版 libhsakmt 的 ABI。
@@ -387,12 +387,12 @@ ext4 依赖。交叉配置与已确认的 `linux/kernel/gpgpu.arm64.config` 核�
 配置或编译内核；转换前后核对 `.config`、生成头、`Module.symvers` 和模块
 链接脚本的内容，保持它们与交叉内核一致。路径元数据允许随安装位置调整。
 
-> **[SOURCE]** 当前未提交工作区，基于实验子仓库 `57543dd54b6b046b888277272fa84af81746b1ac`：
+> **[SOURCE]** 实验子仓库固定提交 `6325a87e4c500f4930c4e0b502a1ec241f83bf26`：
 >
-> - 工具链版本和校验值：[linux/kernel/cross-toolchain.json](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/cross-toolchain.json:1:1)，[第 1～10 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/cross-toolchain.json:1:1)。
-> - 保留环境的版本与缓存校验：[linux/kernel-build.py](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:311:1)，[第 311～323 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:311:1)；宿主依赖解包与路径设置：[第 74～95 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:74:1)。
-> - 功能配置差异检查：[linux/kernel-build.py](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:108:1)，[第 108～121 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel-build.py:108:1)。
-> - 客体工具重编与最终校验：[linux/kernel/guest-cross-prepare.sh](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/guest-cross-prepare.sh:148:1)，[第 148～212 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/kernel/guest-cross-prepare.sh:148:1)。
+> - 工具链版本和校验值：[linux/kernel/cross-toolchain.json](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel/cross-toolchain.json#L1)，[第 1～10 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel/cross-toolchain.json#L1)。
+> - 保留环境的版本与缓存校验：[linux/kernel-build.py](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel-build.py#L315)，[第 315～328 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel-build.py#L315)；宿主依赖解包与路径设置：[第 75～96 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel-build.py#L75)。
+> - 功能配置差异检查：[linux/kernel-build.py](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel-build.py#L110)，[第 110～123 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel-build.py#L110)。
+> - 客体工具重编与最终校验：[linux/kernel/guest-cross-prepare.sh](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel/guest-cross-prepare.sh#L152)，[第 152～216 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/kernel/guest-cross-prepare.sh#L152)。
 
 从实验子仓库根目录执行：
 
@@ -424,7 +424,7 @@ make -f Makefile.camp test-gpgpu-cp JOBS=4
 
 ### 第二阶段本轮验证状态
 
-2026-10-19，当前工作区的 RV64 固件与 Host 接口库已通过编译，汇编检查
+2026-10-19，整改前提交 `3217651` 中的 RV64 固件与 Host 接口库已通过编译，汇编检查
 4/4。CP QTest 为 16/16，包含原 8 项、设备边界检查和真实队列固件流程；
 新增的 A57 与 RV64 CP 双向 64 位并发访问检查运行 2000 轮，高低半部同时
 交替变化。单／双进程 SMMUv3 专项各 2/2，ARM64／RISC-V 设备检查各 21/21。
@@ -448,7 +448,21 @@ RAM。等待用例在提交前确认主线程和两个等待线程均阻塞在�
 
 > **[SOURCE]** 2026-10-19 实际运行产物：[队列结果](../../build/gpgpu-kernel-cross/remote/none/queue-test.json)、[队列检查与卸载日志](../../build/gpgpu-kernel-cross/remote/none/queue-test.log)、[四种同步组合的八次运行汇总](../../build/gpgpu-kernel-cross/stage1-validation.json)及[内核构建清单](../../build/gpgpu-kernel-cross/kernel-build.json)。这些链接指向本地 `build/` 产物，未纳入 Git；复现构建和测试后生成。
 >
-> 当前工作区的等待与寿命检查见 [tests/test-queue.c](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:369:1) 的 [第 369～407 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:369:1)、[第 609～647 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:609:1)，非法参数地址见该文件的 [第 458～465 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/tests/test-queue.c:458:1)。固件目录修复见 [linux/guest-queue-test.sh](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/guest-queue-test.sh:8:1) 的 [第 8～14 行](vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/guest-queue-test.sh:8:1)。
+> 整改后提交 `6325a87` 中的等待与寿命检查见 [tests/test-queue.c](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497) 的 [第 497～539 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497)、[第 817～863 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L817)，非法参数地址见该文件的 [第 609～616 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L609)。固件目录修复见 [linux/guest-queue-test.sh](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8) 的 [第 8～14 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8)。
+
+同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
+MQD 及相关引用，尚待修复。上述测试数量是已提交的历史运行记录；复核环境
+仅完成用户态编译和汇编检查，未重跑完整客体验收。证据与复核范围见
+[大纲复核记录](<../../../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)；
+寄存器与协议查阅见 [GPGPU 硬件手册](<../../../QEMU_2026_GPGPU_硬件手册.html>)。
+
+同日完成 `hw/gpgpu/` 和 `software/` 的中文注释与 Linux 风格整改，
+原实现提交 `3217651` 重写为 `6325a87`。本次用户态与 RV64 固件编译通过，
+汇编器检查 4/4；40 个 C/头文件的规范化语法树一致，5 个库目标文件去除
+调试信息后逐字节一致，CP 固件与 4 个计算 Kernel 二进制一致。
+格式配置、kernel-doc、Python 和 Shell 语法检查通过；Linux checkpatch 为
+0 错误、25 提示，主要涉及 MMIO 的 volatile、声明宏及既有深层分支。
+本次未重跑完整 QEMU 与 Linux 客体验收，上述端到端数量仍属整改前记录。
 
 下节的 2026-10-08 记录属于第一阶段历史结果。
 

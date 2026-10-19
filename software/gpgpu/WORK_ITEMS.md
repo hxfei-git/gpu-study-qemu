@@ -112,10 +112,11 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
 `build/gpgpu-linux-validation.json`，专项日志为
 `build/gpgpu-iommu-qtest.log`。
 
-## 第二阶段工作区实现与验证
+## 第二阶段实现与验证
 
 2026-10-19 在实验基线 `57543dd54b6b046b888277272fa84af81746b1ac` 上接入
-用户队列实现。实现顺序和后续安排统一维护在[实验大纲第二阶段](<../../../QEMU GPGPU 实验大纲.md#22-第二阶段用户-aql-queuedoorbellcp-与-signal>)；
+用户队列实现，原提交为 `3217651a83c00c14a39712cefda9394b6e977ff3`。同日合入中文注释与 Linux 风格整改后，
+实现提交重写为 `6325a87e4c500f4930c4e0b502a1ec241f83bf26`。实现顺序和后续安排统一维护在[实验大纲第二阶段](<../../../QEMU GPGPU 实验大纲.md#22-第二阶段用户-aql-queuedoorbellcp-与-signal>)；
 本节记录代码落点与验证状态。
 
 队列模式使用双进程设备、`IOMMU=none、VMID=0`。Host 通过 HSAKMT 风格库
@@ -166,3 +167,7 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
 固件目录链接，并将非法参数用例地址移到客体 RAM 与 PCI 窗口之外。
 完整日志和代码依据见 [README](README.md#第二阶段本轮验证状态)；历史第一阶段
 记录保持原日期。
+
+2026-10-19 规格复核仍有管理结果码校验与异常资源回收待修项；既有验收通过
+不等同于完全符合规格。证据及本次复核验证范围统一见
+[大纲复核记录](<../../../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)。

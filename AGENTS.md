@@ -87,69 +87,50 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 
 ## 当前 GPGPU 实验
 
-根据用户反馈，进阶实验一已完成，并已搭配 A57、支持 SMMUv3 系统 IOMMU。
-当前进入第二阶段：用户 AQL Queue、Doorbell、CP 与 Signal。实现前先阅读
-[QEMU GPGPU 四阶段实验大纲](<../QEMU GPGPU 实验大纲.md>) 和
-[CP/MEC 第一版规格](<../CP_MEC 第一版规格.md>)，实验计划继续统一在大纲维护。
-2026-10-11 已完成远端设备与原生 CP 基础接入，2026-10-14 完成
-CP Host 访存窗口及回归。2026-10-17 原生 CP 迁移至 RV64，窗口增加
-对齐的 8 字节读写并通过原有 8 项 CP 回归；裸机物理访存、地址编码和
-RV32 计算执行器保持原约定。当前状态见
-[大纲进度说明](<../QEMU GPGPU 实验大纲.md#current-progress>)。第二阶段
-队列功能尚未记录实现完成或整体运行验收通过。
+根据用户反馈，第一阶段已完成，并已搭配 A57、支持 SMMUv3 系统 IOMMU。
+第二阶段的设备队列入口、RV64 CP 固件、Linux 驱动和 HSAKMT 风格接口库
+已在固定提交 `6325a87e4c500f4930c4e0b502a1ec241f83bf26` 接入。
+实验计划统一维护在[QEMU GPGPU 四阶段实验大纲](<../QEMU GPGPU 实验大纲.md>)；
+已确认行为见[CP/MEC 第一版规格](<../CP_MEC 第一版规格.md>)，寄存器及协议查阅
+见独立的 [GPGPU 硬件手册](<../QEMU_2026_GPGPU_硬件手册.html>)。
 
-2026-10-18 按固定提交 `57543dd54b6b046b888277272fa84af81746b1ac` 核对：
-RV64 原生 CP 执行裸机固件，RV32 计算执行器运行应用 Kernel，两者分别保存
-寄存器和取指位置。计算线程的 `a0` 仍为 32 位，当前参数仍从 VRAM 读取。
-CP Host 窗口已实现；[规格 9.5.2](<../CP_MEC 第一版规格.md#spec-kernel-executor-interface>)
-已确认 16 字节描述对象和计算执行器的只读参数窗口。执行器保存完整的 64 位
-Host 参数基址和长度，各计算线程以 `a0 = 0x9000_0000` 访问
-`0x9000_0000～0x9000_ffff`，每次按实际长度检查 4 字节读取。
-该路径尚未实现，CP 分发寄存器和执行结果接口已按
-[规格 9.5.3](<../CP_MEC 第一版规格.md#spec-cp-dispatch-interface>) 确定。
-CP 解析描述对象，经 `0xfffd_0000 + BAR0 字节偏移` 访问原有分发配置，
-新增代码和参数长度寄存器用于范围检查。配置只在空闲时填写，最后写
-`DISPATCH=1`；设备统一保存配置，通过本次状态和错误寄存器返回结果，
-CP 读取并确认后才可接受下一任务。执行器分段推进并保留线程状态和累计预算，
-队列仍逐个完整执行 Dispatch；正常路径由 CP 独占提交和确认，旧 Host 直接
-提交路径单独用于回归。映射、五个新增寄存器和分段执行均尚待实现和验证，
-完整布局见[规格 6.3 节](<../CP_MEC 第一版规格.md#spec-executor-dispatch>)。
-源码依据见[CP 与计算执行器的位宽](<../CP_MEC 软件实现、参考与扩展.md#cp-executor-widths>)。
+当前执行模型是 RV64 原生 CP 运行裸机固件、RV32 计算执行器运行应用 Kernel。
+队列模式使用双进程设备、`IOMMU=none、VMID=0`，全设备共享两个用户队列名额。
+CP Host 窗口支持对齐的 1/2/4/8 字节访问；计算线程通过
+`0x9000_0000～0x9000_ffff` 的只读窗口读取 Host 参数，`a0` 仍为 32 位。
+同步路径的参数继续位于 VRAM。末尾 4 MiB VRAM 固定供固件使用，
+驱动用 `gpu_buddy` 管理前 60 MiB，并保留首个页。
 
-[规格 9.5.4](<../CP_MEC 第一版规格.md#spec-signal-completion-protocol>) 已确认
-24 字节 Signal 布局和通知、等待协议，属于待实现的第二阶段接口。
-每个使用中的 Signal 独占事件和通知槽；事件编号在进程内非零且不与存活事件重复。
-通知槽初值为 0，CP 完成时写入零扩展到 64 位的事件编号；驱动先保存“已通知”
-状态，再清零通知槽并唤醒等待者。登记后复查条件，等待返回不清除事件状态，
-同一任务可唤醒多个等待者；旧通知及相关处理结束后才可重新初始化。
-完成值仍为 `1 → 0`，默认等待仍先主动检查约 `200 μs` 再阻塞。
+HQD、8 字节 Doorbell、IH、分段执行器及状态确认均已接入。
+成功路径依次发布 Signal、通知槽、IH 记录、`INVALID` Header 和消费进度；
+默认等待先主动检查约 `200 μs`，再阻塞并复查 Signal，支持多个等待者。
+错误保留首次记录，未知是否停止访问的对象继续保留；多 VMID、抢占、运行中
+复位恢复、共享内存与组内屏障、完整 ROCr 运行时仍属后续范围。
 
-[规格 9.5.5](<../CP_MEC 第一版规格.md#spec-task-visibility>) 已确认任务可见性
-规则，尚待实现：A57 运行时在 Header 发布前、Doorbell 写入前及读到 Signal 完成后
-执行带编译器内存约束的 `dmb sy`；CP 在取包、提交配置和完成通知之间使用
-同样带编译器内存约束的 `fence iorw, iorw`。执行器后端结束相关访问后才发布终态，
-成功还须完成结果写回；跨线程交接用锁或 release/acquire 同步。CP 保存结果并清理、确认后，
-依次发布 Signal、通知槽和 IH 通知，每次访问成功后才继续。屏障不能代替 DMA
-完成等待或后端同步，完整流程与验证要求见[规格 6.4 节](<../CP_MEC 第一版规格.md#spec-dispatch-visibility>)。
+2026-10-19 已提交的验收记录包含 CP QTest 16/16、Linux 队列 5/5、
+设备卸载 1/1，以及单／双进程与 `none/smmuv3` 四种同步组合回归。
+每种同步组合包含装卸载 5/5、三个示例的 17,953 个输出值、运行时检查
+68/68 和卸载重载 2/2。日志位置与复现入口见
+[软件栈说明](software/gpgpu/README.md#第二阶段本轮验证状态)。
 
-`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支；
-`hxfei-qemu` 保留早期开发历史。第一阶段软件栈位于 `software/gpgpu/`，
-包含 Linux PCI 驱动、libgpgpu、RV32 汇编 kernel 和汇编前端、三个 FP32 示例及客体集成测试。
-修改接口前阅读 `software/gpgpu/README.md` 和 `WORK_ITEMS.md`。
-当前 ABI 位于 `software/gpgpu/include/gpgpu_uapi.h`。
+同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
+MQD 及相关引用，尚待修复。当前结论是核心实现基本符合规格，不能仅凭既有
+验收通过判定完全符合。证据、复核验证范围和待修项统一见
+[大纲复核记录](<../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)。
 
-运行 `make -f Makefile.camp test-gpgpu-stack` 验证 ARM64 Linux 驱动与运行时。
-首次运行会初始化 Alpine，后续构建复用 `build/gpgpu-linux-module/` 中保存编译环境的磁盘。
-运行 `make -C software/gpgpu check-assembler` 验证汇编前端编码。
+`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支，
+`hxfei-qemu` 保留早期开发历史。软件栈位于 `software/gpgpu/`；
+修改接口前阅读其中的 `README.md` 和 `WORK_ITEMS.md`。
+共享队列协议为 `include/gpgpu_queue.h`，驱动接口为 `include/gpgpu_uapi.h`，
+HSAKMT 风格库位于 `hsakmt/`。模块参数 `queue_mode=0/1` 选择互斥的
+同步模式或队列模式；原同步路径继续回归。
 
-2026-10-07 的第一阶段验证通过了三个示例（17,953 个输出值）、
-68 项驱动与运行时检查，以及 RISC-V 和 ARM64 virt 上各 21 项 GPGPU QTest。
-这 21 项包括 17 项评分测试和 4 项回归测试。核对测试数量与日志，
-不能仅凭评分脚本的退出状态判断全部通过。
+运行 `make -f Makefile.camp test-gpgpu-stack` 验证原 ARM64 Linux 软件栈，
+运行 `make -f Makefile.camp test-gpgpu-cp JOBS=4` 验证 CP；
+队列测试与 Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
+运行 `make -C software/gpgpu check-assembler` 验证 RV32 汇编前端。
+核对测试数量与日志，不能仅凭评分脚本退出状态判断全部通过。
 
-现有代码仍使用第一阶段的独占会话和同步调用。设备指针为 VRAM 偏移；
-mmap 映射 64 KiB 一致性 DMA 暂存缓冲区。
-第二阶段将按大纲增加用户 AQL Queue、Doorbell、CP 与 Signal，
-并保留现有同步路径的回归验证。共享内存与 block 屏障、异步流和 GPU 地址隔离
-留待后续实现。阶段规格中的新增寄存器、共享区和接口不能作为已有设备能力。
-解释器支持 BF16、FP8 和 FP4 转换，尚未实现 FP16 转换。设备已明确禁止迁移。
+2026-10-07 的 17,953 个示例输出值、68 项运行时检查及两种架构各 21 项
+设备 QTest 属于第一阶段历史验收。解释器支持 BF16、FP8 和 FP4 转换，
+尚未实现 FP16 转换；设备不支持迁移。
