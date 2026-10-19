@@ -1,7 +1,7 @@
 <!--
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
-# 进阶实验一：类 CUDA 最小软件栈
+# QEMU GPGPU 软件栈：同步调用、AQL 与 GPUVM
 
 | 缩写 | 英文全称 | 中文含义 |
 | --- | --- | --- |
@@ -44,8 +44,16 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | VMID | Virtual Memory Identifier | 虚拟地址空间编号；第二阶段固定为 0 |
 | CPU | Central Processing Unit | 中央处理器 |
 | GNU / GCC | GNU's Not Unix / GNU Compiler Collection | GNU 工具集／GNU 编译器集合 |
+| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
+| BO | Buffer Object | 持有固定存储的缓冲对象 |
+| GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
+| VM | Virtual Memory | 本文指一个文件持有的 GPU 地址空间 |
+| TLB | Translation Lookaside Buffer | 地址翻译缓存 |
+| PTE / PDE | Page Table Entry / Page Directory Entry | 页表叶子项／页目录项 |
+| TTM | Translation Table Maps | 图形对象存储位置与迁移管理框架 |
+| VMA | Virtual Memory Area | CPU 进程的虚拟内存映射区域 |
 
-同步软件栈和第二阶段队列软件栈都放在 `software/gpgpu/`。同步模式下，
+前三阶段的软件栈都放在 `software/gpgpu/`。第三阶段入口见[GPUVM 对象与使用流程](#stage-three-gpuvm)。同步模式下，
 ARM64 Linux 应用通过 libgpgpu 提交数据和 Kernel，QEMU 中的 GPGPU 执行
 RV32 代码，再把结果传回应用。
 Host 在本文中指 Linux 客体里的应用；QEMU 进程运行在物理宿主机上。
@@ -214,6 +222,143 @@ CP 对应使用 `fence iorw, iorw`。默认 Signal 等待的约 `200 μs` 预算
 以上接口遵循[CP/MEC 第一版规格](<../../../CP_MEC 第一版规格.md>)中的实验
 协议，采用 HSAKMT 风格的职责划分，未实现完整 ROCr 或原版 libhsakmt 的 ABI。
 
+<a id="stage-three-gpuvm"></a>
+
+## 第三阶段：GPUVM 对象与使用流程
+
+应用先准备所有对象，再创建一条用户 Queue，反复发布 AQL，结束后统一关闭。
+例如向量加法的两个进程都把 X 放在 GPUVA `0x0050_0000`，各自的文件上下文
+绑定不同 VMID，页表指向不同存储，因此两个任务得到各自的结果。
+
+```text
+应用 A / B → 各自打开 /dev/dri/renderD128
+  → GEM handle → 固定 Host coherent / VRAM 存储
+  → MAP → 所属 VM 的三级页表 → 同步 TLB 失效
+  → 用户 Queue → MQD/HQD 中的 VMID 1 或 2
+  → CP：翻译 Ring、进度、描述对象、Signal、通知槽
+  → RV32 执行器：按同一 VMID 翻译代码、参数、数组
+  → 写回结果 → Signal → 通知槽 → IH → 消费回报
+  → 停止提交、排空并卸载 Queue → 结束事件
+  → UNMAP、失效确认、关闭 GEM → 解绑并归还 VMID
+```
+
+设备、RV64 固件、驱动和库共用 `include/gpgpu_vm.h`。新设备以
+`-global gpgpu.gpuvm=on` 启动，驱动使用 `queue_mode=2`，只通过 DRM render
+入口开放用户功能。`queue_mode=0/1` 分别保留同步与物理地址队列模式；它们
+使用 `/dev/gpgpu0`，设备关闭 GPUVM。模式或版本不匹配时拒绝装载，运行中不切换。
+
+**[BOUNDARY]** 本版沿用 RV64 裸机 CP 和 RV32 计算执行器。GPUVA 为 32 位，
+页大小为 4 KiB，三级索引为 2/9/9 位；管理 DMA 使用 VMID 0 直通，两个用户
+VMID 固定驻留。每 VM 最多一条 Queue，整个 Queue 寿命内冻结映射。CPU 同步
+写表并按 VMID 全量失效；没有 TTM、存储迁移、驱逐、换页、缺页重放或抢占。
+这套页表及寄存器是教学设计，不是 MI300X 硬件接口。
+
+### 分配权限、提交与关闭
+
+`gpgpuKmtOpen()` 查询 DRM 能力，随后普通 `gpgpuKmtAllocMemory()` 依次创建
+BO、建立 Host CPU 映射、选择 GPUVA 并执行整对象 MAP，全部成功才返回。
+对象的 `gpu_va` 交给 AQL、描述对象或 Kernel 参数；Host 的 `cpu` 指针只用于
+准备数据，旧字段 `host_address`、`vram_offset` 在 GPUVM 模式保持零。
+VRAM 上传、下载仍通过 `gpgpuKmtCopyMemory()` 按对象句柄和逻辑范围检查。
+
+代码使用 `gpgpuKmtAllocMemoryEx()` 指定 `GPGPU_VM_READ | GPGPU_VM_EXEC`；
+输入参数和数组可只读，输出、Ring、进度和 Signal 按需要读写。普通申请默认
+读写权限。扩展接口的 `fixed_va=0` 仍由库选址；指定地址用于隔离和重映射
+验证，不能绕过保留区、重叠、归属或权限检查。新对象的整个实际分配清零，
+CPU 和 GPU 不会看到上一个对象留下的内容。
+
+分配范围排除零页、控制页 `0x8000_0000～0x8000_0fff`、参数窗口
+`0x9000_0000～0x9000_ffff` 和内部通知页 `0xffff_f000～0xffff_ffff`。
+RV32 从控制页读取线程索引，`a0` 仍指向参数窗口；窗口内读取先换成参数
+GPUVA，再按任务 VMID 翻译。普通取指和数据访问不走原始 VRAM 旁路。
+
+Queue 创建前应备齐所有对象；事件创建只分配预映射通知页的 512 个槽之一。
+创建 Queue 后申请或释放映射返回忙，已有对象内容可按发布与等待协议更新。
+代码、参数和完成对象仍通过原 AQL 字段引用，提交不增加逐任务 ioctl。
+可运行示例是 `tests/test-gpuvm.c` 中的 `prepare()`、`submit()`、`verify()`。
+
+调用 `gpgpuKmtClose()` 前，应用先停止新提交并完成已预留包的发布。最后一次
+关闭会依次排空并销毁 Queue、销毁事件、撤销映射、解除 CPU 映射和关闭句柄；
+排空最多等待约 5 秒，超时或状态未知返回错误，相关对象继续保留。库跟踪调用方
+提供的内存、队列、事件结构，这些结构必须保持有效，直到显式销毁或最后关闭
+成功。关闭期间拒绝其他线程的新接口调用，直接写 Ring 的提交线程须由应用停下。
+
+`gpgpuKmtGetVmInfo()` 返回可分配区间和当前绑定数量；第三个 VM 在首次 MAP
+时得到资源不足，不驱逐已有 VM。`gpgpuKmtGetVmFault()` 返回队列首次故障的
+VMID、GPUVA、读写取指类型和阶段。故障只停止源队列，不回滚已完成的写入。
+应在销毁队列对象前读取诊断；不能确认访问结束时，不以超时替代安全卸载。
+
+> **[SPEC]** [GPUVM 第一版规格](<../../../GPUVM 第一版规格.md>)，2026-10-19 版：
+> 第 2～4 节规定对象、页表和上下文，第 5～7 节规定更新、通知与引用寿命；
+> 寄存器集中在[硬件手册第 17 章](<../../../QEMU_2026_GPGPU_硬件手册.html#gpuvm-registers>)。
+
+### 构建与复现 GPUVM
+
+目标内核仍为 `6.18.57-0-gpgpu-virt`，新增内置 `CONFIG_DRM=y`，保留
+`CONFIG_GPU_BUDDY=y`，不启用 TTM 或显示驱动。使用独立输出目录，保留原
+`build/gpgpu-kernel-cross/` 与 `build/gpgpu-linux-module/`。内核来源、固定
+工具链和缓存要求沿用[内核构建说明](#重建内核与运行队列测试)。
+
+从实验子仓库根目录运行：
+
+```sh
+python3 software/gpgpu/linux/kernel-build.py --build-mode cross --jobs 16 \
+  --output-dir build/gpgpu-kernel-gpuvm
+make -f Makefile.camp test-gpgpu-cp JOBS=4
+python3 software/gpgpu/linux/gpuvm-test.py --iommu none
+python3 software/gpgpu/linux/gpuvm-test.py --iommu smmuv3
+python3 software/gpgpu/linux/gpuvm-fault-test.py
+```
+
+两个 GPUVM 脚本串行占用同一开发盘。端到端脚本编译固件、驱动和测试程序，
+在 A57 客体装载 `queue_mode=2`，运行五组检查并卸载模块；同时检查实际
+IOMMU domain 和内核告警。故障脚本在独立源码副本中生成三个注入模块，
+分别改写管理结果或失效状态读取；生产接口没有故障注入入口。
+
+单独演示时，在相同 GPUVM 客体中安装固件、装载模块后运行
+`test-gpuvm`。程序逐项核对 2,051 个向量结果，运行两个真实进程使用相同
+GPUVA 的场景，再执行权限故障、重映射和重复关闭检查。测试的 Ring 发布和
+等待辅助函数与第二阶段相同，可沿上述四个函数讲解完整对象与访问关系。
+
+<a id="stage-three-validation"></a>
+
+### 第三阶段验收与代码快照
+
+2026-10-19，本轮实现以子仓库提交
+`c5acaf7a05a6852f94985197c15c2e84953fe991` 为起点，固定实现提交为
+[`3600ff795dde9069a6e4f1405f6950a61ea75faa`](https://github.com/hxfei-git/gpu-study-qemu/commit/3600ff795dde9069a6e4f1405f6950a61ea75faa)。
+验收代码归档为 `build/gpgpu-stage3-source.tar.gz`，逐文件 SHA-256 与起点提交
+记录在 `build/gpgpu-stage3-source.json`；运行结果索引为
+`build/gpgpu-stage3-validation.json`。归档保留提交前的验收材料，
+实现源文件与固定提交一致；`build/` 产物不进入 Git。
+
+- CP QTest 18/18：原 16 项及两组 GPUVM 检查，后者覆盖全部用户存储路径、
+  故障归属、另一 VM 继续运行、非法页表、部分写入、失效确认和复位范围。
+- GPUVM Linux 五组验收在 `none`、`smmuv3` 下各 5/5，卸载各 1/1；SMMUv3
+  实际 domain 为 `DMA`。覆盖完整跨页向量、双进程同地址隔离、故障退出、
+  撤销重映射、GEM 句柄与 CPU 映射寿命、256 轮句柄创建／关闭竞争，以及 VMID 回收复用。
+- 未知结果保留 3/3：映射管理请求返回初值、卸载请求返回未定义值、失效没有
+  ACK。每项均核对旧 VMID 保留、另一个名额可用、第三个申请失败，并在停止
+  设备后清理；内核无告警。GEM 对象独立持有 DRM 设备引用，异常保留期间
+  不会提前销毁其 CPU 映射管理结构。
+- 旧物理队列 5/5、卸载 1/1。单／双进程与 `none/smmuv3` 四种同步组合均
+  通过：每种装卸载 5/5、17,953 个示例输出、运行时检查 68/68、卸载重载 2/2。
+- 原 ARM64、RISC-V 设备 QTest 各 21/21；用户库及测试构建通过，汇编检查 4/4。
+
+GPUVM 日志与哈希在 `build/gpgpu-kernel-gpuvm/gpuvm/{none,smmuv3,retention}/`。
+CP 日志为 `build/gpgpu-gpuvm-cp-regression.log`；旧队列日志为
+`build/gpgpu-stage3-legacy-queue.log`，四种同步组合为
+`build/gpgpu-stage3-sync-{0,1}-{none,smmuv3}-{test,stack}.log`。
+结果记录同时检查客体退出码、逐组 PASS 和内核日志，不能仅凭命令退出成功判断。
+
+> **[SOURCE] 可选源码索引**
+>
+> 版本为固定实现提交 `3600ff795dde9069a6e4f1405f6950a61ea75faa`；验收文件散列另见本地 `gpgpu-stage3-source.json`：
+> - 页表、权限和失效：[hw/gpgpu/gpgpu_vm.c](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L31)，[第 31 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L31)、[第 63 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L63)、[第 176 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L176)。
+> - GEM 与映射寿命：[linux/gpgpu_gpuvm.c](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L40)，[第 40 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L40)、[第 123 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L123)、[第 304 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L304)、[第 346 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L346)、[第 377 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_gpuvm.c#L377)。
+> - 未知管理结果判定：[linux/gpgpu_queue.c](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_queue.c#L110)，[第 110～118 行](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/linux/gpgpu_queue.c#L110-L118)；已发布请求失败沿原保留路径处理。
+> - 用户可复现用例：[tests/test-gpuvm.c](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/tests/test-gpuvm.c#L44)，[第 44 行起](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/tests/test-gpuvm.c#L44)；设备注入见 [tests/qtest/gpgpu-gpuvm-test.inc，第 1 行起](https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/tests/qtest/gpgpu-gpuvm-test.inc#L1)。
+
 ## 运行时接口
 
 本节列出 `queue_mode=0` 使用的原同步接口。
@@ -373,12 +518,12 @@ amd64 依赖包。宿主机须已有 `gcc`、`g++`、`make`、`flex`、`bison`�
 其默认输出仍为 `build/gpgpu-kernel/`。
 
 原 Alpine 配置保存在 `linux/kernel/virt.aarch64.config`，实验增量见
-`linux/kernel/gpgpu.config`：启用内置伙伴分配器和固件加载，关闭未使用的
+`linux/kernel/gpgpu.config`：启用内置伙伴分配器、DRM/GEM 和固件加载，关闭未使用的
 设备、网络与文件系统模块，同时保留启动、PCI、IOMMU、virtio、9p 和
 ext4 依赖。交叉配置与已确认的 `linux/kernel/gpgpu.arm64.config` 核对，
-只允许编译器、汇编器和链接器的版本记录不同。当前差异仅为
-`CONFIG_CC_VERSION_TEXT` 和 `CONFIG_GCC_VERSION`，记录在输出目录的
-`cross-config-differences.json`；功能选项出现差异时脚本停止构建。
+只允许编译器、汇编器和链接器的版本记录不同；实际差异记录在输出目录的
+`cross-config-differences.json`，功能选项出现差异时脚本停止构建。第三阶段
+生成完整配置并使用独立输出目录，第二阶段已有内核产物保持原状。
 
 交叉输出中的构建工具使用宿主机指令集。导入 ARM64 客体时，
 `linux/kernel/guest-cross-prepare.sh` 用客体的 Alpine GCC `15.2.0`
@@ -406,7 +551,7 @@ make -C software/gpgpu firmware
 # 使用重建内核，在双进程、IOMMU=none 配置运行五组队列测试
 make -C software/gpgpu/linux queue-test BUILD_DIR="$PWD/build/gpgpu-kernel-cross"
 
-# 原 8 项 CP 回归和新增 8 项设备／固件队列检查
+# 16 项设备／固件队列检查及 2 组 GPUVM 检查
 make -f Makefile.camp test-gpgpu-cp JOBS=4
 ```
 
