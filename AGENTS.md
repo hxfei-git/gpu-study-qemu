@@ -95,7 +95,8 @@ Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 M
 见独立的 [GPGPU 硬件手册](<../QEMU_2026_GPGPU_硬件手册.html>)。
 
 当前执行模型是 RV64 原生 CP 运行裸机固件、RV32 计算执行器运行应用 Kernel。
-队列模式使用双进程设备、`IOMMU=none、VMID=0`，全设备共享两个用户队列名额。
+旧物理队列模式使用双进程设备、`IOMMU=none、VMID=0`；GPUVM 模式支持
+`none/smmuv3`，用户 VMID 为 1、2，每 VM 一条 Queue，全设备两个用户队列名额。
 CP Host 窗口支持对齐的 1/2/4/8 字节访问；计算线程通过
 `0x9000_0000～0x9000_ffff` 的只读窗口读取 Host 参数，`a0` 仍为 32 位。
 同步路径的参数继续位于 VRAM。末尾 4 MiB VRAM 固定供固件使用，
@@ -104,7 +105,7 @@ CP Host 窗口支持对齐的 1/2/4/8 字节访问；计算线程通过
 HQD、8 字节 Doorbell、IH、分段执行器及状态确认均已接入。
 成功路径依次发布 Signal、通知槽、IH 记录、`INVALID` Header 和消费进度；
 默认等待先主动检查约 `200 μs`，再阻塞并复查 Signal，支持多个等待者。
-错误保留首次记录，未知是否停止访问的对象继续保留；多 VMID、抢占、运行中
+错误保留首次记录，未知是否停止访问的对象继续保留；抢占、运行中
 复位恢复、共享内存与组内屏障、完整 ROCr 运行时仍属后续范围。
 
 2026-10-19 已提交的验收记录包含 CP QTest 16/16、Linux 队列 5/5、
@@ -114,16 +115,29 @@ HQD、8 字节 Doorbell、IH、分段执行器及状态确认均已接入。
 [软件栈说明](software/gpgpu/README.md#第二阶段本轮验证状态)。
 
 同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
-MQD 及相关引用，尚待修复。当前结论是核心实现基本符合规格，不能仅凭既有
-验收通过判定完全符合。证据、复核验证范围和待修项统一见
+MQD 及相关引用。本轮已修复，并通过三个独立注入场景核对异常保留和设备停止后
+的安全回收。修复前证据及当前验证入口统一见
 [大纲复核记录](<../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)。
 
 `hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支，
 `hxfei-qemu` 保留早期开发历史。软件栈位于 `software/gpgpu/`；
 修改接口前阅读其中的 `README.md` 和 `WORK_ITEMS.md`。
-共享队列协议为 `include/gpgpu_queue.h`，驱动接口为 `include/gpgpu_uapi.h`，
-HSAKMT 风格库位于 `hsakmt/`。模块参数 `queue_mode=0/1` 选择互斥的
-同步模式或队列模式；原同步路径继续回归。
+共享队列协议为 `include/gpgpu_queue.h`，旧驱动接口为 `include/gpgpu_uapi.h`；
+GPUVM 编码和 DRM 接口分别为 `include/gpgpu_vm.h`、`include/gpgpu_drm.h`。
+HSAKMT 风格库位于 `hsakmt/`。模块参数 `queue_mode=0/1/2` 选择互斥的
+同步、物理队列和 GPUVM 模式；前两种保留 `/dev/gpgpu0`，第三种使用 DRM render
+node，设备须以 `-global gpgpu.gpuvm=on` 启动。
+
+第三阶段已实现 DRM/GEM 固定存储、32 位 GPUVA、三级 4 KiB 页表、两个用户
+VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
+`0x8000_0000～0x8000_0fff`；先准备全部对象，再建 Queue，队列存活期间冻结映射。
+不接入 TTM、迁移、驱逐、换页或运行中恢复。CPU 映射和 GEM 对象独立保护存储与
+设备寿命；未知完成结果或失效未确认时保留资源。GPUVM 内核输出独立放在
+`build/gpgpu-kernel-gpuvm/`，保留原环境。
+
+第三阶段 CP 检查 18/18；GPUVM 在 `none/smmuv3` 下各 5/5、卸载各 1/1；
+未知结果保留 3/3，内核无告警。旧队列和四种同步组合也已回归。
+固定实现提交、复现命令和实际日志见[软件栈说明](software/gpgpu/README.md#stage-three-validation)。
 
 运行 `make -f Makefile.camp test-gpgpu-stack` 验证原 ARM64 Linux 软件栈，
 运行 `make -f Makefile.camp test-gpgpu-cp JOBS=4` 验证 CP；

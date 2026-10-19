@@ -28,7 +28,12 @@
 | MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
 | KIQ / HIQ | Kernel Interface Queue / HSA Interface Queue | 内核接口／HSA 接口管理队列 |
 | IH | Interrupt Handler | 本实验的完成与错误通知模块 |
-| VMID | Virtual Memory Identifier | 虚拟地址空间编号；本阶段固定为 0 |
+| VMID | Virtual Memory Identifier | 虚拟地址空间编号；第二阶段固定为 0 |
+| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
+| GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
+| VM | Virtual Memory | GPU 地址空间 |
+| TLB | Translation Lookaside Buffer | 地址翻译缓存 |
+| TTM | Translation Table Maps | 图形对象存储位置与迁移管理框架 |
 
 第一阶段六项已完成，按下列顺序单独提交。提交正文说明做了什么、核心思想、
 完成方法和验证结果。运行命令、架构与能力覆盖见 [README.md](README.md)。
@@ -54,6 +59,29 @@
 2026-10-07 验收：三个 demo 的 17,953 个输出全部正确，MSI-X 增量为
 kernel=3、DMA=21、error=0；驱动与运行时检查 68/68，卸载重载 2/2，
 RISC-V 和 ARM64 的 GPGPU QTest 均为 21/21（其中评分测试 17/17）。
+
+## 第三阶段实现与验证
+
+2026-10-19 已完成固定存储 GPUVM。对象、页表、VMID、全部用户存储访问、
+同步失效和安全退出按[GPUVM 第一版规格](<../../../GPUVM 第一版规格.md>)接入；
+后续计划仍在父目录实验大纲维护。
+
+```text
+DRM 文件 → GEM 对象与 GPUVA 映射 → 用户 VMID
+  → CP / 执行器翻译访问 → 结果与通知
+  → 卸载队列 → 失效并解除映射 → 回收引用、存储和 VMID
+```
+
+本轮先修复未知管理结果码校验，再完成 DRM/GEM、三级 4 KiB 页表、两个用户
+VMID 和全部访存接入。模式 2 使用 DRM render node，保留原模式 0/1。
+RV32 控制页按用户选择保留；每 VM 一条 Queue，Queue 存活期间冻结映射，
+不接入 TTM、迁移、换页或抢占。异常保留的 GEM 对象独立持有 DRM 设备引用，
+直到设备访问停止后再回收。
+
+CP 18/18；GPUVM 的 `none/smmuv3` 各 5/5，卸载各 1/1；未知管理结果及失效
+未确认的保留检查 3/3。旧物理队列与单／双进程、`none/smmuv3` 四种同步组合
+回归通过。固定提交、命令、测试覆盖及验收归档统一见
+[README 的第三阶段验收](README.md#stage-three-validation)。
 
 ## 固定的接口与范围
 
