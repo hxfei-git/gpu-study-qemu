@@ -1,6 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "qemu/osdep.h"
-#include "gpgpu.h"
+#include "gpgpu_doorbell.h"
+#include "gpgpu_hqd.h"
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * gpgpu_doorbell_read() - 处理 Doorbell 读访问
@@ -25,21 +27,20 @@ static void gpgpu_doorbell_write(void *opaque, hwaddr addr, uint64_t val, unsign
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return;
 	}
-	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++) {
-		uint32_t control = s->hqd[slot][GPGPU_HQD_DOORBELL / 4];
-
-		if (s->hqd[slot][GPGPU_HQD_ACTIVE / 4] && (control & GPGPU_DOORBELL_ENABLE) &&
-		    (control & GPGPU_DOORBELL_OFFSET_MASK) == addr) {
-			/* 固件持续轮询；通知不修改共享 W/R。 */
-			s->doorbell_pending[slot] = true;
-		}
-	}
+	gpgpu_hqd_notify(s, addr);
 }
 
-const MemoryRegionOps gpgpu_doorbell_ops = {
+static const MemoryRegionOps gpgpu_doorbell_ops = {
 	.read = gpgpu_doorbell_read,
 	.write = gpgpu_doorbell_write,
 	.endianness = DEVICE_LITTLE_ENDIAN,
 	.valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 	.impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 };
+
+void gpgpu_doorbell_init(GPGPUState *s)
+{
+	memory_region_init_io(&s->doorbell.mmio, OBJECT(s), &gpgpu_doorbell_ops, s,
+			      "gpgpu-doorbell", GPGPU_DOORBELL_BAR_SIZE);
+	pci_register_bar(PCI_DEVICE(s), 4, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->doorbell.mmio);
+}

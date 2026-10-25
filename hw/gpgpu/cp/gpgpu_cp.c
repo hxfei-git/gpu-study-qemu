@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later
  * 原生 CP 的架构无关控制寄存器
  */
 
 #include "qemu/osdep.h"
-#include "gpgpu.h"
+#include "gpgpu_cp.h"
+#include "gpgpu_cp_window.h"
+#include "hw/gpgpu/memory/gpgpu_vram.h"
+#include "hw/gpgpu/memory/gpgpu_vm.h"
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * gpgpu_attach_cp() - 连接板级原生 CP 的控制入口
@@ -13,9 +17,9 @@
  */
 void gpgpu_attach_cp(GPGPUState *s, GPGPUCPSetState set_state, void *opaque)
 {
-	assert(set_state && !s->cp_set_state);
-	s->cp_set_state = set_state;
-	s->cp_opaque = opaque;
+	assert(set_state && !s->cp.set_state);
+	s->cp.set_state = set_state;
+	s->cp.opaque = opaque;
 	gpgpu_cp_reset(s);
 }
 
@@ -26,12 +30,12 @@ void gpgpu_attach_cp(GPGPUState *s, GPGPUCPSetState set_state, void *opaque)
  */
 void gpgpu_cp_reset(GPGPUState *s)
 {
-	if (!s->cp_set_state)
+	if (!s->cp.set_state)
 		return;
 
-	s->cp_reset_hold = true;
-	s->cp_reset_vector = 0;
-	s->cp_set_state(s->cp_opaque, true, 0);
+	s->cp.reset_hold = true;
+	s->cp.reset_vector = 0;
+	s->cp.set_state(s->cp.opaque, true, 0);
 }
 
 /*
@@ -41,14 +45,14 @@ void gpgpu_cp_reset(GPGPUState *s)
  */
 uint32_t gpgpu_cp_read(GPGPUState *s, hwaddr addr)
 {
-	if (!s->cp_set_state)
+	if (!s->cp.set_state)
 		return 0;
 
 	switch (addr) {
 	case GPGPU_REG_CP_CTRL:
-		return GPGPU_CP_PRESENT | (s->cp_reset_hold ? GPGPU_CP_RESET_HOLD : 0);
+		return GPGPU_CP_PRESENT | (s->cp.reset_hold ? GPGPU_CP_RESET_HOLD : 0);
 	case GPGPU_REG_CP_RESET_VECTOR:
-		return s->cp_reset_vector;
+		return s->cp.reset_vector;
 	default:
 		return 0;
 	}
@@ -62,7 +66,7 @@ uint32_t gpgpu_cp_read(GPGPUState *s, hwaddr addr)
  */
 void gpgpu_cp_write(GPGPUState *s, hwaddr addr, uint32_t val)
 {
-	if (!s->cp_set_state)
+	if (!s->cp.set_state)
 		return;
 
 	switch (addr) {
@@ -70,22 +74,40 @@ void gpgpu_cp_write(GPGPUState *s, hwaddr addr, uint32_t val)
 		bool reset_hold = val & GPGPU_CP_RESET_HOLD;
 
 		/* 重复写入不改变 PC，不再次启动 CPU。 */
-		if (reset_hold != s->cp_reset_hold) {
-			s->cp_set_state(s->cp_opaque, reset_hold, s->cp_reset_vector);
-			s->cp_reset_hold = reset_hold;
-			s->cp_started |= !reset_hold;
+		if (reset_hold != s->cp.reset_hold) {
+			s->cp.set_state(s->cp.opaque, reset_hold, s->cp.reset_vector);
+			s->cp.reset_hold = reset_hold;
+			s->cp.started |= !reset_hold;
 		}
 		break;
 	}
 	case GPGPU_REG_CP_RESET_VECTOR:
-		if (!s->cp_reset_hold || (val & 1) || !gpgpu_vram_contains(s, val, 2)) {
+		if (!s->cp.reset_hold || (val & 1) || !gpgpu_vram_contains(s, val, 2)) {
 			gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 			return;
 		}
-		s->cp_set_state(s->cp_opaque, true, val);
-		s->cp_reset_vector = val;
+		s->cp.set_state(s->cp.opaque, true, val);
+		s->cp.reset_vector = val;
 		break;
 	default:
 		break;
 	}
+}
+
+void gpgpu_cp_device_reset(GPGPUState *s)
+{
+	gpgpu_cp_reset(s);
+	s->cp.started = false;
+}
+
+void gpgpu_cp_reset_access(GPGPUState *s)
+{
+	/* 保持原生 CPU 复位中的清理时机，不能提前到跨线程回调之前。 */
+	gpgpu_cp_window_reset(s);
+	gpgpu_vm_reset_firmware(s);
+}
+
+bool gpgpu_cp_host_configurable(GPGPUState *s)
+{
+	return s->cp.reset_hold && !s->cp.started;
 }

@@ -1,13 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later
  * QEMU 教学用 GPGPU 设备
  * Copyright (c) 2024-2025
  */
 
 #include "qemu/osdep.h"
+#include "gpgpu_irq.h"
+#include "gpgpu_ih.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
-#include "gpgpu.h"
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * gpgpu_update_irq() - 按使能状态发送 PCI 中断
@@ -17,7 +19,7 @@
 static void gpgpu_update_irq(GPGPUState *s, GPGPUIrq events)
 {
 	PCIDevice *pdev = PCI_DEVICE(s);
-	GPGPUIrq pending = s->irq_status & s->irq_enable;
+	GPGPUIrq pending = s->irq.status & s->irq.enable;
 
 	events &= pending;
 	pci_set_irq(pdev, pending && !msix_enabled(pdev) && !msi_enabled(pdev));
@@ -42,20 +44,8 @@ static void gpgpu_update_irq(GPGPUState *s, GPGPUIrq events)
  */
 void gpgpu_raise_irq(GPGPUState *s, GPGPUIrq events)
 {
-	s->irq_status |= events;
+	s->irq.status |= events;
 	gpgpu_update_irq(s, events);
-}
-
-/*
- * gpgpu_set_error() - 保存全局错误并发出错误事件
- *
- * 错误位按位累积，同时设置 GLOBAL_STATUS 的 ERROR 标志。
- */
-void gpgpu_set_error(GPGPUState *s, GPGPUError error)
-{
-	s->error_status |= error;
-	s->global_status |= GPGPU_STATUS_ERROR;
-	gpgpu_raise_irq(s, GPGPU_IRQ_ERROR);
 }
 
 /*
@@ -67,9 +57,9 @@ uint32_t gpgpu_irq_read(GPGPUState *s, hwaddr addr)
 {
 	switch (addr) {
 	case GPGPU_REG_IRQ_ENABLE:
-		return s->irq_enable;
+		return s->irq.enable;
 	case GPGPU_REG_IRQ_STATUS:
-		return s->irq_status;
+		return s->irq.status;
 	default:
 		return 0;
 	}
@@ -84,18 +74,18 @@ void gpgpu_irq_write(GPGPUState *s, hwaddr addr, uint32_t val)
 {
 	switch (addr) {
 	case GPGPU_REG_IRQ_ENABLE: {
-		GPGPUIrq old = s->irq_enable;
+		GPGPUIrq old = s->irq.enable;
 
-		s->irq_enable = val &
+		s->irq.enable = val &
 			(GPGPU_IRQ_KERNEL_DONE | GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR |
 			 GPGPU_IRQ_IH);
-		if ((s->irq_enable & GPGPU_IRQ_IH) && s->ih.wptr != s->ih.rptr)
-			s->irq_status |= GPGPU_IRQ_IH;
-		gpgpu_update_irq(s, s->irq_enable & ~old);
+		if ((s->irq.enable & GPGPU_IRQ_IH) && gpgpu_ih_pending(s))
+			s->irq.status |= GPGPU_IRQ_IH;
+		gpgpu_update_irq(s, s->irq.enable & ~old);
 		break;
 	}
 	case GPGPU_REG_IRQ_ACK:
-		s->irq_status &= ~val;
+		s->irq.status &= ~val;
 		gpgpu_update_irq(s, 0);
 		if (val & GPGPU_IRQ_IH)
 			gpgpu_ih_refresh_irq(s);
@@ -112,8 +102,8 @@ void gpgpu_irq_write(GPGPUState *s, hwaddr addr, uint32_t val)
  */
 void gpgpu_irq_clear(GPGPUState *s)
 {
-	s->irq_enable = 0;
-	s->irq_status = 0;
+	s->irq.enable = 0;
+	s->irq.status = 0;
 	pci_set_irq(PCI_DEVICE(s), 0);
 }
 
