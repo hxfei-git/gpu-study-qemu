@@ -14,8 +14,8 @@ esac
 
 output_dir="/mnt/gpgpu-build/$stage_name"
 test -d "$output_dir"
-shared_source=/mnt/gpgpu-src
 shared_stack=/mnt/gpgpu-stack
+shared_source="$shared_stack/linux"
 if ! test -d "$shared_stack/include"; then
     mkdir -p "$shared_stack"
     mount -t 9p -o trans=virtio,version=9p2000.L,ro \
@@ -37,7 +37,7 @@ for source_file in "$shared_source/Makefile" "$shared_source/gpgpu_pci_main.c" \
     if cmp -s "$source_file" "$destination"; then
         continue
     fi
-    # Use guest timestamps; retain existing timestamps for unchanged content.
+    # 内容相同时保留原时间戳，避免在客体中重复编译未改动的文件。
     cp "$source_file" "$destination"
     changed_files=$((changed_files + 1))
 done

@@ -5,7 +5,8 @@
 set -eu
 jobs=${1:?需要编译并发数}
 shared=/mnt/gpgpu-build
-materials=/mnt/gpgpu-src/kernel
+materials=/mnt/gpgpu-stack/linux/kernel
+scripts=/mnt/gpgpu-src/kernel
 source_dir=/root/gpgpu-kernel-source
 build_dir=/root/gpgpu-kernel-output
 
@@ -57,4 +58,4 @@ grep -q '[[:space:]]gpu_buddy_init[[:space:]]' "$build_dir/Module.symvers"
 make -C "$source_dir" O="$build_dir" ARCH=arm64 \
     INSTALL_MOD_STRIP=1 modules_install
 
-sh "$materials/guest-export.sh" "$jobs" native "$release"
+sh "$scripts/guest-export.sh" "$jobs" native "$release"
