@@ -171,11 +171,11 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
   `tests/queue_helpers.c` 完成原子取号、Header 发布、Doorbell 和默认
   Signal 等待，不增加逐任务 ioctl。`tests/test-queue.c` 按五组验证计算、
   并发、等待、错误和资源寿命，包含多进程管理及异常退出后的保留检查。
-- `linux/kernel/` 与 `linux/kernel-build.py` 保存独立内核重建材料和入口。
+- `linux/kernel/` 与 `scripts/kernel-build.py` 保存独立内核重建材料和入口。
   目标为 Linux `6.18.57-0-gpgpu-virt`、`GPU_BUDDY=y`。默认 `--build-mode cross`
   使用固定 Arm GNU Toolchain `15.2.Rel1`（GCC `15.2.1`）及 `--jobs 16`，
   输出到 `build/gpgpu-kernel-cross/`；功能开关保持一致，仅允许工具版本记录不同。
-  开发文件导入 ARM64 客体后，由 `guest-cross-prepare.sh` 原生重编构建工具
+  开发文件导入 ARM64 客体后，由 `scripts/guest/kernel/guest-cross-prepare.sh` 原生重编构建工具
   和 GCC 插件，保留配置、生成头及 `Module.symvers`。该客体默认使用 4 个
   虚拟 CPU、4 GiB 内存和 32 GiB 磁盘，资源参数见 README。
   `--build-mode native` 仍使用原 `build/gpgpu-kernel/` 输出，原发行版环境也保留。

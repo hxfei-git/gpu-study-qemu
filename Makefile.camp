@@ -61,7 +61,7 @@ help:
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
 	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
 	@echo "  test-gpgpu-remote-iommu  运行远端 GPGPU 的两项 SMMUv3 DMA QTest"
-	@echo "  test-gpgpu-cp      运行 RV64 CP、Host 访存与消息交错的八项 QTest"
+	@echo "  test-gpgpu-cp      运行 RV64 CP、队列、固件与 GPUVM 的十八项 QTest"
 	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"

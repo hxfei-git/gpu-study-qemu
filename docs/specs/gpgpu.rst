@@ -238,7 +238,7 @@ MSI-X 表和屏蔽状态在两端同步，计算、DMA 完成和错误通知保�
     make -C software/gpgpu/linux prepare
     make -C software/gpgpu/linux run REMOTE=1 IOMMU=smmuv3
 
-交互入口由 ``scripts/gpgpu_remote.py`` 启动 B，再连接 A，并保存两端命令和
+交互入口由 ``software/gpgpu/scripts/gpgpu_remote.py`` 启动 B，再连接 A，并保存两端命令和
 设备日志。Host 退出、启动超时和异常会清理两个进程。本版不支持断线重连和迁移，
 也不扩展 CP 发起异步 Host DMA 的功能。
 
@@ -505,8 +505,9 @@ Linux 驱动将 ``dma_alloc_coherent()`` 返回的 DMA 地址写入系统内存�
     BAR0 系统 DMA 地址 → PCI 地址空间 → SMMUv3 → 客体 RAM 暂存区
     BAR0 显存偏移      → GPGPU VRAM
 
-``hw/gpgpu/gpgpu_dma.c`` 使用 ``pci_dma_read/write()`` 并检查
-``MemTxResult``。未映射访问使 ``DMA_STATUS`` 为 ERROR，置位
+``hw/gpgpu/memory/gpgpu_dma.c`` 通过同目录的 ``gpgpu_host.c`` 访问 Host，
+由既有 PCI/vfio-user 路径处理 DMA，并检查 ``MemTxResult``。
+未映射访问使 ``DMA_STATUS`` 为 ERROR，置位
 ``ERROR_STATUS.DMA_FAULT`` 并报告错误中断，不发送 DMA 完成通知。
 向 ``ERROR_STATUS`` 和 ``IRQ_ACK`` 写 1 清除锁存状态后，可用合法映射
 重新提交描述符；不需要重置设备或重建页表。
@@ -866,33 +867,30 @@ Implementation Notes
 QEMU Device Implementation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The device is implemented in ``hw/gpgpu/gpgpu.c`` with the following components:
+``hw/gpgpu/gpgpu.c`` 注册并组装单个 PCI 设备，编排初始化、复位和清理。
+``gpgpu_mmio.c`` 将寄存器访问转交所属模块；``cp/`` 管理 CP 控制、访存窗口、
+HQD 和 Doorbell，``memory/`` 管理 VRAM、GPUVM、描述符 DMA 及 Host 访问，
+``interrupt/`` 管理 IH 记录发布和 PCI 中断。
 
-- ``GPGPUState``: Main device state structure
-- ``gpgpu_mmio_ops``: MMIO operations for BAR 0
-- ``gpgpu_vram_ops``: Memory operations for BAR 2
-- ``gpgpu_realize()``: Device initialization
-- ``gpgpu_dispatch_kernel()``: Kernel execution simulation
+``gpgpu.h`` 声明设备类型和设备级接口，完整 ``GPGPUState`` 仅在
+``gpgpu_internal.h`` 中组合。各模块在自己的头文件中声明操作和查询接口；
+RISC-V 板级代码通过这些接口取得共享 VRAM、连接 CP 并处理 CPU 复位。
 
 Compute Unit Simulation
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Each compute unit maintains:
+计算实现在 ``hw/gpgpu/compute/``。Dispatch 保存派发参数、持有任务句柄并发布
+执行结果；Core 推进工作组、warp 和累计预算；指令模块执行一个 lane 的一条
+RV32 指令，再由计算访存模块处理取指、数据读写、只读参数窗口及线程控制窗口。
 
-- Warp schedulers
-- Register files (per thread)
-- Program counters (per warp, with divergence stack)
-- Shared memory
-
-The simulation can operate in:
-
-1. **Functional mode**: Execute threads sequentially for correctness
-2. **Cycle-approximate mode**: Model warp scheduling and memory latency
+执行上下文区分同步、物理队列和 GPUVM 队列三种模式。每个 lane 保存自己的
+寄存器和 PC；同步路径一次执行完整网格，队列路径由定时器分段推进。
+当前没有按 CU 分配任务的调度器、并行执行模式或组内共享内存与屏障。
 
 Future Extensions
 -----------------
 
-- Command queue support (via BAR 4 doorbells)
+- 抢占与运行中复位恢复
 - Multiple kernel concurrent execution
 - Texture sampling units
 - L1/L2 cache simulation
