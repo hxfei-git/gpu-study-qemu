@@ -75,18 +75,20 @@ Linux 客体
                   │ PCI DMA：客体 RAM ↔ VRAM
                   ▼
 QEMU（gpgpu.c 注册 PCI 设备和 BAR）
-  hw/gpgpu/gpgpu_regs.c：BAR0 寄存器路由
-                  ├─ gpgpu_dma.c：客体 RAM ↔ VRAM
-                  └─ gpgpu_dispatch.c：读取代码、Args、grid/block
+  hw/gpgpu/gpgpu_mmio.c：BAR0 寄存器路由
+                  ├─ memory/gpgpu_dma.c：客体 RAM ↔ VRAM
+                  └─ compute/gpgpu_dispatch.c：检查并保存派发参数
                   ▼
-  hw/gpgpu/gpgpu_core.c：RV32 执行器
-                  │ 逐线程读写 VRAM
+  compute/gpgpu_core.c：推进工作组、warp 和执行预算
+                  → gpgpu_isa.c：逐 lane 解释 RV32 指令
+                  → gpgpu_memory.c：取指、读取参数和访问数据
+                  │ 通过 memory/ 的接口访问存储
                   ▼
-  kernel 完成 → gpgpu_irq.c：MSI-X → 驱动 completion → ioctl 返回
+  kernel 完成 → interrupt/gpgpu_irq.c：MSI-X → 驱动 completion → ioctl 返回
 ```
 
 双进程设备中的原生 CP 使用 `qemu-system-riscv64` 执行 RV64 裸机固件；
-应用 Kernel 继续由 `gpgpu_core.c` 的 RV32 计算执行器运行，计算线程的
+应用 Kernel 继续由 `compute/` 下的 RV32 计算执行器运行，计算线程的
 寄存器和 `a0` 仍为 32 位。同步路径把参数上传到 VRAM，队列路径则把完整的
 64 位 Host 参数地址交给执行器，计算线程用 `a0 = 0x9000_0000` 读取只读
 参数窗口。窗口检查对齐的 4 字节读取及本次参数范围。
@@ -96,11 +98,12 @@ QEMU（gpgpu.c 注册 PCI 设备和 BAR）
 组合回归均已通过，结果见下文。下述同步模式的独占会话、暂存区和超时复位
 继续用于第一阶段回归。
 
-阅读设备代码时，先从 `gpgpu_regs.c` 找到寄存器所属模块，再沿该模块的
-读写函数追踪操作。`gpgpu_regs.h` 保存寄存器偏移和枚举，`gpgpu.h` 保存
-设备状态与模块接口。`dma.status` 使用 `GPGPUDMAStatus` 枚举，取值为
+阅读设备代码时，先从 `gpgpu_mmio.c` 找到寄存器所属模块，再沿该模块的
+读写函数追踪操作。`gpgpu_regs.h` 保存寄存器偏移和枚举，`gpgpu.h` 声明
+设备类型与设备级接口；完整设备状态由 `gpgpu_internal.h` 组合，各模块在
+自己的头文件中声明接口。`dma.status` 使用 `GPGPUDMAStatus` 枚举，取值为
 IDLE、BUSY、COMPLETE、ERROR；中断和全局状态使用可组合的枚举位标志。
-BAR4 的 8 字节 Doorbell 回调位于 `gpgpu_doorbell.c`。
+BAR4 的 8 字节 Doorbell 回调位于 `cp/gpgpu_doorbell.c`。
 
 在同步模式中，驱动匹配 PCI `1234:1337`，申请 BAR0、BAR2 和 BAR4。
 BAR0 用于控制、DMA 和 Kernel 派发，BAR2 表示设备显存资源；BAR4 在同步
@@ -205,9 +208,10 @@ CP 对应使用 `fence iorw, iorw`。默认 Signal 等待的约 `200 μs` 预算
 进程异常退出后，驱动保留仍可能被设备访问的上下文和内存；本版通过设备
 移除停止访问后清理，不实现运行中复位恢复、取消预留空洞或强制中止。
 
-代码沿现有职责组织：设备的 HQD、IH 和参数访问分别位于
-`hw/gpgpu/gpgpu_hqd.c`、`gpgpu_ih.c`、`gpgpu_params.c`；分发和 RV32 执行器
-仍使用原有文件。`firmware/` 将启动与异常、Host 访存、管理命令、AQL 收尾
+代码沿功能分目录组织：设备的 HQD、IH 和参数访问分别位于
+`hw/gpgpu/cp/gpgpu_hqd.c`、`hw/gpgpu/interrupt/gpgpu_ih.c` 和
+`hw/gpgpu/compute/gpgpu_memory.c`；分发和 RV32 执行器同属 `compute/`。
+`firmware/` 将启动与异常、Host 访存、管理命令、AQL 收尾
 分开。驱动的 PCI 入口改为 `linux/gpgpu_pci_main.c`，与 `gpgpu_memory.c`、
 `gpgpu_queue.c`、`gpgpu_event.c` 共同链接成原名 `gpgpu_pci.ko`。
 `include/gpgpu_queue.h` 集中定义 MQD、AQL、Signal、IH 和寄存器编码，
@@ -302,17 +306,19 @@ VMID、GPUVA、读写取指类型和阶段。故障只停止源队列，不回�
 从实验子仓库根目录运行：
 
 ```sh
-python3 software/gpgpu/linux/kernel-build.py --build-mode cross --jobs 16 \
+python3 software/gpgpu/scripts/kernel-build.py --build-mode cross --jobs 16 \
   --output-dir build/gpgpu-kernel-gpuvm
 make -f Makefile.camp test-gpgpu-cp JOBS=4
-python3 software/gpgpu/linux/gpuvm-test.py --iommu none
-python3 software/gpgpu/linux/gpuvm-test.py --iommu smmuv3
-python3 software/gpgpu/linux/gpuvm-fault-test.py
+make -C software/gpgpu/linux test-gpuvm IOMMU=none
+make -C software/gpgpu/linux test-gpuvm IOMMU=smmuv3
+make -C software/gpgpu/linux test-gpuvm-fault
 ```
 
-两个 GPUVM 脚本串行占用同一开发盘。端到端脚本编译固件、驱动和测试程序，
+两个 GPUVM 目标共用 `scripts/gpgpu_linux.py`，串行占用同一开发盘。
+默认目录为 `build/gpgpu-kernel-gpuvm/`，可用 `GPUVM_BUILD_DIR` 指定其他目录。
+端到端目标编译固件、驱动和测试程序，
 在 A57 客体装载 `queue_mode=2`，运行五组检查并卸载模块；同时检查实际
-IOMMU domain 和内核告警。故障脚本在独立源码副本中生成三个注入模块，
+IOMMU domain 和内核告警。故障目标调用独立客体脚本，在源码副本中生成三个注入模块，
 分别改写管理结果或失效状态读取；生产接口没有故障注入入口。
 
 单独演示时，在相同 GPUVM 客体中安装固件、装载模块后运行
@@ -450,7 +456,7 @@ Host 构建需要 C 编译器、ar 和 Python 3；QEMU 依赖见仓库 README。
 内核开发包。之后使用保存的 developer.raw 增量编译，无需重新安装客体。
 客体程序由 ARM64 gcc 原生构建；RV32 kernel 使用同一份汇编源码生成。
 
-`module-test.py` 的各入口接受 `--iommu none|smmuv3`。启用时使用
+`scripts/gpgpu_linux.py` 的同步验收与交互入口接受 `--iommu none|smmuv3`。启用时使用
 `-machine virt,gic-version=3,iommu=smmuv3,default-bus-bypass-iommu=off`，
 在原内核参数后追加 `iommu.passthrough=0 iommu.strict=1`。自举和模块编译
 继续使用原配置；模式不进入环境指纹，切换模式不会重建环境。
@@ -489,7 +495,7 @@ done
 构建沿用已保存的 Alpine `6.18.57-0-virt` 开发盘及匹配的软件包缓存。
 `--base-environment` 默认指向 `build/gpgpu-linux-module/`，其中须包含原
 `developer.raw`、环境记录和通过清单校验的 `apk-cache/`。通用的
-`module-test.py prepare` 会按运行时的软件源取包，未来重跑不保证得到这一
+`scripts/gpgpu_linux.py prepare` 会按运行时的软件源取包，未来重跑不保证得到这一
 固定版本；重建时应保留并使用已核对的原环境。
 
 交叉流程按 x86_64 Ubuntu 24.04 宿主机准备，使用 `dpkg-deb` 解包固定的
@@ -498,7 +504,7 @@ amd64 依赖包。宿主机须已有 `gcc`、`g++`、`make`、`flex`、`bison`�
 `e2fsprogs`。脚本只按 `cross-host-dependencies.json` 补充 11 个依赖包，
 上述基本工具由宿主环境提供。
 
-`linux/kernel-build.py` 默认使用 `--build-mode cross`，在物理宿主机上
+`scripts/kernel-build.py` 默认使用 `--build-mode cross`，在物理宿主机上
 交叉编译 Linux `6.18.57-0-gpgpu-virt`，再将产物导入独立 ARM64 客体：
 
 ```text
@@ -526,7 +532,7 @@ ext4 依赖。交叉配置与已确认的 `linux/kernel/gpgpu.arm64.config` 核�
 生成完整配置并使用独立输出目录，第二阶段已有内核产物保持原状。
 
 交叉输出中的构建工具使用宿主机指令集。导入 ARM64 客体时，
-`linux/kernel/guest-cross-prepare.sh` 用客体的 Alpine GCC `15.2.0`
+`scripts/guest/kernel/guest-cross-prepare.sh` 用客体的 Alpine GCC `15.2.0`
 定向重编 `fixdep`、`conf`、`modpost`、`mk_elfconfig`、`genksyms`、签名工具
 和已启用的 GCC 插件，并修复源码、输出及依赖文件中的绝对路径。脚本不重新
 配置或编译内核；转换前后核对 `.config`、生成头、`Module.symvers` 和模块
@@ -543,7 +549,7 @@ ext4 依赖。交叉配置与已确认的 `linux/kernel/gpgpu.arm64.config` 核�
 
 ```sh
 # 默认流程：宿主机交叉编译，再导入独立 ARM64 客体
-python3 software/gpgpu/linux/kernel-build.py --build-mode cross --jobs 16
+python3 software/gpgpu/scripts/kernel-build.py --build-mode cross --jobs 16
 
 # 独立构建 RV64 裸机固件，产物为 build/gpgpu-firmware/gpgpu-cp.bin
 make -C software/gpgpu firmware
