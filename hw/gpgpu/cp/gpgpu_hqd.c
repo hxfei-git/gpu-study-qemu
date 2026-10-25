@@ -1,6 +1,10 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "qemu/osdep.h"
-#include "gpgpu.h"
+#include "gpgpu_hqd.h"
+#include "gpgpu_cp.h"
+#include "hw/gpgpu/memory/gpgpu_vm.h"
+#include "software/gpgpu/include/gpgpu_queue.h"
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * hqd_field() - 判断槽内偏移是否为已实现的 HQD 字段
@@ -78,7 +82,7 @@ uint32_t gpgpu_hqd_read(GPGPUState *s, unsigned int slot, hwaddr addr, unsigned 
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return 0;
 	}
-	return hqd_field(addr) ? s->hqd[slot][addr / 4] : 0;
+	return hqd_field(addr) ? s->hqd.slots[slot][addr / 4] : 0;
 }
 
 /*
@@ -94,12 +98,10 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 
 	if (slot >= GPGPU_QUEUE_SLOTS || size != 4 || (addr & 3) || !hqd_field(addr))
 		goto invalid;
-	hqd = s->hqd[slot];
+	hqd = s->hqd.slots[slot];
 	old = hqd[addr / 4];
-	if (!from_cp &&
-	    (!s->cp_reset_hold || s->cp_started || slot != 0 || addr == GPGPU_HQD_ERROR)) {
+	if (!from_cp && (!gpgpu_cp_host_configurable(s) || slot != 0 || addr == GPGPU_HQD_ERROR))
 		goto invalid;
-	}
 	if (hqd[GPGPU_HQD_ACTIVE / 4] && addr != GPGPU_HQD_ACTIVE && addr != GPGPU_HQD_RPTR &&
 	    addr != GPGPU_HQD_ERROR &&
 	    !(addr == GPGPU_HQD_DOORBELL && !((old ^ val) & ~GPGPU_DOORBELL_ENABLE))) {
@@ -119,7 +121,7 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 		if (valid && val && s->gpuvm && slot >= 2) {
 			unsigned int vmid = hqd[GPGPU_HQD_VMID / 4];
 
-			valid = vmid >= 1 && vmid <= GPGPU_VM_USERS && s->vm[vmid].enabled &&
+			valid = vmid >= 1 && vmid <= GPGPU_VM_USERS && gpgpu_vm_enabled(s, vmid) &&
 				hqd_address(hqd, GPGPU_HQD_RING_LO) <=
 					GPGPU_VM_ADDRESS_LIMIT - hqd[GPGPU_HQD_CONTROL / 4] &&
 				hqd_address(hqd, GPGPU_HQD_RPTR_ADDR_LO) < GPGPU_VM_ADDRESS_LIMIT &&
@@ -155,8 +157,8 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 		goto invalid;
 	hqd[addr / 4] = val;
 	if (addr == GPGPU_HQD_ACTIVE && val) {
-		s->queue_mode = true;
-		s->doorbell_pending[slot] = true;
+		s->hqd.queue_mode = true;
+		s->hqd.doorbell_pending[slot] = true;
 	}
 	return;
 invalid:
@@ -191,3 +193,63 @@ const MemoryRegionOps gpgpu_cp_hqd_ops = {
 	.valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 	.impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 };
+
+unsigned int gpgpu_hqd_selected(GPGPUState *s)
+{
+	return s->hqd.select;
+}
+
+void gpgpu_hqd_select(GPGPUState *s, uint32_t slot)
+{
+	if (slot < GPGPU_QUEUE_SLOTS)
+		s->hqd.select = slot;
+	else
+		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+}
+
+bool gpgpu_hqd_active(GPGPUState *s, unsigned int slot)
+{
+	return slot < GPGPU_QUEUE_SLOTS && s->hqd.slots[slot][GPGPU_HQD_ACTIVE / 4];
+}
+
+bool gpgpu_hqd_binding_valid(GPGPUState *s, unsigned int slot, unsigned int vmid)
+{
+	return slot >= 2 && gpgpu_hqd_active(s, slot) &&
+		s->hqd.slots[slot][GPGPU_HQD_VMID / 4] == vmid;
+}
+
+bool gpgpu_hqd_vmid_active(GPGPUState *s, unsigned int vmid)
+{
+	for (unsigned int slot = 2; slot < GPGPU_QUEUE_SLOTS; slot++)
+		if (gpgpu_hqd_binding_valid(s, slot, vmid))
+			return true;
+	return false;
+}
+
+bool gpgpu_hqd_queue_mode(GPGPUState *s)
+{
+	return s->hqd.queue_mode;
+}
+
+void gpgpu_hqd_enter_queue_mode(GPGPUState *s)
+{
+	s->hqd.queue_mode = true;
+}
+
+void gpgpu_hqd_notify(GPGPUState *s, hwaddr offset)
+{
+	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++) {
+		uint32_t control = s->hqd.slots[slot][GPGPU_HQD_DOORBELL / 4];
+
+		if (gpgpu_hqd_active(s, slot) && (control & GPGPU_DOORBELL_ENABLE) &&
+		    (control & GPGPU_DOORBELL_OFFSET_MASK) == offset) {
+			/* 固件持续轮询；通知不修改共享 W/R，也不启动计算。 */
+			s->hqd.doorbell_pending[slot] = true;
+		}
+	}
+}
+
+void gpgpu_hqd_reset(GPGPUState *s)
+{
+	memset(&s->hqd, 0, sizeof(s->hqd));
+}

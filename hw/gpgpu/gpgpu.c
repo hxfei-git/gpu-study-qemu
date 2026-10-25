@@ -1,74 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later
  * QEMU 教学用 GPGPU 设备
  * Copyright (c) 2024-2025
  */
 
 #include "qemu/osdep.h"
+#include "gpgpu.h"
+#include "gpgpu_internal.h"
+#include "gpgpu_mmio.h"
+#include "cp/gpgpu_cp.h"
+#include "cp/gpgpu_hqd.h"
+#include "cp/gpgpu_doorbell.h"
+#include "compute/gpgpu_dispatch.h"
+#include "compute/gpgpu_memory.h"
+#include "compute/gpgpu_exec_types.h"
+#include "memory/gpgpu_vram.h"
+#include "memory/gpgpu_vm.h"
+#include "memory/gpgpu_dma.h"
+#include "interrupt/gpgpu_ih.h"
+#include "interrupt/gpgpu_irq.h"
 #include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/pci/pcie.h"
 #include "migration/vmstate.h"
-#include "gpgpu.h"
+
 #include "qemu/host-utils.h"
-#include "gpgpu_core.h"
 
-/*
- * gpgpu_vram_read() - 读取 BAR2 的小端数据
- *
- * 先检查 VRAM 范围，越界时锁存故障并返回零。
- */
-static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned int size)
+/* 停止原生 CP 和任务后，依次复位各模块；此入口保留 VRAM。 */
+void gpgpu_reset_state(GPGPUState *s)
 {
-	GPGPUState *s = opaque;
-
-	if (!gpgpu_vram_contains(s, addr, size)) {
-		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
-		return 0;
-	}
-
-	return ldn_le_p(s->vram_ptr + addr, size);
+	gpgpu_cp_device_reset(s);
+	gpgpu_dispatch_reset(s);
+	gpgpu_vm_reset(s);
+	gpgpu_hqd_reset(s);
+	gpgpu_ih_reset(s);
+	s->global_ctrl = 0;
+	s->global_status = GPGPU_STATUS_READY;
+	s->error_status = 0;
+	gpgpu_irq_clear(s);
+	gpgpu_mmio_reset(s);
+	gpgpu_dma_reset(s);
 }
 
-/*
- * gpgpu_vram_store() - 向 VRAM 写入一个小端标量
- *
- * 经 AddressSpace 写入，使原生 CP 已翻译的代码同步失效。
- */
-void gpgpu_vram_store(GPGPUState *s, hwaddr addr, uint64_t val, unsigned int size)
+/* 全局错误由设备锁存，再交 IRQ 模块通知 Host。 */
+void gpgpu_set_error(GPGPUState *s, GPGPUError error)
 {
-	uint8_t buf[8];
-
-	if (!gpgpu_vram_contains(s, addr, size)) {
-		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
-		return;
-	}
-
-	stn_le_p(buf, size, val);
-	address_space_write(&s->vram_as, addr, MEMTXATTRS_UNSPECIFIED, buf, size);
+	s->error_status |= error;
+	s->global_status |= GPGPU_STATUS_ERROR;
+	gpgpu_raise_irq(s, GPGPU_IRQ_ERROR);
 }
-
-/*
- * gpgpu_vram_write() - 处理 BAR2 写回调
- *
- * 转交共用写入口，沿用范围检查和 TCG 失效处理。
- */
-static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
-{
-	gpgpu_vram_store(opaque, addr, val, size);
-}
-
-static const MemoryRegionOps gpgpu_vram_ops = {
-    .read = gpgpu_vram_read,
-    .write = gpgpu_vram_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
 
 /*
  * gpgpu_realize() - 建立 PCI 设备资源
@@ -90,13 +72,8 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 
 	pci_config_set_interrupt_pin(pci_conf, 1);
 
-	/* RAM 支持原生取指，BAR2 保留原访问语义。 */
-	if (!memory_region_init_ram_nomigrate(&s->vram_ram, OBJECT(s), "gpgpu-vram-ram",
-					      s->vram_size, errp)) {
+	if (!gpgpu_vram_init(s, errp))
 		return;
-	}
-	s->vram_ptr = memory_region_get_ram_ptr(&s->vram_ram);
-	address_space_init(&s->vram_as, &s->vram_ram, "gpgpu-vram-writes");
 
 	/* BAR0：控制寄存器。 */
 	memory_region_init_io(&s->ctrl_mmio, OBJECT(s), &gpgpu_ctrl_ops, s, "gpgpu-ctrl",
@@ -104,26 +81,17 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 	pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
 			 &s->ctrl_mmio);
 
-	/* BAR2：设备 VRAM。 */
-	memory_region_init_io(&s->vram, OBJECT(s), &gpgpu_vram_ops, s, "gpgpu-vram", s->vram_size);
-	pci_register_bar(pdev, 2,
-			 PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64 |
-				 PCI_BASE_ADDRESS_MEM_PREFETCH,
-			 &s->vram);
-
-	/* BAR4：Doorbell 通知寄存器。 */
-	memory_region_init_io(&s->doorbell_mmio, OBJECT(s), &gpgpu_doorbell_ops, s,
-			      "gpgpu-doorbell", GPGPU_DOORBELL_BAR_SIZE);
-	pci_register_bar(pdev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->doorbell_mmio);
+	gpgpu_vram_register_bar(s);
+	gpgpu_doorbell_init(s);
 
 	if (!gpgpu_irq_init(s, errp)) {
-		address_space_destroy(&s->vram_as);
+		gpgpu_vram_cleanup(s);
 		return;
 	}
 	if (pcie_endpoint_cap_init(pdev, 0) < 0) {
 		error_setg(errp, "GPGPU: cannot initialize PCIe endpoint capability");
 		gpgpu_irq_cleanup(s);
-		address_space_destroy(&s->vram_as);
+		gpgpu_vram_cleanup(s);
 		return;
 	}
 	gpgpu_dma_init(s);
@@ -146,7 +114,7 @@ static void gpgpu_exit(PCIDevice *pdev)
 	gpgpu_dispatch_cleanup(s);
 	gpgpu_irq_cleanup(s);
 	pcie_cap_exit(pdev);
-	address_space_destroy(&s->vram_as);
+	gpgpu_vram_cleanup(s);
 }
 
 /*
@@ -160,7 +128,7 @@ static void gpgpu_reset(DeviceState *dev)
 
 	gpgpu_reset_state(s);
 	/* 复位发生在 realize 成功之后，此时 VRAM 已分配。 */
-	address_space_set(&s->vram_as, 0, 0, s->vram_size, MEMTXATTRS_UNSPECIFIED);
+	gpgpu_vram_reset(s);
 	gpgpu_irq_reset(s);
 }
 
@@ -182,8 +150,8 @@ static const VMStateDescription vmstate_gpgpu = {
 					   VMSTATE_UINT32(global_ctrl, GPGPUState),
 					   VMSTATE_UINT32(global_status, GPGPUState),
 					   VMSTATE_UINT32(error_status, GPGPUState),
-					   VMSTATE_UINT32(irq_enable, GPGPUState),
-					   VMSTATE_UINT32(irq_status, GPGPUState),
+					   VMSTATE_UINT32(irq.enable, GPGPUState),
+					   VMSTATE_UINT32(irq.status, GPGPUState),
 					   VMSTATE_END_OF_LIST() }
 };
 

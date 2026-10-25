@@ -1,14 +1,19 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "qemu/osdep.h"
-#include "hw/remote/vfio-user-obj.h"
-#include "gpgpu.h"
+#include "gpgpu_vm.h"
+#include "gpgpu_vram.h"
+#include "gpgpu_host.h"
+#include "hw/gpgpu/cp/gpgpu_hqd.h"
+#include "software/gpgpu/include/gpgpu_queue.h"
+
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /* 首次故障按源槽锁存，普通用户错误不升级为全设备错误。 */
 bool gpgpu_vm_fail(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, uint32_t access,
 		   uint32_t phase, uint32_t reason)
 {
-	if (slot < GPGPU_QUEUE_SLOTS && !s->vm_fault[slot].reason) {
-		s->vm_fault[slot] = (GPGPUVMFault) {
+	if (slot < GPGPU_QUEUE_SLOTS && !s->vm.fault[slot].reason) {
+		s->vm.fault[slot] = (GPGPUVMFault) {
 			.address = address,
 			.reason = reason,
 			.vmid = vmid,
@@ -31,7 +36,7 @@ static bool vm_page_valid(GPGPUState *s, uint64_t address)
 static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t address, uint64_t *pte)
 {
 	unsigned int shifts[] = { 30, 21, 12 };
-	uint64_t table = s->vm[vmid].root;
+	uint64_t table = s->vm.contexts[vmid].root;
 
 	for (unsigned int level = 0; level < 3; level++) {
 		uint32_t index = (address >> shifts[level]) & (level ? 511 : 3);
@@ -39,7 +44,7 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t address, uint64_t
 
 		if (!vm_page_valid(s, table))
 			return GPGPU_VM_FAULT_TABLE;
-		entry = ldq_le_p(s->vram_ptr + table + index * 8);
+		entry = ldq_le_p(s->vram.ptr + table + index * 8);
 		if (!(entry & GPGPU_VM_VALID))
 			return GPGPU_VM_FAULT_UNMAPPED;
 		if (entry & ~(GPGPU_VM_ADDR_MASK | (level == 2 ? GPGPU_VM_FLAGS : GPGPU_VM_VALID)))
@@ -67,7 +72,7 @@ bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addre
 	uint32_t reason = GPGPU_VM_FAULT_CONTEXT;
 	bool counted = false;
 
-	if (!s->gpuvm || vmid < 1 || vmid > GPGPU_VM_USERS || !s->vm[vmid].enabled)
+	if (!s->gpuvm || vmid < 1 || vmid > GPGPU_VM_USERS || !s->vm.contexts[vmid].enabled)
 		goto fail;
 	reason = GPGPU_VM_FAULT_RANGE;
 	if (!length || address >= GPGPU_VM_ADDRESS_LIMIT ||
@@ -76,13 +81,13 @@ bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addre
 		goto fail;
 	if (access != GPGPU_VM_READ && access != GPGPU_VM_WRITE && access != GPGPU_VM_EXEC)
 		goto fail;
-	s->vm[vmid].accesses++;
+	s->vm.contexts[vmid].accesses++;
 	counted = true;
 	while (length) {
 		uint32_t page = address >> 12;
 		uint32_t offset = address & 4095;
 		size_t count = MIN(length, GPGPU_VM_PAGE_SIZE - offset);
-		GPGPUVMTlb *cached = &s->tlb[(page ^ vmid) % ARRAY_SIZE(s->tlb)];
+		GPGPUVMTlb *cached = &s->vm.tlb[(page ^ vmid) % ARRAY_SIZE(s->vm.tlb)];
 		uint64_t pte, physical;
 
 		if (cached->vmid == vmid && cached->page == page && cached->pte) {
@@ -99,35 +104,32 @@ bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addre
 		physical = (pte & GPGPU_VM_ADDR_MASK) + offset;
 		reason = GPGPU_VM_FAULT_STORAGE;
 		if (pte & GPGPU_VM_SYSTEM) {
-			if (vfu_object_dma_rw(PCI_DEVICE(s), physical, bytes, count,
+			if (gpgpu_host_access(s, physical, bytes, count,
 					      access == GPGPU_VM_WRITE) != MEMTX_OK)
 				goto fail;
 		} else if (access == GPGPU_VM_WRITE) {
-			memcpy(s->vram_ptr + physical, bytes, count);
+			memcpy(s->vram.ptr + physical, bytes, count);
 		} else {
-			memcpy(bytes, s->vram_ptr + physical, count);
+			memcpy(bytes, s->vram.ptr + physical, count);
 		}
 		address += count;
 		bytes += count;
 		length -= count;
 	}
-	s->vm[vmid].accesses--;
+	s->vm.contexts[vmid].accesses--;
 	return true;
 fail:
 	if (counted)
-		s->vm[vmid].accesses--;
+		s->vm.contexts[vmid].accesses--;
 	return gpgpu_vm_fail(s, vmid, slot, address, access, phase, reason);
 }
 
 /* 上下文有驻留队列或在途访问时，Host 不能变更页表根或失效。 */
 static bool vm_busy(GPGPUState *s, unsigned int vmid)
 {
-	if (s->vm[vmid].accesses)
+	if (s->vm.contexts[vmid].accesses)
 		return true;
-	for (unsigned int slot = 2; slot < GPGPU_QUEUE_SLOTS; slot++)
-		if (s->hqd[slot][GPGPU_HQD_ACTIVE / 4] && s->hqd[slot][GPGPU_HQD_VMID / 4] == vmid)
-			return true;
-	return false;
+	return gpgpu_hqd_vmid_active(s, vmid);
 }
 
 /* 读取只读能力、上下文或源槽的首次故障，不产生清除副作用。 */
@@ -138,21 +140,21 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr addr)
 	if (addr == GPGPU_REG_VM_MODE)
 		return s->gpuvm ? 2 : 0;
 	if (addr == GPGPU_REG_VM_FIRMWARE)
-		return s->vm_firmware;
+		return s->vm.firmware;
 	if (addr == GPGPU_REG_VM_STATUS)
-		return s->vm_status;
+		return s->vm.status;
 	for (unsigned int id = 1; id <= GPGPU_VM_USERS; id++) {
 		hwaddr base = GPGPU_REG_VM_CONTEXT(id);
 
 		if (addr == base + GPGPU_VM_ROOT_LO)
-			return s->vm[id].root;
+			return s->vm.contexts[id].root;
 		if (addr == base + GPGPU_VM_ROOT_HI)
-			return s->vm[id].root >> 32;
+			return s->vm.contexts[id].root >> 32;
 		if (addr == base + GPGPU_VM_ENABLE)
-			return s->vm[id].enabled;
+			return s->vm.contexts[id].enabled;
 	}
 	if (addr >= GPGPU_REG_VM_FAULT(0) && addr < GPGPU_REG_VM_FAULT(4)) {
-		GPGPUVMFault *f = &s->vm_fault[(addr - GPGPU_REG_VM_FAULT(0)) / 0x40];
+		GPGPUVMFault *f = &s->vm.fault[(addr - GPGPU_REG_VM_FAULT(0)) / 0x40];
 
 		switch (addr & 0x3f) {
 		case GPGPU_VM_FAULT_REASON:
@@ -178,22 +180,22 @@ void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value)
 	if (!s->gpuvm)
 		goto invalid;
 	if (addr == GPGPU_REG_VM_INVALIDATE) {
-		if (s->vm_status & GPGPU_VM_BUSY)
+		if (s->vm.status & GPGPU_VM_BUSY)
 			goto invalid;
-		s->vm_status = GPGPU_VM_BUSY;
+		s->vm.status = GPGPU_VM_BUSY;
 		if (value < 1 || value > GPGPU_VM_USERS || vm_busy(s, value)) {
-			s->vm_status = GPGPU_VM_ERROR;
+			s->vm.status = GPGPU_VM_ERROR;
 			return;
 		}
-		for (unsigned int i = 0; i < ARRAY_SIZE(s->tlb); i++)
-			if (s->tlb[i].vmid == value)
-				memset(&s->tlb[i], 0, sizeof(s->tlb[i]));
-		s->vm_status = GPGPU_VM_ACK;
+		for (unsigned int i = 0; i < ARRAY_SIZE(s->vm.tlb); i++)
+			if (s->vm.tlb[i].vmid == value)
+				memset(&s->vm.tlb[i], 0, sizeof(s->vm.tlb[i]));
+		s->vm.status = GPGPU_VM_ACK;
 		return;
 	}
 	for (unsigned int id = 1; id <= GPGPU_VM_USERS; id++) {
 		hwaddr base = GPGPU_REG_VM_CONTEXT(id);
-		GPGPUVMContext *vm = &s->vm[id];
+		GPGPUVMContext *vm = &s->vm.contexts[id];
 
 		if (addr < base || addr >= base + 0x20)
 			continue;
@@ -219,11 +221,34 @@ void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value)
 	}
 	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++) {
 		if (addr == GPGPU_REG_VM_FAULT(slot) + GPGPU_VM_FAULT_CLEAR && value == 1 &&
-		    !s->hqd[slot][GPGPU_HQD_ACTIVE / 4]) {
-			memset(&s->vm_fault[slot], 0, sizeof(s->vm_fault[slot]));
+		    !gpgpu_hqd_active(s, slot)) {
+			memset(&s->vm.fault[slot], 0, sizeof(s->vm.fault[slot]));
 			return;
 		}
 	}
 invalid:
 	gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+}
+
+bool gpgpu_vm_enabled(GPGPUState *s, unsigned int vmid)
+{
+	return vmid >= 1 && vmid <= GPGPU_VM_USERS && s->vm.contexts[vmid].enabled;
+}
+
+void gpgpu_vm_reset(GPGPUState *s)
+{
+	memset(&s->vm, 0, sizeof(s->vm));
+}
+
+void gpgpu_vm_reset_firmware(GPGPUState *s)
+{
+	s->vm.firmware = 0;
+}
+
+bool gpgpu_vm_set_firmware(GPGPUState *s, uint32_t version)
+{
+	if (!s->gpuvm || version != GPGPU_VM_VERSION)
+		return false;
+	s->vm.firmware = version;
+	return true;
 }

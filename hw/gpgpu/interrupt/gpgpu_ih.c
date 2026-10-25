@@ -1,9 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "qemu/osdep.h"
+#include "gpgpu_ih.h"
+#include "gpgpu_irq.h"
+#include "hw/gpgpu/memory/gpgpu_vram.h"
+#include "hw/gpgpu/memory/gpgpu_host.h"
+#include "software/gpgpu/include/gpgpu_queue.h"
 #include "qemu/atomic.h"
 #include "qemu/bitops.h"
-#include "hw/remote/vfio-user-obj.h"
-#include "gpgpu.h"
+
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * ih_fault() - 锁存 IH 通道首次故障
@@ -95,7 +100,7 @@ static void ih_submit(GPGPUState *s, uint32_t addr)
 		result = GPGPU_IH_ERR_RECORD;
 		goto done;
 	}
-	memcpy(record, s->vram_ptr + addr, sizeof(record));
+	gpgpu_vram_read_bytes(s, addr, record, sizeof(record));
 	if (!ih_record_valid(record)) {
 		result = GPGPU_IH_ERR_RECORD;
 		goto done;
@@ -106,8 +111,8 @@ static void ih_submit(GPGPUState *s, uint32_t addr)
 		goto done;
 	}
 	ih->status |= GPGPU_IH_BUSY;
-	if (vfu_object_dma_rw(PCI_DEVICE(s), ih->base + (ih->wptr % capacity) * sizeof(record),
-			      record, sizeof(record), true) != MEMTX_OK) {
+	if (gpgpu_host_access(s, ih->base + (ih->wptr % capacity) * sizeof(record), record,
+			      sizeof(record), true) != MEMTX_OK) {
 		result = GPGPU_IH_ERR_DMA;
 		goto done;
 	}
@@ -207,4 +212,19 @@ void gpgpu_ih_write(GPGPUState *s, hwaddr addr, uint32_t val, bool from_cp)
 	}
 invalid:
 	ih_fault(s, GPGPU_IH_ERR_PROTOCOL);
+}
+
+bool gpgpu_ih_pending(GPGPUState *s)
+{
+	return s->ih.wptr != s->ih.rptr;
+}
+
+bool gpgpu_ih_faulted(GPGPUState *s)
+{
+	return s->ih.status & GPGPU_IH_FAULT;
+}
+
+void gpgpu_ih_reset(GPGPUState *s)
+{
+	memset(&s->ih, 0, sizeof(s->ih));
 }

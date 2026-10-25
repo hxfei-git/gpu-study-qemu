@@ -5,15 +5,19 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu/bitops.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
 #include "hw/pci/pci_host.h"
 #include "hw/remote/machine.h"
-#include "hw/remote/vfio-user-obj.h"
 #include "hw/gpgpu/gpgpu.h"
+#include "hw/gpgpu/gpgpu_mmio.h"
+#include "hw/gpgpu/cp/gpgpu_cp.h"
+#include "hw/gpgpu/cp/gpgpu_cp_window.h"
+#include "hw/gpgpu/cp/gpgpu_hqd.h"
+#include "hw/gpgpu/memory/gpgpu_vram.h"
+#include "software/gpgpu/include/gpgpu_queue.h"
 #include "target/riscv/cpu.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -32,11 +36,6 @@ struct GPGPUCPMachineState {
     MemoryRegion host_window_regs;
     MemoryRegion hqd_regs;
     MemoryRegion dispatch_regs;
-    uint64_t host_iova_base;
-    uint32_t vm_domain;
-    uint32_t vm_id;
-    uint32_t vm_slot;
-    uint32_t vm_phase;
     bool reset_asserted;
     VMChangeStateEntry *vm_state;
 };
@@ -46,124 +45,6 @@ typedef struct GPGPUCPStateChange {
     bool reset_hold;
     uint32_t reset_vector;
 } GPGPUCPStateChange;
-
-static MemTxResult gpgpu_cp_host_access(GPGPUCPMachineState *s, hwaddr addr,
-                                       uint8_t *buf, unsigned size,
-                                       bool is_write)
-{
-    uint64_t iova;
-
-    if (addr >= GPGPU_CP_HOST_WINDOW_SIZE ||
-        size > GPGPU_CP_HOST_WINDOW_SIZE - addr ||
-        s->host_iova_base > UINT64_MAX - addr) {
-        return MEMTX_ERROR;
-    }
-    iova = s->host_iova_base + addr;
-    if (iova > UINT64_MAX - (size - 1)) {
-        return MEMTX_ERROR;
-    }
-
-    if (s->vm_domain == GPGPU_VM_DOMAIN_USER) {
-        return gpgpu_vm_access(s->gpgpu, s->vm_id, s->vm_slot, iova, buf,
-                               size, is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ,
-                               s->vm_phase) ? MEMTX_OK : MEMTX_ERROR;
-    }
-    if (s->vm_domain != GPGPU_VM_DOMAIN_MANAGEMENT) {
-        return MEMTX_ERROR;
-    }
-    /* 直接访存，不使用 Host DMA 描述符、状态或完成中断。 */
-    return vfu_object_dma_rw(PCI_DEVICE(s->gpgpu), iova, buf, size, is_write);
-}
-
-static MemTxResult gpgpu_cp_host_read(void *opaque, hwaddr addr, uint64_t *val,
-                                     unsigned size, MemTxAttrs attrs)
-{
-    uint8_t buf[8];
-    MemTxResult result;
-
-    *val = 0;
-    result = gpgpu_cp_host_access(opaque, addr, buf, size, false);
-    if (result == MEMTX_OK) {
-        *val = ldn_le_p(buf, size);
-    }
-    return result;
-}
-
-static MemTxResult gpgpu_cp_host_write(void *opaque, hwaddr addr, uint64_t val,
-                                      unsigned size, MemTxAttrs attrs)
-{
-    uint8_t buf[8];
-
-    stn_le_p(buf, size, val);
-    return gpgpu_cp_host_access(opaque, addr, buf, size, true);
-}
-
-static const MemoryRegionOps gpgpu_cp_host_ops = {
-    .read_with_attrs = gpgpu_cp_host_read,
-    .write_with_attrs = gpgpu_cp_host_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
-
-static uint64_t gpgpu_cp_host_regs_read(void *opaque, hwaddr addr,
-                                      unsigned size)
-{
-    GPGPUCPMachineState *s = opaque;
-
-    switch (addr) {
-    case 0: return (uint32_t)s->host_iova_base;
-    case 4: return s->host_iova_base >> 32;
-    case 8: return s->vm_domain;
-    case 12: return s->vm_id;
-    case 16: return s->vm_slot;
-    case 20: return s->vm_phase;
-    default: return 0;
-    }
-}
-
-static void gpgpu_cp_host_regs_write(void *opaque, hwaddr addr, uint64_t val,
-                                     unsigned size)
-{
-    GPGPUCPMachineState *s = opaque;
-
-    if (addr >= 8) {
-        switch (addr) {
-        case 8: s->vm_domain = val; break;
-        case 12: s->vm_id = val; break;
-        case 16: s->vm_slot = val; break;
-        case 20: s->vm_phase = val; break;
-        }
-        return;
-    }
-    if (addr == 0) {
-        /* 低 16 位读零；写完高低位后再访存。 */
-        val &= ~(GPGPU_CP_HOST_WINDOW_SIZE - 1);
-        s->host_iova_base = deposit64(s->host_iova_base, 0, 32, val);
-    } else {
-        s->host_iova_base = deposit64(s->host_iova_base, 32, 32, val);
-    }
-}
-
-static const MemoryRegionOps gpgpu_cp_host_regs_ops = {
-    .read = gpgpu_cp_host_regs_read,
-    .write = gpgpu_cp_host_regs_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-    .impl = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-};
 
 static void gpgpu_cp_set_state_on_cpu(CPUState *cs, run_on_cpu_data data)
 {
@@ -177,9 +58,7 @@ static void gpgpu_cp_set_state_on_cpu(CPUState *cs, run_on_cpu_data data)
         }
         s->cp.env.resetvec = change->reset_vector;
         resettable_assert_reset(OBJECT(cs), RESET_TYPE_COLD);
-        s->host_iova_base = 0;
-        s->vm_domain = s->vm_id = s->vm_slot = s->vm_phase = 0;
-        s->gpgpu->vm_firmware = 0;
+        gpgpu_cp_reset_access(s->gpgpu);
         s->reset_asserted = true;
         cs->halted = true;
         /* 暂停取指，防止复位前残留的 pending IRQ 唤醒 CPU。 */
@@ -266,14 +145,14 @@ static void gpgpu_cp_machine_init(MachineState *machine)
     memory_region_init(&s->cp_memory, OBJECT(machine), "gpgpu-cp-memory",
                        UINT64_C(1) << 32);
     memory_region_init_alias(&s->vram_alias, OBJECT(machine), "gpgpu-cp-vram",
-                             &gpgpu->vram_ram, 0, gpgpu->vram_size);
+                             gpgpu_vram_region(gpgpu), 0, gpgpu_vram_size(gpgpu));
     memory_region_add_subregion(&s->cp_memory, 0, &s->vram_alias);
     memory_region_init_io(&s->host_window, OBJECT(machine), &gpgpu_cp_host_ops,
-                          s, "gpgpu-cp-host-window", GPGPU_CP_HOST_WINDOW_SIZE);
+                          gpgpu, "gpgpu-cp-host-window", GPGPU_CP_HOST_WINDOW_SIZE);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_HOST_WINDOW_BASE,
                                 &s->host_window);
     memory_region_init_io(&s->host_window_regs, OBJECT(machine),
-                          &gpgpu_cp_host_regs_ops, s,
+                          &gpgpu_cp_host_regs_ops, gpgpu,
                           "gpgpu-cp-host-window-regs", 24);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_IOVA_BASE_LO,
                                 &s->host_window_regs);

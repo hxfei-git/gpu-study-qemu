@@ -1,40 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later
  * QEMU 教学用 GPGPU 设备
  * Copyright (c) 2024-2025
  */
 
 #include "qemu/osdep.h"
-#include "gpgpu.h"
-
-/*
- * gpgpu_reset_state() - 复位设备寄存器与执行状态
- *
- * 先停止 CP 和计算任务，再清队列、中断及 DMA 状态；此入口保留 VRAM。
- */
-void gpgpu_reset_state(GPGPUState *s)
-{
-	/* 停止 CP 后再改变设备状态；此处保留 VRAM。 */
-	gpgpu_cp_reset(s);
-	gpgpu_dispatch_reset(s);
-	s->cp_started = false;
-	memset(s->vm, 0, sizeof(s->vm));
-	memset(s->tlb, 0, sizeof(s->tlb));
-	memset(s->vm_fault, 0, sizeof(s->vm_fault));
-	s->vm_status = s->vm_firmware = 0;
-	s->queue_mode = false;
-	s->hqd_select = 0;
-	memset(s->hqd, 0, sizeof(s->hqd));
-	memset(s->doorbell_pending, 0, sizeof(s->doorbell_pending));
-	memset(&s->ih, 0, sizeof(s->ih));
-	s->global_ctrl = 0;
-	s->global_status = GPGPU_STATUS_READY;
-	s->error_status = 0;
-	gpgpu_irq_clear(s);
-	memset(&s->kernel, 0, sizeof(s->kernel));
-	memset(&s->simt, 0, sizeof(s->simt));
-	gpgpu_dma_reset(s);
-}
+#include "gpgpu_mmio.h"
+#include "cp/gpgpu_cp.h"
+#include "cp/gpgpu_hqd.h"
+#include "compute/gpgpu_dispatch.h"
+#include "memory/gpgpu_dma.h"
+#include "memory/gpgpu_vm.h"
+#include "memory/gpgpu_vram.h"
+#include "interrupt/gpgpu_irq.h"
+#include "interrupt/gpgpu_ih.h"
+#include "software/gpgpu/include/gpgpu_queue.h"
+#include "gpgpu_internal.h"
 
 /*
  * gpgpu_ctrl_read() - 分发 Host BAR0 读访问
@@ -54,9 +35,9 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 	if (addr >= 0x0900 && addr < 0x0b00)
 		return gpgpu_vm_read(s, addr);
 	if (addr == GPGPU_REG_HQD_SELECT)
-		return s->hqd_select;
+		return gpgpu_hqd_selected(s);
 	if ((addr & ~0xffULL) == GPGPU_REG_HQD_WINDOW)
-		return gpgpu_hqd_read(s, s->hqd_select, addr & 0xff, size);
+		return gpgpu_hqd_read(s, gpgpu_hqd_selected(s), addr & 0xff, size);
 	if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 		return gpgpu_ih_read(s, addr);
 
@@ -65,7 +46,7 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 	case GPGPU_REG_IRQ_ENABLE:
 		return gpgpu_irq_read(s, addr);
 	case GPGPU_REG_KERNEL_ADDR_LO:
-		return gpgpu_kernel_read(s, addr);
+		return gpgpu_dispatch_read(s, addr);
 	case GPGPU_REG_DMA_SRC_LO:
 		return gpgpu_dma_read(s, addr);
 	case GPGPU_REG_CP_CTRL:
@@ -81,9 +62,9 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 		return (s->num_cus & 0xff) | ((s->warps_per_cu & 0xff) << 8) |
 			((s->warp_size & 0xff) << 16);
 	case GPGPU_REG_VRAM_SIZE_LO:
-		return (uint32_t)s->vram_size;
+		return (uint32_t)gpgpu_vram_size(s);
 	case GPGPU_REG_VRAM_SIZE_HI:
-		return (uint32_t)(s->vram_size >> 32);
+		return (uint32_t)(gpgpu_vram_size(s) >> 32);
 	case GPGPU_REG_GLOBAL_CTRL:
 		return s->global_ctrl;
 	case GPGPU_REG_GLOBAL_STATUS:
@@ -133,14 +114,11 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		return;
 	}
 	if (addr == GPGPU_REG_HQD_SELECT) {
-		if (val < GPGPU_QUEUE_SLOTS)
-			s->hqd_select = val;
-		else
-			gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+		gpgpu_hqd_select(s, val);
 		return;
 	}
 	if ((addr & ~0xffULL) == GPGPU_REG_HQD_WINDOW) {
-		gpgpu_hqd_write(s, s->hqd_select, addr & 0xff, val, size, false);
+		gpgpu_hqd_write(s, gpgpu_hqd_selected(s), addr & 0xff, val, size, false);
 		return;
 	}
 	if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO) {
@@ -153,7 +131,7 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		gpgpu_irq_write(s, addr, val);
 		return;
 	case GPGPU_REG_KERNEL_ADDR_LO:
-		gpgpu_kernel_write(s, addr, val);
+		gpgpu_dispatch_write(s, addr, val);
 		return;
 	case GPGPU_REG_DMA_SRC_LO:
 		gpgpu_dma_write(s, addr, val);
@@ -208,19 +186,19 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 }
 
 const MemoryRegionOps gpgpu_ctrl_ops = {
-    .read = gpgpu_ctrl_read,
-    .write = gpgpu_ctrl_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-        .unaligned = true,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-        .unaligned = true,
-    },
+	.read = gpgpu_ctrl_read,
+	.write = gpgpu_ctrl_write,
+	.endianness = DEVICE_LITTLE_ENDIAN,
+	.valid = {
+		.min_access_size = 1,
+		.max_access_size = 8,
+		.unaligned = true,
+	},
+	.impl = {
+		.min_access_size = 1,
+		.max_access_size = 8,
+		.unaligned = true,
+	},
 };
 
 /*
@@ -241,7 +219,7 @@ static uint64_t cp_regs_read(void *opaque, hwaddr addr, unsigned int size)
 	if (addr >= 0x0900 && addr < 0x0a00)
 		return gpgpu_vm_read(s, addr);
 	if ((addr & ~0xffULL) == GPGPU_REG_KERNEL_ADDR_LO)
-		return gpgpu_kernel_read(s, addr);
+		return gpgpu_dispatch_read(s, addr);
 	if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 		return gpgpu_ih_read(s, addr);
 	if (addr == GPGPU_REG_ERROR_STATUS)
@@ -265,12 +243,10 @@ static void cp_regs_write(void *opaque, hwaddr addr, uint64_t val, unsigned int 
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
 		return;
 	}
-	if (addr == GPGPU_REG_VM_FIRMWARE && s->gpuvm && val == GPGPU_VM_VERSION) {
-		s->vm_firmware = val;
+	if (addr == GPGPU_REG_VM_FIRMWARE && gpgpu_vm_set_firmware(s, val))
 		return;
-	}
 	if ((addr & ~0xffULL) == GPGPU_REG_KERNEL_ADDR_LO)
-		gpgpu_kernel_cp_write(s, addr, val);
+		gpgpu_dispatch_cp_write(s, addr, val);
 	else if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 		gpgpu_ih_write(s, addr, val, true);
 	else
@@ -284,3 +260,8 @@ const MemoryRegionOps gpgpu_cp_regs_ops = {
 	.valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 	.impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 };
+
+void gpgpu_mmio_reset(GPGPUState *s)
+{
+	memset(&s->simt, 0, sizeof(s->simt));
+}

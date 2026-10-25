@@ -1,14 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * SPDX-License-Identifier: GPL-2.0-or-later
  * QEMU 教学用 GPGPU 设备
  * Copyright (c) 2024-2025
  */
 
 #include "qemu/osdep.h"
+#include "gpgpu_dma.h"
+#include "gpgpu_host.h"
+#include "gpgpu_vram.h"
+#include "hw/gpgpu/interrupt/gpgpu_irq.h"
 #include "qemu/bitops.h"
 #include "qemu/timer.h"
-#include "hw/remote/vfio-user-obj.h"
-#include "gpgpu.h"
+
+#include "hw/gpgpu/gpgpu_internal.h"
 
 /*
  * gpgpu_dma_complete() - 发布已完成传输的 DMA 结果
@@ -57,18 +61,18 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
 
 	s->dma.status = GPGPU_DMA_BUSY;
 	if (ctrl & GPGPU_DMA_DIR_FROM_VRAM) {
-		result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr, s->vram_ptr + vram_addr,
-					   s->dma.size, true);
+		result =
+			gpgpu_host_access(s, host_addr, s->vram.ptr + vram_addr, s->dma.size, true);
 	} else {
 		hwaddr mapped_size = s->dma.size;
-		void *vram = address_space_map(&s->vram_as, vram_addr, &mapped_size, true,
+		void *vram = address_space_map(&s->vram.as, vram_addr, &mapped_size, true,
 					       MEMTXATTRS_UNSPECIFIED);
 
 		/* 连续 RAM 范围已在上面检查，应始终完整映射。 */
 		assert(vram && mapped_size == s->dma.size);
-		result = vfu_object_dma_rw(PCI_DEVICE(s), host_addr, vram, s->dma.size, false);
+		result = gpgpu_host_access(s, host_addr, vram, s->dma.size, false);
 		/* 失败可能已有部分写入，因此失效整个范围。 */
-		address_space_unmap(&s->vram_as, vram, mapped_size, true, s->dma.size);
+		address_space_unmap(&s->vram.as, vram, mapped_size, true, s->dma.size);
 	}
 	if (result != MEMTX_OK) {
 		s->dma.status = GPGPU_DMA_ERROR;
