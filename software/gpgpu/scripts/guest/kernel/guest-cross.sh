@@ -8,7 +8,7 @@ set -eu
 set -o pipefail
 jobs=${1:?需要客体并发数}
 shared=/mnt/gpgpu-build
-materials=/mnt/gpgpu-src/kernel
+scripts=/mnt/gpgpu-src/kernel
 source_dir=/root/gpgpu-kernel-source
 build_dir=/root/gpgpu-kernel-output
 SOURCE_DATE_EPOCH=$(cat "$shared/source-date-epoch")
@@ -41,6 +41,6 @@ rm -rf "/lib/modules/$release/kernel"
 zstd -dc "$shared/cross-modules.tar.zst" | tar -xf - -C /
 
 # ARM64 客体不能执行 x86_64 host-tools；只替换工具和路径元数据。
-sh "$materials/guest-cross-prepare.sh" "$source_dir" "$build_dir"
+sh "$scripts/guest-cross-prepare.sh" "$source_dir" "$build_dir"
 depmod -a "$release"
-sh "$materials/guest-export.sh" "$jobs" cross "$release"
+sh "$scripts/guest-export.sh" "$jobs" cross "$release"

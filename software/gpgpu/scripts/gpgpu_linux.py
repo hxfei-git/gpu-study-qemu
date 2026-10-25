@@ -16,20 +16,22 @@ import shutil
 import signal
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request
 
+from gpgpu_remote import RemoteDevice
 
-SOURCE = Path(__file__).resolve().parent
-ROOT = SOURCE.parents[2]
+
+SCRIPTS = Path(__file__).resolve().parent
+STACK = SCRIPTS.parent
+SOURCE = STACK / "linux"
+GUEST_SCRIPTS = SCRIPTS / "guest"
+ROOT = STACK.parents[1]
 IMAGES = ROOT / "build" / "gpgpu-arm64-linux"
 QEMU_DIRECTORY = ROOT / "build" / "arm64-qemu"
 QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-aarch64"
 DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv64"
-sys.path.insert(0, str(ROOT / "scripts"))
-from gpgpu_remote import RemoteDevice
 ISO_NAME = "alpine-virt-3.24.2-aarch64.iso"
 ISO_SHA256 = "a57ba668b5f6b17a670fcf8e799d5d7fe43766ed086d6ce2927b0625bf43dbf6"
 ISO_URL = (
@@ -101,11 +103,14 @@ def environment_metadata(output):
 
 
 def inputs_hash(filenames, version):
-    """将构建版本、输入路径和源码内容一起散列，识别需要重建的缓存。"""
+    """按原逻辑名称和实际内容计算指纹，目录迁移本身不使缓存过期。"""
     digest = hashlib.sha256()
     digest.update(f"gpgpu-build:{version}\0".encode())
     for name in filenames:
-        digest.update(name.encode() + b"\0" + (SOURCE / name).read_bytes())
+        # 环境脚本只移动位置，仍用原名称参与散列，保留已安装的固定内核。
+        directory = (GUEST_SCRIPTS if name in ENVIRONMENT_INPUTS or
+                     name == "guest-compile.sh" else SOURCE)
+        digest.update(name.encode() + b"\0" + (directory / name).read_bytes())
     return digest.hexdigest()
 
 
@@ -361,8 +366,8 @@ def prepare_environment(output, fingerprint):
         "-device", "virtio-blk-pci,drive=developer",
         "-device", "gpgpu,bus=pcie.0",
     ]
-    command += shared_directory(SOURCE, "gpgpu_src", True)
-    command += shared_directory(SOURCE.parent, "gpgpu_stack", True)
+    command += shared_directory(GUEST_SCRIPTS, "gpgpu_src", True)
+    command += shared_directory(STACK, "gpgpu_stack", True)
     command += shared_directory(output, "gpgpu_build", False)
     command += ["-netdev", "user,id=net0",
                 "-device", "virtio-net-pci,netdev=net0"]
@@ -461,8 +466,8 @@ def developer_command(output, iommu="none", remote=False):
         "-device", "@GPGPU_DEVICE@" if remote else "gpgpu,bus=pcie.0",
         "-nic", "none",
     ]
-    command += shared_directory(SOURCE, "gpgpu_src", True)
-    command += shared_directory(SOURCE.parent, "gpgpu_stack", True)
+    command += shared_directory(GUEST_SCRIPTS, "gpgpu_src", True)
+    command += shared_directory(STACK, "gpgpu_stack", True)
     command += shared_directory(output, "gpgpu_build", False)
     return command
 
@@ -595,7 +600,7 @@ def stack_test(output, iommu, device_qemu=None):
     stack_output = output / "stack"
     # RV32 kernel 在宿主机汇编；客体使用已保存的 C 编译器，
     # 因此重复测试无需下载开发软件包。
-    subprocess.run(["make", "-C", str(SOURCE.parent),
+    subprocess.run(["make", "-C", str(STACK),
                     f"BUILD_DIR={stack_output}", "kernels"], check=True)
     remote = RemoteDevice(device_qemu, results) if device_qemu else None
     command = developer_command(output, iommu, remote=bool(remote))
@@ -607,7 +612,7 @@ def stack_test(output, iommu, device_qemu=None):
             "mkdir -p /mnt/gpgpu-stack\n"
             "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
             "gpgpu_stack /mnt/gpgpu-stack\n"
-            "sh /mnt/gpgpu-src/guest-stack-test.sh "
+            "sh /mnt/gpgpu-src/guest-test.sh sync "
             f"> {guest_log} 2>&1\n"
             "printf 'GPGPU_STACK_RC=%s\\n' \"$?\"\n"
         )
@@ -659,11 +664,11 @@ def queue_test(output, device_qemu):
     results = output / "remote" / "none"
     results.mkdir(parents=True, exist_ok=True)
     (results / "queue-test.json").unlink(missing_ok=True)
-    subprocess.run(["make", "-C", str(SOURCE.parent / "firmware")], check=True)
+    subprocess.run(["make", "-C", str(STACK / "firmware")], check=True)
     shutil.copyfile(ROOT / "build/gpgpu-firmware/gpgpu-cp.bin",
                     output / "gpgpu-cp.bin")
     stack = output / "queue-stack"
-    subprocess.run(["make", "-C", str(SOURCE.parent),
+    subprocess.run(["make", "-C", str(STACK),
                     f"BUILD_DIR={stack}", "kernels"], check=True)
     remote = RemoteDevice(device_qemu, results)
     guest = Guest(developer_command(output, "none", remote=True),
@@ -674,7 +679,7 @@ def queue_test(output, device_qemu):
             "mkdir -p /mnt/gpgpu-stack\n"
             "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
             "gpgpu_stack /mnt/gpgpu-stack\n"
-            "sh /mnt/gpgpu-src/guest-queue-test.sh "
+            "sh /mnt/gpgpu-src/guest-test.sh queue "
             "> /mnt/gpgpu-build/remote/none/queue-test.log 2>&1\n"
             "printf 'GPGPU_QUEUE_RC=%s\\n' \"$?\"\n"
         )
@@ -705,28 +710,133 @@ def queue_test(output, device_qemu):
         guest.close()
 
 
+def prepare_gpuvm_firmware(output):
+    """构建并复制两种 GPUVM 验收共用的 CP 固件。"""
+    subprocess.run(["make", "-C", str(STACK / "firmware")], check=True)
+    shutil.copy2(ROOT / "build/gpgpu-firmware/gpgpu-cp.bin",
+                 output / "gpgpu-cp.bin")
+
+
+def gpuvm_test(output, iommu, device_qemu):
+    """在指定 IOMMU 模式下运行五组 GPUVM 检查，核对卸载及内核日志。"""
+    check_iommu_kernel(output, iommu)
+    prepare_gpuvm_firmware(output)
+    stack = output / "gpuvm-stack"
+    subprocess.run(["make", "-C", str(STACK), f"BUILD_DIR={stack}", "kernels"],
+                   check=True)
+    results = output / "gpuvm" / iommu
+    results.mkdir(parents=True, exist_ok=True)
+    (results / "result.json").unlink(missing_ok=True)
+    remote = RemoteDevice(device_qemu, results, gpuvm=True)
+    guest = Guest(developer_command(output, iommu, remote=True),
+                  results / "console.log", remote)
+    try:
+        guest.wait(rb"^GPGPU_DEVELOPER_READY$")
+        guest.send(
+            "mkdir -p /mnt/gpgpu-stack\n"
+            "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
+            "gpgpu_stack /mnt/gpgpu-stack\n"
+            "sh /mnt/gpgpu-src/guest-test.sh gpuvm "
+            f"> /mnt/gpgpu-build/gpuvm/{iommu}/test.log 2>&1\n"
+            "printf 'GPGPU_GPUVM_RC=%s\\n' \"$?\"\n"
+        )
+        result = guest.wait(rb"^GPGPU_GPUVM_RC=(\d+)$", timeout=1200)
+        log = (results / "test.log").read_text(errors="replace")
+        print(log, end="", flush=True)
+        groups = re.findall(r"^PASS gpuvm-group-([1-5])$", log, re.M)
+        if (result.group(1) != b"0" or groups != list("12345") or
+                "GPUVM unload: PASS" not in log):
+            raise RuntimeError("GPUVM 验收不完整，请检查 test.log")
+        domain = check_iommu_domain(guest, iommu)
+        check_kernel_log(guest)
+        write_metadata(results / "result.json", {
+            "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "groups_passed": len(groups), "iommu": domain,
+            "transport": "vfio-user",
+            "kernel_release": (output / "kernel-release").read_text().strip(),
+            "module_sha256": sha256(output / "gpgpu_pci.ko"),
+            "firmware_sha256": sha256(output / "gpgpu-cp.bin"),
+            "test_sha256": sha256(stack / "test-gpuvm"),
+            "kernel_faults": 0,
+        })
+    finally:
+        guest.close()
+
+
+def gpuvm_fault_test(output, device_qemu):
+    """在独立模块副本中注入未知结果，检查三个场景的资源保留与安全回收。"""
+    prepare_gpuvm_firmware(output)
+    results = output / "gpuvm" / "retention"
+    results.mkdir(parents=True, exist_ok=True)
+    (results / "result.json").unlink(missing_ok=True)
+    remote = RemoteDevice(device_qemu, results, gpuvm=True)
+    guest = Guest(developer_command(output, "none", remote=True),
+                  results / "console.log", remote)
+    try:
+        guest.wait(rb"^GPGPU_DEVELOPER_READY$")
+        guest.send(
+            "mkdir -p /mnt/gpgpu-stack\n"
+            "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
+            "gpgpu_stack /mnt/gpgpu-stack\n"
+            "make -C /mnt/gpgpu-stack "
+            "BUILD_DIR=/mnt/gpgpu-build/gpuvm-stack all "
+            "> /mnt/gpgpu-build/gpuvm/retention/build.log 2>&1 &&\n"
+            "sh /mnt/gpgpu-src/guest-gpuvm-fault-test.sh "
+            "> /mnt/gpgpu-build/gpuvm/retention/test.log 2>&1\n"
+            "printf 'GPGPU_RETAIN_RC=%s\\n' \"$?\"\n"
+        )
+        result = guest.wait(rb"^GPGPU_RETAIN_RC=(\d+)$", timeout=1200)
+        log = (results / "test.log").read_text(errors="replace")
+        print(log, end="", flush=True)
+        groups = re.findall(r"^PASS gpuvm-retain-(map|unmap|invalidate)$",
+                            log, re.M)
+        if result.group(1) != b"0" or groups != ["map", "unmap", "invalidate"]:
+            raise RuntimeError("未知结果保留测试失败")
+        check_kernel_log(guest)
+        write_metadata(results / "result.json", {
+            "tests_passed": groups, "kernel_faults": 0,
+            "test_sha256": sha256(output / "gpuvm-stack/test-gpuvm"),
+            "module_sha256": sha256(output / "gpgpu_pci.ko"),
+            "fault_modules": {
+                name: sha256(results / f"fault-{name}.ko") for name in groups
+            },
+        })
+    finally:
+        guest.close()
+
+
 def main():
-    """选择准备、运行、状态或验收入口，串行保护同一输出目录。"""
+    """选择准备、编译、交互运行或验收入口，串行保护同一输出目录。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "module", "test", "run",
-                                            "stack-test", "queue-test"))
+                                            "stack-test", "queue-test",
+                                            "gpuvm-test", "gpuvm-fault-test"))
     parser.add_argument("--output-dir", type=Path,
-                        default=ROOT / "build" / "gpgpu-linux-module")
+                        help="产物目录；GPUVM 默认使用独立内核环境")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--iommu", choices=("none", "smmuv3"), default="none",
                         help="系统 IOMMU 模式，默认 none")
     parser.add_argument("--skip-prepare", action="store_true",
-                        help="Test existing artifacts without rebuilding")
+                        help="直接验收已有产物，不重新准备或编译")
     parser.add_argument("--remote", action="store_true",
                         help="连接远端 GPGPU 与 RV64 CP")
     parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY,
                         help="远端设备 QEMU 路径")
     args = parser.parse_args()
+    gpuvm = args.command in ("gpuvm-test", "gpuvm-fault-test")
+    if gpuvm:
+        # 两种 GPUVM 验收都依赖独立的 DRM 内核及远端 CP，不能重建成发行版环境。
+        if args.force or args.skip_prepare:
+            parser.error("GPUVM 验收不接受 --force 或 --skip-prepare")
+        args.remote = True
+    if args.command == "gpuvm-fault-test" and args.iommu != "none":
+        parser.error("gpuvm-fault-test 使用 --iommu none")
     if args.skip_prepare and (args.command not in ("test", "stack-test", "queue-test")
                               or args.force):
-        parser.error("--skip-prepare requires a test without --force")
-    if args.remote and args.command not in ("test", "stack-test", "queue-test", "run"):
-        parser.error("--remote 只适用于 test、stack-test 或 run")
+        parser.error("--skip-prepare 只适用于验收，不能与 --force 同时使用")
+    if args.remote and args.command not in ("test", "stack-test", "queue-test",
+                                            "gpuvm-test", "gpuvm-fault-test", "run"):
+        parser.error("--remote 只适用于验收或 run")
     if args.command == "queue-test" and (not args.remote or args.iommu != "none"):
         parser.error("queue-test 要求 --remote --iommu none")
     device_qemu = args.device_qemu.resolve() if args.remote else None
@@ -735,7 +845,8 @@ def main():
             """将终止信号转换为异常，让统一清理路径关闭客体和远端设备。"""
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, interrupted)
-    output = args.output_dir.resolve()
+    default_output = "gpgpu-kernel-gpuvm" if gpuvm else "gpgpu-linux-module"
+    output = (args.output_dir or ROOT / "build" / default_output).resolve()
     if args.command == "run":
         command = runtime_command(output, interactive=True, iommu=args.iommu,
                                   remote=args.remote)
@@ -753,6 +864,8 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         with (output / ".build.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if gpuvm and not environment_metadata(output):
+                raise RuntimeError("先完成启用 DRM 的独立内核构建与导入")
             if not args.skip_prepare:
                 prepare(output, args.force, remote=args.remote)
             if args.command == "test":
@@ -761,6 +874,10 @@ def main():
                 stack_test(output, args.iommu, device_qemu)
             elif args.command == "queue-test":
                 queue_test(output, device_qemu)
+            elif args.command == "gpuvm-test":
+                gpuvm_test(output, args.iommu, device_qemu)
+            elif args.command == "gpuvm-fault-test":
+                gpuvm_fault_test(output, device_qemu)
 
 
 if __name__ == "__main__":

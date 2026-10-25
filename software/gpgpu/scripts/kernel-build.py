@@ -7,7 +7,6 @@ import argparse
 import datetime
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,13 +18,10 @@ import subprocess
 import tempfile
 import urllib.request
 
+import gpgpu_linux as MODULE
 
-SOURCE = Path(__file__).resolve().parent
-MATERIALS = SOURCE / "kernel"
-SPEC = importlib.util.spec_from_file_location("module_test",
-                                            SOURCE / "module-test.py")
-MODULE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODULE)
+
+MATERIALS = MODULE.SOURCE / "kernel"
 
 
 def checksum(path, algorithm="sha256"):
@@ -319,7 +315,7 @@ def build(args, output):
         raise RuntimeError("构建目录必须与原发行版环境分开")
     base_metadata = MODULE.environment_metadata(base)
     if not base_metadata:
-        raise RuntimeError("先运行 module-test.py prepare 建立发行版编译环境")
+        raise RuntimeError("先运行 linux/Makefile 的 prepare 建立发行版编译环境")
     if base_metadata["kernel_release"] != "6.18.57-0-virt":
         raise RuntimeError("本配方要求保留的 Alpine 6.18.57-0-virt 环境")
     packages = json.loads((MATERIALS / "cached-packages.json").read_text())
@@ -375,7 +371,8 @@ def build(args, output):
                 "-append", "console=ttyAMA0",
                 "-drive", f"file={disk},if=none,id=developer,format=raw",
                 "-device", "virtio-blk-pci,drive=developer", "-nic", "none"]
-    command += MODULE.shared_directory(SOURCE, "gpgpu_src", True)
+    command += MODULE.shared_directory(MODULE.GUEST_SCRIPTS, "gpgpu_src", True)
+    command += MODULE.shared_directory(MODULE.STACK, "gpgpu_stack", True)
     command += MODULE.shared_directory(output, "gpgpu_build", False)
     MODULE.write_metadata(output / "build-command.json", command)
     print(f"启动 ARM64 构建客体：{args.cpus} CPU / {args.memory} / "
@@ -385,7 +382,11 @@ def build(args, output):
         guest.wait(rb"^GPGPU_DEVELOPER_READY$")
         script = "guest-cross.sh" if args.build_mode == "cross" else "guest-build.sh"
         guest_log = "kernel-export.log" if args.build_mode == "cross" else "kernel-build.log"
-        guest.send("sh /mnt/gpgpu-src/kernel/" + script + " "
+        # 旧开发盘的 init 继续挂载脚本与产物；固定内核材料由软件栈共享提供。
+        guest.send("mkdir -p /mnt/gpgpu-stack\n"
+                   "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
+                   "gpgpu_stack /mnt/gpgpu-stack\n"
+                   "sh /mnt/gpgpu-src/kernel/" + script + " "
                    + shlex.quote(str(args.cpus))
                    + " > /mnt/gpgpu-build/" + guest_log + " 2>&1\n"
                    "printf 'GPGPU_KERNEL_RC=%s\\n' \"$?\"\n")
