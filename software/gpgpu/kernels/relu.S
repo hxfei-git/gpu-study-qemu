@@ -3,11 +3,10 @@
 # 对有限 FP32 输入，根据符号位决定是否输出 +0。
 .include "gpgpu_kernel.inc"
 relu:
-	lui t0, GPGPU_CTRL_HI
-	lw t1, BLOCK_X(t0)
-	lw t2, BLOCK_DIM_X(t0)
+	csrr t1, BLOCK_ID_X
+	csrr t2, BLOCK_DIM_X
 	mul t1, t1, t2
-	lw t2, THREAD_X(t0)
+	csrr t2, THREAD_ID_X
 	add t1, t1, t2
 	lw t2, 8(a0)
 	bgeu t1, t2, done

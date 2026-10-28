@@ -13,8 +13,26 @@
 #include "gpgpu_compute_internal.h"
 #include "gpgpu_memory.h"
 
-/* 当前解释器只接受通过 CSRRS 读取线程身份。 */
+/* 启动状态和线程身份仅支持 CSRRS rs1=x0 读取。 */
+#define CSR_THREAD_ID_X 0xCC0
+#define CSR_BLOCK_ID_X 0xCC3
+#define CSR_GRID_DIM_Z 0xCCB
 #define CSR_MHARTID 0xF14
+
+/* 先检查编号，即使目标为 x0 也不能跳过非法 CSR 的执行错误。 */
+static bool isa_read_startup_csr(const GPGPUWarp *warp, const GPGPULane *lane,
+			       uint32_t csr, uint32_t *value)
+{
+	if (csr >= CSR_THREAD_ID_X && csr < CSR_BLOCK_ID_X)
+		*value = lane->startup_vgpr[csr - CSR_THREAD_ID_X];
+	else if (csr >= CSR_BLOCK_ID_X && csr <= CSR_GRID_DIM_Z)
+		*value = warp->startup_sgpr[csr - CSR_BLOCK_ID_X];
+	else if (csr == CSR_MHARTID)
+		*value = lane->mhartid;
+	else
+		return false;
+	return true;
+}
 
 /*
  * isa_set_rounding_mode() - 设置本条浮点指令的舍入模式
@@ -181,16 +199,17 @@ bool gpgpu_isa_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_id
 			warp->active_mask &= ~(1U << lane_id);
 			break;
 
-		case 0x2: /* CSRRS */
-			/*
-			 * mhartid 只读；CSRRS 的 rs1 必须为零，避免把读取解释成写入。
-			 */
-			if (csr != CSR_MHARTID || rs1 != 0)
+		case 0x2: { /* CSRRS */
+			uint32_t value;
+
+			/* rs1 按寄存器编码判断，其他寄存器即使保存零也属于写请求。 */
+			if (rs1 != 0 || !isa_read_startup_csr(warp, lane, csr, &value))
 				return gpgpu_exec_fail(ctx, 0);
 			if (rd != 0)
-				lane->gpr[rd] = lane->mhartid;
+				lane->gpr[rd] = value;
 			lane->pc += 4;
 			break;
+		}
 
 		default:
 			return gpgpu_exec_fail(ctx, 0);
@@ -272,7 +291,7 @@ bool gpgpu_isa_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_id
 
 		if (funct3 != 2)
 			return gpgpu_exec_fail(ctx, 0);
-		if (!gpgpu_memory_load_word(ctx, warp, lane_id, addr, &value))
+		if (!gpgpu_memory_load_word(ctx, addr, &value))
 			return false;
 		if (opcode == 0x07)
 			lane->fpr[rd] = value;

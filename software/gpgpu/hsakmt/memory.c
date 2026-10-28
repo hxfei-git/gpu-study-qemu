@@ -14,12 +14,12 @@ static uint64_t vm_choose_address(GpgpuKmtContext *c, uint64_t size, uint64_t al
 			GpgpuKmtMemory *m;
 
 			for (m = c->memory; m; m = m->next)
-				if (m->gpu_va && address < m->gpu_va + m->mapped_size &&
-				    m->gpu_va < address + size)
+				if (m->bound && address < m->gpu_address + m->mapped_size &&
+				    m->gpu_address < address + size)
 					break;
 			if (!m)
 				return address;
-			address = (m->gpu_va + m->mapped_size + alignment - 1) & ~(alignment - 1);
+			address = (m->gpu_address + m->mapped_size + alignment - 1) & ~(alignment - 1);
 		}
 	}
 	return 0;
@@ -48,7 +48,7 @@ GpgpuKmtStatus gpgpuKmtAllocMemoryEx(GpgpuKmtContext *c, uint32_t kind, uint64_t
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 	pthread_mutex_lock(&gpgpu_kmt_lock);
-	if (!c->gpuvm) {
+	if (!c->gpuvm && fixed_va) {
 		status = GPGPU_KMT_NOT_SUPPORTED;
 		goto out;
 	}
@@ -67,8 +67,9 @@ GpgpuKmtStatus gpgpuKmtAllocMemoryEx(GpgpuKmtContext *c, uint32_t kind, uint64_t
 		}
 	}
 	map.handle = create.handle;
-	map.address = fixed_va ? fixed_va : vm_choose_address(c, create.mapped_size, alignment);
-	if (!map.address) {
+	map.address = !c->gpuvm ? 0 :
+		(fixed_va ? fixed_va : vm_choose_address(c, create.mapped_size, alignment));
+	if (c->gpuvm && !map.address) {
 		status = GPGPU_KMT_OUT_OF_RESOURCES;
 		goto rollback;
 	}
@@ -87,7 +88,8 @@ GpgpuKmtStatus gpgpuKmtAllocMemoryEx(GpgpuKmtContext *c, uint32_t kind, uint64_t
 		.kind = kind,
 		.size = size,
 		.mapped_size = create.mapped_size,
-		.gpu_va = map.address,
+		.gpu_address = map.address,
+		.bound = true,
 		.mmap_offset = create.mmap_offset,
 		.cpu = cpu,
 		.next = c->memory,
@@ -110,7 +112,7 @@ out:
 static GpgpuKmtStatus vm_free_memory(GpgpuKmtMemory *m)
 {
 	GpgpuKmtContext *c = m->context;
-	struct gpgpu_vm_map map = { .version = GPGPU_DRM_VERSION, .address = m->gpu_va };
+	struct gpgpu_vm_map map = { .version = GPGPU_DRM_VERSION, .address = m->gpu_address };
 	struct gpgpu_gem_close release = { .handle = m->handle };
 	GpgpuKmtStatus status = gpgpu_kmt_begin(c);
 	GpgpuKmtMemory **link;
@@ -118,11 +120,16 @@ static GpgpuKmtStatus vm_free_memory(GpgpuKmtMemory *m)
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 	pthread_mutex_lock(&gpgpu_kmt_lock);
-	if (m->gpu_va && ioctl(c->fd, GPGPU_DRM_UNMAP, &map) < 0) {
+	if (m->queue_users || c->queues) {
+		status = GPGPU_KMT_UNAVAILABLE;
+		goto out;
+	}
+	if (m->bound && ioctl(c->fd, GPGPU_DRM_UNMAP, &map) < 0) {
 		status = gpgpu_kmt_error(errno);
 		goto out;
 	}
-	m->gpu_va = 0;
+	m->bound = false;
+	m->gpu_address = 0;
 	if (m->cpu && munmap(m->cpu, m->mapped_size)) {
 		status = gpgpu_kmt_error(errno);
 		goto out;
@@ -144,123 +151,19 @@ out:
 	return status;
 }
 
-/*
- * gpgpuKmtAllocMemory() - 申请 Host 或 VRAM 内存对象
- *
- * 通过 ioctl 取得句柄和地址；Host 对象再建立 CPU 映射，失败时回收申请。
- */
+/* 普通数据对象默认可读写；代码通过 Ex 指定执行权限。 */
 GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
-				   uint64_t alignment, GpgpuKmtMemory *memory)
+                                    uint64_t alignment, GpgpuKmtMemory *memory)
 {
-	struct gpgpu_memory_request request = {
-		.version = GPGPU_QABI_VERSION,
-		.kind = kind,
-		.size = size,
-		.alignment = alignment,
-	};
-	GpgpuKmtStatus status;
-	void *mapping = NULL;
-
-	if (!memory || !size || !alignment || (alignment & (alignment - 1)))
-		return GPGPU_KMT_INVALID_PARAMETER;
-	memset(memory, 0, sizeof(*memory));
-	status = gpgpu_kmt_begin(context);
-	if (status != GPGPU_KMT_SUCCESS)
-		return status;
-	if (context->gpuvm) {
-		status = gpgpuKmtAllocMemoryEx(context, kind, size, alignment,
-					       GPGPU_VM_READ | GPGPU_VM_WRITE, 0, memory);
-		gpgpu_kmt_end(context);
-		return status;
-	}
-	if (ioctl(context->fd, GPGPU_IOC_MEMORY_ALLOC, &request) < 0) {
-		status = gpgpu_kmt_error(errno);
-		goto done;
-	}
-	if (kind == GPGPU_MEMORY_HOST) {
-		mapping = mmap(NULL, request.size, PROT_READ | PROT_WRITE, MAP_SHARED, context->fd,
-			       request.mmap_offset);
-		if (mapping == MAP_FAILED) {
-			struct gpgpu_object_request release = {
-				.version = GPGPU_QABI_VERSION,
-				.handle = request.handle,
-			};
-
-			status = gpgpu_kmt_error(errno);
-			ioctl(context->fd, GPGPU_IOC_MEMORY_FREE, &release);
-			goto done;
-		}
-	}
-	*memory = (GpgpuKmtMemory) {
-		.context = context,
-		.handle = request.handle,
-		.kind = request.kind,
-		.size = request.size,
-		.vram_offset = request.vram_offset,
-		.host_address = request.host_address,
-		.mmap_offset = request.mmap_offset,
-		.cpu = mapping,
-	};
-	gpgpu_kmt_objects(context, 1);
-done:
-	gpgpu_kmt_end(context);
-	return status;
+	return gpgpuKmtAllocMemoryEx(context, kind, size, alignment,
+	                            GPGPU_VM_READ | GPGPU_VM_WRITE, 0, memory);
 }
 
-/*
- * gpgpuKmtFreeMemory() - 释放不再使用的内存对象
- *
- * 先检查队列引用并解除映射；驱动拒绝释放时尝试恢复 CPU 映射。
- */
 GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 {
-	GpgpuKmtContext *context;
-	struct gpgpu_object_request request;
-	GpgpuKmtStatus status;
-	bool mapped;
-
 	if (!memory || !memory->context)
 		return GPGPU_KMT_INVALID_PARAMETER;
-	context = memory->context;
-	if (context->gpuvm)
-		return vm_free_memory(memory);
-	status = gpgpu_kmt_begin(context);
-	if (status != GPGPU_KMT_SUCCESS)
-		return status;
-	pthread_mutex_lock(&gpgpu_kmt_lock);
-	if (memory->queue_users) {
-		pthread_mutex_unlock(&gpgpu_kmt_lock);
-		gpgpu_kmt_end(context);
-		return GPGPU_KMT_UNAVAILABLE;
-	}
-	pthread_mutex_unlock(&gpgpu_kmt_lock);
-	mapped = memory->cpu != NULL;
-	if (mapped && munmap(memory->cpu, memory->size)) {
-		status = gpgpu_kmt_error(errno);
-		goto done;
-	}
-	memory->cpu = NULL;
-	request = (struct gpgpu_object_request) {
-		.version = GPGPU_QABI_VERSION,
-		.handle = memory->handle,
-	};
-	if (ioctl(context->fd, GPGPU_IOC_MEMORY_FREE, &request) < 0) {
-		status = gpgpu_kmt_error(errno);
-		/* 外部映射等引用阻止回收时，恢复本库可用的映射。 */
-		if (mapped) {
-			void *mapping = mmap(NULL, memory->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-					     context->fd, memory->mmap_offset);
-
-			if (mapping != MAP_FAILED)
-				memory->cpu = mapping;
-		}
-		goto done;
-	}
-	gpgpu_kmt_objects(context, -1);
-	memset(memory, 0, sizeof(*memory));
-done:
-	gpgpu_kmt_end(context);
-	return status;
+	return vm_free_memory(memory);
 }
 
 /*
@@ -288,5 +191,5 @@ GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset, Gp
 		.vram_offset = vram_offset,
 		.size = size,
 	};
-	return gpgpu_kmt_ioctl(host->context, GPGPU_IOC_MEMORY_COPY, &request);
+	return gpgpu_kmt_ioctl(host->context, GPGPU_DRM_COPY, &request);
 }

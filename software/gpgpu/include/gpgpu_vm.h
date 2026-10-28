@@ -2,24 +2,20 @@
 #ifndef GPGPU_VM_H
 #define GPGPU_VM_H
 
-/* GPUVM 固定版本；旧物理队列不使用这些寄存器和地址语义。 */
-#define GPGPU_VM_VERSION 1U
+/* 设备、固件和驱动共用的统一访存协议版本。 */
+#define GPGPU_VM_VERSION 2U
 #define GPGPU_VM_PAGE_SIZE 4096U
 #define GPGPU_VM_USERS 2U
 #define GPGPU_VM_ADDRESS_LIMIT 0x100000000ULL
 #define GPGPU_VM_NOTIFY_VA 0xfffff000U
-#define GPGPU_VM_CTRL_VA 0x80000000U
-#define GPGPU_VM_ARGS_VA 0x90000000U
-#define GPGPU_VM_ARGS_END 0x90010000U
-#define GPGPU_VM_ADDR_MASK 0x0000fffffffff000ULL
-/* 表项沿用有效、Host 域及读写取指位，其他位必须为零。 */
+#define GPGPU_VM_ADDR_MASK 0xfffff000ULL
+/* 表项仅保存 32 位 GPU 物理页地址、有效和读写取指位。 */
 #define GPGPU_VM_VALID (1ULL << 0)
-#define GPGPU_VM_SYSTEM (1ULL << 1)
 #define GPGPU_VM_EXEC (1ULL << 4)
 #define GPGPU_VM_READ (1ULL << 5)
 #define GPGPU_VM_WRITE (1ULL << 6)
 #define GPGPU_VM_PERMS (GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_EXEC)
-#define GPGPU_VM_FLAGS (GPGPU_VM_VALID | GPGPU_VM_SYSTEM | GPGPU_VM_PERMS)
+#define GPGPU_VM_FLAGS (GPGPU_VM_VALID | GPGPU_VM_PERMS)
 /* BAR0：只读版本/启动模式、固件握手、同步失效和固定上下文窗口。 */
 #define GPGPU_REG_VM_VERSION 0x0900
 #define GPGPU_REG_VM_MODE 0x0904
@@ -48,7 +44,19 @@
 #define GPGPU_VM_FAULT_TABLE 4U
 #define GPGPU_VM_FAULT_PERMISSION 5U
 #define GPGPU_VM_FAULT_STORAGE 6U
-/* CP 本地窗口：域为 0 时管理 DMA 直通，域为 1 时必须按 VMID 翻译。 */
+/* 全设备 Outbound 窗口，配置在 CP 启动前完成。 */
+#define GPGPU_REG_OUTBOUND_GPU_BASE 0x0b00
+#define GPGPU_REG_OUTBOUND_SIZE_LO 0x0b04
+#define GPGPU_REG_OUTBOUND_SIZE_HI 0x0b08
+#define GPGPU_REG_OUTBOUND_HOST_LO 0x0b0c
+#define GPGPU_REG_OUTBOUND_HOST_HI 0x0b10
+#define GPGPU_REG_OUTBOUND_CONTROL 0x0b14
+#define GPGPU_REG_OUTBOUND_STATUS 0x0b18
+#define GPGPU_OUTBOUND_ENABLE 1U
+#define GPGPU_OUTBOUND_ACK 1U
+#define GPGPU_OUTBOUND_BUSY 2U
+#define GPGPU_OUTBOUND_ERROR 4U
+/* CP 本地窗口：域为 0 时访问 GPU 物理地址，域为 1 时按设备属性翻译或直通。 */
 #define GPGPU_CP_VM_DOMAIN 0xfffe0008U
 #define GPGPU_CP_VM_ID 0xfffe000cU
 #define GPGPU_CP_VM_SLOT 0xfffe0010U

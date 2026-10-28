@@ -66,7 +66,7 @@ make -f Makefile.camp build
 # 运行指定方向的实验测试
 make -f Makefile.camp test-cpu
 make -f Makefile.camp test-soc
-make -f Makefile.camp test-gpgpu
+make -f Makefile.camp test-gpgpu-stack
 make -f Makefile.camp test-rust
 
 # 运行所有实验测试
@@ -103,14 +103,14 @@ git push origin main
 - 运行：`make -f Makefile.camp test-soc`
 - 文档：[实验手册](https://qemu.gevico.online/exercise/2026/stage1/soc/g233-exper-manual/) | [G233 SoC 硬件手册](https://qemu.gevico.online/exercise/2026/stage1/soc/g233-datasheet/)
 
-### GPGPU 实验（QTest 测题）
+### GPGPU 实验（DRM/AQL 核心计算）
 
-实现 PCIe GPGPU 设备，包含 SIMT 执行引擎、DMA 和低精度浮点支持。测试验证设备寄存器、显存、内核执行和 FP8/FP4 转换。
+当前软件栈通过 DRM/GEM、AQL Queue、RV64 CP 和 Signal/IH 运行 RV32 Kernel。用户访存按 `gpuvm=on/off` 翻译或直通，物理空间连续分为 VRAM 与 Outbound，线程启动信息通过只读 CSR 获取。
 
-- 设备：`hw/gpgpu/`（PCI 设备 `gpgpu`）
-- 测试：`tests/qtest/gpgpu-test.c`（17 个子测试）
-- 运行：`make -f Makefile.camp test-gpgpu`
-- 文档：[实验手册](https://qemu.gevico.online/exercise/2026/stage1/gpu/gpu-exper-manual/) | [GPU 硬件手册](https://qemu.gevico.online/exercise/2026/stage1/gpu/gpu-datasheet/)
+- 设备与软件：[软件栈说明](software/gpgpu/README.md)。
+- 计算示例：向量加法、矩阵乘法和 ReLU，保留原规模及逐元素比较。
+- 唯一验证入口：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
+- 原 GPGPU 专用 QTest 与评分任务已删除，历史结果保留在软件栈说明中。
 
 ### Rust 实验（QTest + 单元测试）
 
@@ -131,7 +131,7 @@ make -f Makefile.camp configure  # 配置 QEMU
 make -f Makefile.camp build      # 编译 QEMU
 make -f Makefile.camp test-cpu   # CPU 实验测试
 make -f Makefile.camp test-soc   # SoC 实验测试
-make -f Makefile.camp test-gpgpu # GPGPU 实验测试
+make -f Makefile.camp test-gpgpu-stack # GPGPU 实验测试
 make -f Makefile.camp test-rust  # Rust 实验测试
 make -f Makefile.camp test       # 所有测试
 make -f Makefile.camp clean      # 清理构建

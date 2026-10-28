@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""汇编文档中约定的教学指令子集，不支持伪指令。
+"""汇编文档中约定的教学指令子集，支持只读 CSR 的 csrr 伪指令。
 
 每条指令使用 32 位 RV32 编码；本工具不编译 C，
 也不实现完整的 GNU 汇编语言。
@@ -60,7 +60,7 @@ def encode(line, pc, symbols):
     """按助记符校验操作数，并将一条教学指令编码成 32 位 RV32 指令字。"""
     fields = line.replace(",", " ").split()
     op, operands = fields[0], fields[1:]
-    counts = {"ebreak": 0, "lui": 2, "jal": 2}
+    counts = {"ebreak": 0, "lui": 2, "jal": 2, "csrr": 2}
     expected = counts.get(op, 3)
     if op in ("lw", "sw", "flw", "fsw"):
         expected = 2
@@ -68,6 +68,13 @@ def encode(line, pc, symbols):
         raise ValueError(f"{op} expects {expected} operands")
     if op == "ebreak":
         return 0x00100073
+    if op in ("csrr", "csrrs"):
+        rd = register(operands[0])
+        csr = immediate(operands[1], symbols)
+        if not 0 <= csr < 1 << 12:
+            raise ValueError("CSR operand must be in 0..4095")
+        rs1 = 0 if op == "csrr" else register(operands[2])
+        return (csr << 20) | (rs1 << 15) | (2 << 12) | (rd << 7) | 0x73
     if op == "lui":
         rd = register(operands[0])
         imm = immediate(operands[1], symbols)

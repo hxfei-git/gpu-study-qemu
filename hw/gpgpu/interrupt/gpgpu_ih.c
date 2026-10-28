@@ -38,10 +38,12 @@ void gpgpu_ih_refresh_irq(GPGPUState *s)
  *
  * 要求页对齐基址、2 的幂字节容量，并检查末地址不溢出。
  */
-static bool ih_config_valid(GPGPUIHState *ih)
+static bool ih_config_valid(GPGPUState *s)
 {
+	GPGPUIHState *ih = &s->ih;
+
 	return !(ih->base & 4095) && ih->size >= sizeof(GpgpuIhRecord) && is_power_of_2(ih->size) &&
-		ih->base <= UINT64_MAX - (ih->size - 1);
+		gpgpu_phys_contains(s, ih->base, ih->size);
 }
 
 /*
@@ -90,7 +92,7 @@ static void ih_submit(GPGPUState *s, uint32_t addr)
 		result = GPGPU_IH_ERR_DISABLED;
 		goto done;
 	}
-	if (!ih_config_valid(ih)) {
+	if (!ih_config_valid(s)) {
 		result = GPGPU_IH_ERR_CONFIG;
 		goto done;
 	}
@@ -111,7 +113,7 @@ static void ih_submit(GPGPUState *s, uint32_t addr)
 		goto done;
 	}
 	ih->status |= GPGPU_IH_BUSY;
-	if (gpgpu_host_access(s, ih->base + (ih->wptr % capacity) * sizeof(record), record,
+	if (gpgpu_phys_access(s, ih->base + (ih->wptr % capacity) * sizeof(record), record,
 			      sizeof(record), true) != MEMTX_OK) {
 		result = GPGPU_IH_ERR_DMA;
 		goto done;
@@ -201,7 +203,7 @@ void gpgpu_ih_write(GPGPUState *s, hwaddr addr, uint32_t val, bool from_cp)
 			ih->status = ih->wptr = ih->rptr = 0;
 			return;
 		}
-		if ((val & GPGPU_IH_ENABLE) && !ih_config_valid(ih)) {
+		if ((val & GPGPU_IH_ENABLE) && !ih_config_valid(s)) {
 			ih_fault(s, GPGPU_IH_ERR_CONFIG);
 			return;
 		}

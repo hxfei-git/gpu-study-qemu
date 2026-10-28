@@ -21,7 +21,7 @@ GpgpuKmtStatus gpgpuKmtCreateEvent(GpgpuKmtQueue *queue, GpgpuKmtEvent *event)
 	status = gpgpu_kmt_begin(queue->context);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
-	if (gpgpu_kmt_raw_ioctl(queue->context, GPGPU_IOC_EVENT_CREATE, &request) < 0) {
+	if (gpgpu_kmt_raw_ioctl(queue->context, GPGPU_DRM_EVENT_CREATE, &request) < 0) {
 		status = gpgpu_kmt_error(errno);
 	} else {
 		*event = (GpgpuKmtEvent) {
@@ -30,7 +30,7 @@ GpgpuKmtStatus gpgpuKmtCreateEvent(GpgpuKmtQueue *queue, GpgpuKmtEvent *event)
 			.queue_id = queue->id,
 			.mailbox_address = request.mailbox_address,
 		};
-		if (queue->context->gpuvm) {
+		{
 			pthread_mutex_lock(&gpgpu_kmt_lock);
 			event->next = queue->context->events;
 			queue->context->events = event;
@@ -55,7 +55,7 @@ GpgpuKmtStatus gpgpuKmtQueryEvent(GpgpuKmtEvent *event, struct gpgpu_event_reque
 		.version = GPGPU_QABI_VERSION,
 		.event_id = event->id,
 	};
-	return gpgpu_kmt_ioctl(event->context, GPGPU_IOC_EVENT_QUERY, state);
+	return gpgpu_kmt_ioctl(event->context, GPGPU_DRM_EVENT_QUERY, state);
 }
 
 /*
@@ -74,7 +74,7 @@ GpgpuKmtStatus gpgpuKmtWaitEvent(GpgpuKmtEvent *event, uint32_t timeout_ms)
 		.event_id = event->id,
 		.timeout_ms = timeout_ms,
 	};
-	return gpgpu_kmt_ioctl(event->context, GPGPU_IOC_EVENT_WAIT, &request);
+	return gpgpu_kmt_ioctl(event->context, GPGPU_DRM_EVENT_WAIT, &request);
 }
 
 /*
@@ -98,10 +98,10 @@ GpgpuKmtStatus gpgpuKmtDestroyEvent(GpgpuKmtEvent *event)
 	status = gpgpu_kmt_begin(context);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
-	if (gpgpu_kmt_raw_ioctl(context, GPGPU_IOC_EVENT_DESTROY, &request) < 0) {
+	if (gpgpu_kmt_raw_ioctl(context, GPGPU_DRM_EVENT_DESTROY, &request) < 0) {
 		status = gpgpu_kmt_error(errno);
 	} else {
-		if (context->gpuvm) {
+		{
 			GpgpuKmtEvent **link;
 
 			pthread_mutex_lock(&gpgpu_kmt_lock);

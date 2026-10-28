@@ -5,8 +5,7 @@
 # 基础实验基于 RISC-V。
 #   - CPU experiment:  TCG testcase  (tests/gevico/tcg)    [softmmu]
 #   - SoC experiment:  QTest         (tests/gevico/qtest)  [softmmu]
-#   - GPGPU experiment: QTest        (tests/gevico/qtest)  [softmmu]
-#   - GPGPU 软件栈：ARM64 Linux 客体中的驱动和运行时
+#   - GPGPU 软件栈：ARM64 Linux 客体中的 DRM/AQL 核心计算
 #   - Rust experiment: QTest + unit  (tests/gevico/qtest)  [softmmu + rust]
 
 SHELL := bash -o pipefail
@@ -20,7 +19,7 @@ BUILD_DIR := $(SRC_DIR)/build
 CROSS_PREFIX ?= riscv64-unknown-elf-
 
 # Configure flags — one config to rule all experiments:
-#   riscv64-softmmu    : SoC/GPGPU QTest + CPU TCG system tests
+#   riscv64-softmmu    : SoC QTest + CPU TCG system tests
 #   riscv64-linux-user : CPU TCG user-mode tests
 #   --enable-rust      : Rust experiment unit tests
 #   --cross-prefix     : bare-metal cross compiler for TCG testcases
@@ -33,10 +32,6 @@ CONFIGURE_FLAGS := \
 # Parallel jobs (default: nproc)
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 JOBS  ?= $(NPROC)
-IOMMU ?= none
-REMOTE ?= 0
-ARM64_BUILD_DIR ?= $(BUILD_DIR)/arm64-qemu
-DEVICE_QEMU ?= $(ARM64_BUILD_DIR)/qemu-system-riscv64
 
 # Use QEMU's bundled meson from pyvenv to avoid version mismatch
 MESON = $(BUILD_DIR)/pyvenv/bin/meson
@@ -58,11 +53,7 @@ help:
 	@echo "  test               Run all experiment tests"
 	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
 	@echo "  test-soc           Run SoC experiment tests (QTest)"
-	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
-	@echo "  test-gpgpu-iommu   运行 ARM64 SMMUv3 的两项 GPGPU DMA QTest"
-	@echo "  test-gpgpu-remote-iommu  运行远端 GPGPU 的两项 SMMUv3 DMA QTest"
-	@echo "  test-gpgpu-cp      运行 RV64 CP、队列、固件与 GPUVM 的十八项 QTest"
-	@echo "  test-gpgpu-stack   运行 GPGPU Linux 驱动与运行时集成测试"
+	@echo "  test-gpgpu-stack   运行 GPUVM 开／关下的三个计算示例"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
 	@echo "  test-rust-qtest    Run Rust QTest tests only"
@@ -138,81 +129,10 @@ test-soc: build
 	echo "--- SoC experiment: $$passed/$$total tests passed ---"; \
 	[ "$$passed" -eq "$$total" ]
 
-# ─── GPGPU experiment (QTest via QOS) ─────────────────────────────────
-# 17 subtests inside qos-test, run individually for scoring.
-# Score: passed * 100 / 17 (rounded down), total = 100.
-
-GPGPU_SUBTESTS := device-id vram-size global-ctrl dispatch-regs \
-                  vram-access dma-regs irq-regs \
-                  simt-thread-id simt-block-id simt-warp-lane \
-                  simt-thread-mask simt-reset \
-                  kernel-exec fp-kernel-exec \
-                  lp-convert lp-convert-e5m2-e2m1 lp-convert-saturate
-
-GPGPU_TOTAL := 17
-
-.PHONY: test-gpgpu
-test-gpgpu: build
-	@passed=0; \
-	export QTEST_QEMU_BINARY=$(BUILD_DIR)/qemu-system-riscv64; \
-	for t in $(GPGPU_SUBTESTS); do \
-	    if $(BUILD_DIR)/tests/qtest/qos-test \
-	        -p /riscv64/virt/generic-pcihost/pci-bus-generic/pci-bus/gpgpu/gpgpu-tests/$$t \
-	        --tap -k 2>/dev/null | grep -q "^ok "; then \
-	        passed=$$((passed + 1)); \
-	    fi; \
-	done; \
-	score=$$((passed * 100 / $(GPGPU_TOTAL))); \
-	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
-	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"; \
-	[ "$$passed" -eq "$(GPGPU_TOTAL)" ]
-
-# 复用 Linux 测试的 ARM64 QEMU 配置；首次先执行 linux/Makefile 的 prepare。
-.PHONY: test-gpgpu-iommu
-test-gpgpu-iommu:
-	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
-		qemu-system-aarch64 tests/qtest/gpgpu-iommu-test
-	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
-		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-iommu-test" --tap \
-		2>&1 | tee "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
-	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-iommu-qtest.log")" = 2
-	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
-	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-iommu-qtest.log"
-
-# 三个目标共用已配置了 AArch64、RV64 与 vfio-user-server 的构建。
-.PHONY: test-gpgpu-remote-iommu test-gpgpu-cp
-test-gpgpu-remote-iommu:
-	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
-		qemu-system-aarch64 qemu-system-riscv64 tests/qtest/gpgpu-iommu-test
-	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
-		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" QTEST_GPGPU_REMOTE=1 \
-		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-remote-iommu-logs" \
-		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-iommu-test" --tap \
-		2>&1 | tee "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
-	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log")" = 2
-	@grep -qx '1\.\.2' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
-	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-remote-iommu-qtest.log"
-
-test-gpgpu-cp:
-	$(MAKE) -C software/gpgpu/firmware
-	ninja -C "$(ARM64_BUILD_DIR)" -j$(JOBS) \
-		qemu-system-aarch64 qemu-system-riscv64 tests/qtest/gpgpu-cp-test
-	QTEST_QEMU_BINARY="$(ARM64_BUILD_DIR)/qemu-system-aarch64" \
-		QTEST_GPGPU_REMOTE_BINARY="$(DEVICE_QEMU)" \
-		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-cp-logs" \
-		QTEST_GPGPU_FIRMWARE="$(BUILD_DIR)/gpgpu-firmware/gpgpu-cp.bin" \
-		"$(ARM64_BUILD_DIR)/tests/qtest/gpgpu-cp-test" --tap \
-		2>&1 | tee "$(BUILD_DIR)/gpgpu-cp-qtest.log"
-	@test "$$(grep -c '^ok ' "$(BUILD_DIR)/gpgpu-cp-qtest.log")" = 18
-	@grep -qx '1\.\.18' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
-	@! grep -Eq '^not ok |# SKIP' "$(BUILD_DIR)/gpgpu-cp-qtest.log"
-
-# ─── GPGPU 软件栈（实际 Linux PCI 驱动与运行时）────────────
-
+# 核心计算固定使用 A57、1 GiB、IOMMU=none，分别运行 GPUVM 开和关。
 .PHONY: test-gpgpu-stack
 test-gpgpu-stack:
-	$(MAKE) -C "$(SRC_DIR)/software/gpgpu/linux" stack-test \
-		IOMMU="$(IOMMU)" REMOTE="$(REMOTE)" DEVICE_QEMU="$(DEVICE_QEMU)"
+	python3 "$(SRC_DIR)/software/gpgpu/scripts/gpgpu_linux.py" stack-test
 
 # ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
 
@@ -254,7 +174,7 @@ test-rust: build
 # ─── Run all tests ────────────────────────────────────────────────────
 
 .PHONY: test
-test: test-cpu test-soc test-gpgpu test-rust
+test: test-cpu test-soc test-rust
 	@echo "=== All experiment tests done ==="
 
 # ─── Clean ────────────────────────────────────────────────────────────

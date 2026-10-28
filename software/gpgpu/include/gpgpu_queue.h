@@ -11,7 +11,8 @@ typedef __UINT64_TYPE__ gpgpu_q_u64;
 typedef __INT64_TYPE__ gpgpu_q_s64;
 
 /* 设备、固件与 Host 共用的队列协议版本。 */
-#define GPGPU_QUEUE_ABI_VERSION 1
+#define GPGPU_QUEUE_ABI_VERSION 2
+#define GPGPU_KERNEL_ABI_VERSION 2U
 /* HQD 总槽数：KIQ、HIQ 和两个用户槽。 */
 #define GPGPU_QUEUE_SLOTS 4
 /* 全设备共享的用户队列名额。 */
@@ -42,9 +43,9 @@ typedef __INT64_TYPE__ gpgpu_q_s64;
 #define GPGPU_REG_HQD_SELECT 0x0600
 /* Host 访问已选 HQD 槽的 BAR0 窗口偏移。 */
 #define GPGPU_REG_HQD_WINDOW 0x0700
-/* IH Ring Host 物理基址低 32 位，停用时由 Host 配置。 */
+/* IH Ring GPU 物理基址低 32 位，停用时由 Host 配置。 */
 #define GPGPU_REG_IH_BASE_LO 0x0800
-/* IH Ring Host 物理基址高 32 位，停用时由 Host 配置。 */
+/* IH Ring GPU 物理基址高 32 位，停用时由 Host 配置。 */
 #define GPGPU_REG_IH_BASE_HI 0x0804
 /* IH Ring 字节容量，停用时由 Host 配置。 */
 #define GPGPU_REG_IH_SIZE 0x0808
@@ -68,22 +69,20 @@ typedef __INT64_TYPE__ gpgpu_q_s64;
 #define GPGPU_REG_DISPATCH_ERROR 0x033c
 /* CP 在终态写 1 确认结果，使执行器返回空闲。 */
 #define GPGPU_REG_DISPATCH_ACK 0x0340
-/* RV32 线程读取 Host 参数的只读窗口起始地址。 */
-#define GPGPU_KERNEL_ARGS_WINDOW 0x90000000u
 /* 单次派发允许的 Host 参数字节数上限。 */
 #define GPGPU_KERNEL_ARGS_MAX 65536u
 
-/* 槽内 MQD Host 地址低 32 位。 */
+/* 槽内 MQD GPU 物理地址低 32 位。 */
 #define GPGPU_HQD_MQD_LO 0x000
-/* 槽内 MQD Host 地址高 32 位。 */
+/* 槽内 MQD GPU 物理地址高 32 位。 */
 #define GPGPU_HQD_MQD_HI 0x004
 /* 槽激活标志；清零只停止取包，不代表已释放占用。 */
 #define GPGPU_HQD_ACTIVE 0x008
-/* 槽地址空间编号，本版只能写零。 */
+/* 槽地址空间编号：管理槽为零，用户槽保留所属上下文编号。 */
 #define GPGPU_HQD_VMID 0x00c
-/* Ring Host 物理基址低 32 位。 */
+/* Ring GPU 地址低 32 位。 */
 #define GPGPU_HQD_RING_LO 0x020
-/* Ring Host 物理基址高 32 位。 */
+/* Ring GPU 地址高 32 位。 */
 #define GPGPU_HQD_RING_HI 0x024
 /* CP 当前下一消费包的 32 位编号。 */
 #define GPGPU_HQD_RPTR 0x028
@@ -261,33 +260,27 @@ enum GpgpuDispatchStatus {
  * @GPGPU_EXEC_ERR_NONE: 未记录执行错误。
  * @GPGPU_EXEC_ERR_INVALID_CONFIG: 提交配置不满足当前执行条件。
  * @GPGPU_EXEC_ERR_CODE_RANGE: 取指超出本次代码范围。
- * @GPGPU_EXEC_ERR_ARG_RANGE: 参数地址、对齐或访问范围非法。
- * @GPGPU_EXEC_ERR_ARG_READ: 读取 Host 参数失败。
- * @GPGPU_EXEC_ERR_ARG_WRITE: 尝试写入只读参数窗口。
  * @GPGPU_EXEC_ERR_INSTRUCTION: 遇到非法或未支持指令。
- * @GPGPU_EXEC_ERR_VRAM: 计算线程的 VRAM 访问非法。
+ * @GPGPU_EXEC_ERR_MEMORY: 计算线程的普通存储访问失败。
  * @GPGPU_EXEC_ERR_BUDGET: warp 或整次派发耗尽执行预算。
  */
 enum GpgpuDispatchError {
 	GPGPU_EXEC_ERR_NONE,
 	GPGPU_EXEC_ERR_INVALID_CONFIG,
 	GPGPU_EXEC_ERR_CODE_RANGE,
-	GPGPU_EXEC_ERR_ARG_RANGE,
-	GPGPU_EXEC_ERR_ARG_READ,
-	GPGPU_EXEC_ERR_ARG_WRITE,
 	GPGPU_EXEC_ERR_INSTRUCTION,
-	GPGPU_EXEC_ERR_VRAM,
+	GPGPU_EXEC_ERR_MEMORY,
 	GPGPU_EXEC_ERR_BUDGET,
 };
 
 /**
  * struct GpgpuMqd - 64 字节小端 MQD，存活队列各自独占并至少按 8 字节对齐
- * @ring_base: Ring 的完整 Host 物理基址，按 64 字节对齐。
- * @rptr_report_addr: 32 位消费进度 R 的 Host 地址，按 8 字节对齐。
- * @wptr_poll_addr: 32 位发布或预留进度 W 的 Host 地址，按 8 字节对齐。
+ * @ring_base: Ring 的用户 GPU 地址或管理 GPU 物理基址，按 64 字节对齐。
+ * @rptr_report_addr: 32 位消费进度 R 的 GPU 地址，按 8 字节对齐。
+ * @wptr_poll_addr: 32 位发布或预留进度 W 的 GPU 地址，按 8 字节对齐。
  * @pq_control: Ring 字节容量，本版直接保存容量而非对数编码。
  * @doorbell_control: Doorbell 字节偏移与 ENABLE 位的组合。
- * @vmid: 队列地址空间编号，本版固定为零。
+ * @vmid: 用户队列所属上下文编号，管理队列为零。
  * @aql_control: 管理 Ring 为零，用户 AQL Ring 为 1。
  * @saved_rptr: 卸载时保存的 R，将 32 位编号零扩展为 64 位。
  * @saved_error: 卸载时保存的首次队列错误，非零时禁止普通重装。
@@ -346,10 +339,10 @@ typedef struct GpgpuManagementResult {
  * @grid_size_z: Z 维总线程数，须为 workgroup_size_z 的整数倍。
  * @private_segment_size: 每线程私有段字节数，本版只接受零。
  * @group_segment_size: 每工作组共享段字节数，本版只接受零。
- * @kernel_object: 16 字节 Kernel 描述对象的 VRAM 偏移，按 8 字节对齐。
- * @kernarg_address: 参数块的完整 Host 物理地址，按 8 字节对齐。
+ * @kernel_object: 16 字节 Kernel 描述对象的用户 GPU 地址，按 8 字节对齐。
+ * @kernarg_address: 参数块的用户 GPU 地址，按 8 字节对齐。
  * @reserved2: 保留字段，必须为零。
- * @completion_signal: 24 字节 Signal 的完整 Host 物理地址，按 8 字节对齐。
+ * @completion_signal: 24 字节 Signal 的用户 GPU 地址，按 8 字节对齐。
  */
 typedef struct GpgpuAqlPacket {
 	gpgpu_q_u32 full_header;
@@ -369,17 +362,17 @@ typedef struct GpgpuAqlPacket {
 } GpgpuAqlPacket;
 
 /**
- * struct GpgpuKernelDescriptor - 16 字节小端 Kernel 描述对象，存放在用户 VRAM
- * @code_entry: RV32 代码入口的 VRAM 字节偏移，按 4 字节对齐。
+ * struct GpgpuKernelDescriptor - 16 字节小端 Kernel 描述对象，经用户访问域读取
+ * @code_entry: RV32 代码入口的 GPU 地址，按 4 字节对齐。
  * @code_size: 代码字节数，非零且为 4 的倍数。
  * @kernarg_size: 参数块字节数，范围为 4 到 64 KiB，按 4 字节对齐。
- * @reserved: 保留字段，必须为零。
+ * @kernel_abi_version: 启动 CSR 与真实参数指针的 ABI，必须为 2。
  */
 typedef struct GpgpuKernelDescriptor {
 	gpgpu_q_u32 code_entry;
 	gpgpu_q_u32 code_size;
 	gpgpu_q_u32 kernarg_size;
-	gpgpu_q_u32 reserved;
+	gpgpu_q_u32 kernel_abi_version;
 } __attribute__((aligned(8))) GpgpuKernelDescriptor;
 
 /**
@@ -387,7 +380,7 @@ typedef struct GpgpuKernelDescriptor {
  * @value: 完整 64 位有符号完成值，本版提交为 1、成功减为零。
  * @event_id: 所属进程内非零且唯一的存活事件编号。
  * @reserved: 保留字段，必须为零。
- * @event_mailbox_ptr: 独占的 8 字节通知槽 Host 物理地址，按 8 字节对齐。
+ * @event_mailbox_ptr: 独占的 8 字节通知槽用户 GPU 地址，按 8 字节对齐。
  */
 typedef struct GpgpuSignal {
 	gpgpu_q_s64 value;
@@ -400,7 +393,7 @@ typedef struct GpgpuSignal {
  * struct GpgpuIhRecord - 32 字节小端通知记录，记录写完后设备才发布 IH W
  * @type: Signal 通知、队列错误或设备错误的 GpgpuIhType 编码。
  * @hqd_slot: 来源 HQD 槽号；设备错误使用全 1。
- * @mqd_addr: 来源队列的完整 MQD 地址；设备错误为零。
+ * @mqd_addr: 来源队列的完整 MQD GPU 物理地址；设备错误为零。
  * @data: Signal 通知的事件编号，或队列/设备错误值。
  * @reserved: 保留字段，必须为零。
  */
@@ -425,6 +418,7 @@ GPGPU_LAYOUT_ASSERT(GpgpuManagementResult, 16, status, 0x08);
 GPGPU_LAYOUT_ASSERT(GpgpuAqlPacket, 64, kernel_object, 0x20);
 GPGPU_LAYOUT_ASSERT(GpgpuAqlPacket, 64, completion_signal, 0x38);
 GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 16, kernarg_size, 0x08);
+GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 16, kernel_abi_version, 0x0c);
 GPGPU_LAYOUT_ASSERT(GpgpuSignal, 24, event_mailbox_ptr, 0x10);
 GPGPU_LAYOUT_ASSERT(GpgpuIhRecord, 32, data, 0x10);
 #undef GPGPU_LAYOUT_ASSERT

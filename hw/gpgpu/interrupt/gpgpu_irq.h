@@ -9,8 +9,7 @@
 
 /* 设备暴露的 MSI-X 向量总数。 */
 #define GPGPU_MSIX_VECTORS 4
-/* 同步 Kernel 完成使用的 MSI-X 向量号。 */
-#define GPGPU_MSIX_VEC_KERNEL 0
+/* 向量 0 保留，计算完成统一经 IH 向量通知。 */
 /* DMA 完成使用的 MSI-X 向量号。 */
 #define GPGPU_MSIX_VEC_DMA 1
 /* 设备错误使用的 MSI-X 向量号。 */

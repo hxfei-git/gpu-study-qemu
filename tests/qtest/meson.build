@@ -266,12 +266,6 @@ qtests_aarch64 = \
   (config_all_devices.has_key('CONFIG_IOMMU_TESTDEV') and
    config_all_devices.has_key('CONFIG_ARM_VIRT') ?
    ['iommu-smmuv3-test'] : []) + \
-  (config_all_devices.has_key('CONFIG_GPGPU') and
-   config_all_devices.has_key('CONFIG_ARM_VIRT') ?
-   ['gpgpu-iommu-test'] : []) + \
-  (config_all_devices.has_key('CONFIG_GPGPU') and
-   config_all_devices.has_key('CONFIG_VFIO_USER_SERVER') and
-   'riscv64-softmmu' in target_dirs ? ['gpgpu-cp-test'] : []) + \
   qtests_cxl +                                                                                  \
   ['arm-cpu-features',
    'numa-test',
@@ -335,9 +329,6 @@ qos_test_ss.add(
 
 if config_all_devices.has_key('CONFIG_VIRTIO_SERIAL')
   qos_test_ss.add(files('virtio-serial-test.c'))
-endif
-if config_all_devices.has_key('CONFIG_GPGPU')
-  qos_test_ss.add(files('gpgpu-test.c'))
 endif
 if config_all_devices.has_key('CONFIG_IP_OCTAL_232')
   qos_test_ss.add(files('ipoctal232-test.c'))
@@ -441,10 +432,6 @@ foreach dir : target_dirs
   endif
   qtest_env.set('G_TEST_DBUS_DAEMON', meson.project_source_root() / 'tests/dbus-vmstate-daemon.sh')
   qtest_env.set('QTEST_QEMU_BINARY', './qemu-system-' + target_base)
-  if 'gpgpu-cp-test' in target_qtests
-    qtest_env.set('QTEST_GPGPU_REMOTE_BINARY', './qemu-system-riscv64')
-    test_deps += [emulators['qemu-system-riscv64']]
-  endif
   if have_tools and have_vhost_user_blk_server
     qtest_env.set('QTEST_QEMU_STORAGE_DAEMON_BINARY', './storage-daemon/qemu-storage-daemon')
     test_deps += [qsd]

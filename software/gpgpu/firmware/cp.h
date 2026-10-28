@@ -10,7 +10,8 @@ typedef gpgpu_q_u64 u64;
 
 /**
  * struct CpSlot - 固件私有的 HQD 占用与管理结果记录
- * @mqd: 当前绑定 MQD 的完整 Host 物理地址；占用解除前不得复用。
+ * @mqd: 当前绑定 MQD 的完整 GPU 物理地址；占用解除前不得复用。
+ * @domain: 管理对象直接访问物理地址，用户对象按设备模式解释地址。
  * @occupied: 占用标记，ACTIVE 清零不代表该槽可重新分配。
  * @pending: 管理操作已结束，正在等待相邻 WRITE_COMPLETION 回报。
  * @result: 暂存的 GpgpuManagementStatus，由完成命令写入 Host。
@@ -19,14 +20,15 @@ typedef gpgpu_q_u64 u64;
 typedef struct CpSlot {
 	u64 mqd;
 	u32 occupied;
-	u32 vmid; /* 普通队列访问的上下文；MQD 本体显式使用管理域。 */
+	u32 domain; /* 明确区分管理物理访问与用户访问。 */
+	u32 vmid;   /* 普通队列访问的上下文；MQD 本体显式使用管理域。 */
 	u32 pending;
 	u32 result;
 } CpSlot;
 
 /**
  * struct CpAccess - 记录 Host 窗口访问归属及最近异常现场
- * @address: 本次访问的完整 Host 物理地址。
+ * @address: 本次访问的 GPU 地址，由 domain 决定是否翻译。
  * @fault_address: 陷阱返回的故障地址，即 mtval。
  * @cause: 最近一次陷阱的 mcause 值。
  * @slot: 当前访问归属的 HQD 槽号。
@@ -104,7 +106,7 @@ static inline void cp_hqd_write(u32 slot, u32 offset, u32 value)
 }
 
 /*
- * cp_hqd_address() - 读取 HQD 中的完整 Host 地址
+ * cp_hqd_address() - 读取 HQD 中的完整 GPU 地址
  *
  * 合并低、高两个静态配置寄存器，不用于读取动态 64 位共享值。
  */
@@ -114,7 +116,7 @@ static inline u64 cp_hqd_address(u32 slot, u32 offset)
 }
 
 /*
- * cp_hqd_set_address() - 向 HQD 写入完整 Host 地址
+ * cp_hqd_set_address() - 向 HQD 写入完整 GPU 地址
  *
  * 分别写低、高 32 位配置，调用者须在激活前完成全部字段。
  */
@@ -125,26 +127,27 @@ static inline void cp_hqd_set_address(u32 slot, u32 offset, u64 address)
 }
 
 /*
- * cp_range() - 检查 Host 对象地址是否可访问
+ * cp_range() - 检查 GPU 对象地址是否可访问
  *
- * 要求非零地址、非零长度与指定对齐，检查末字节不超出 64 位范围。
+ * 要求非零长度与指定对齐，完整范围必须可由 RV32 地址表达。
  */
 static inline int cp_range(u64 address, u64 size, u32 align)
 {
-	return address && !(address & (align - 1)) && size && address <= ~(u64)0 - (size - 1);
+	return !(address & (align - 1)) && size && address < GPGPU_VM_ADDRESS_LIMIT &&
+		size <= GPGPU_VM_ADDRESS_LIMIT - address;
 }
 
-/* 从当前队列 Host 地址读写一个完整标量；成功返回 1。 */
-/* 从 Host RAM 完整读取一个 32 位标量。 */
-int cp_read32(u32 slot, u32 vmid, u32 phase, u64 address, u32 *value);
-/* 从 Host RAM 完整读取一个 64 位标量。 */
-int cp_read64(u32 slot, u32 vmid, u32 phase, u64 address, u64 *value);
-/* 向 Host RAM 完整写入一个 32 位标量。 */
-int cp_write32(u32 slot, u32 vmid, u32 phase, u64 address, u32 value);
-/* 向 Host RAM 完整写入一个 64 位标量。 */
-int cp_write64(u32 slot, u32 vmid, u32 phase, u64 address, u64 value);
-/* 读取初始化后固定的 Host 对象。 */
-int cp_read_object(u32 slot, u32 vmid, u32 phase, u64 address, void *dest, u32 size);
+/* 从当前指定域 GPU 地址读写一个完整标量；成功返回 1。 */
+/* 从指定域完整读取一个 32 位标量。 */
+int cp_read32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 *value);
+/* 从指定域完整读取一个 64 位标量。 */
+int cp_read64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 *value);
+/* 向指定域完整写入一个 32 位标量。 */
+int cp_write32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 value);
+/* 向指定域完整写入一个 64 位标量。 */
+int cp_write64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 value);
+/* 读取初始化后固定的 GPU 对象。 */
+int cp_read_object(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, void *dest, u32 size);
 /* 通过设备同步发布一条 IH 记录。 */
 int cp_ih_submit(u32 slot, u32 type, u32 data);
 /* 保存指定队列的首次错误并停止取包。 */

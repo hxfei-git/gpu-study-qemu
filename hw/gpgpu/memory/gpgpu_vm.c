@@ -24,12 +24,22 @@ bool gpgpu_vm_fail(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address
 	return false;
 }
 
-/* 表页和用户 VRAM 页均必须完整位于普通存储池，不能触及固件。 */
+/* 用户不能触及 VRAM 首页或固件；Outbound 只检查路由，DMA 仍可能失败。 */
+static bool user_physical_valid(GPGPUState *s, uint64_t address, uint64_t length)
+{
+	if (!gpgpu_phys_contains(s, address, length))
+		return false;
+	if (address >= s->vram_size)
+		return true;
+	return address >= GPGPU_VM_PAGE_SIZE &&
+		(address >= (uint64_t)GPGPU_FIRMWARE_BASE + GPGPU_FIRMWARE_SIZE ||
+		 (address < GPGPU_FIRMWARE_BASE && length <= GPGPU_FIRMWARE_BASE - address));
+}
+
 static bool vm_page_valid(GPGPUState *s, uint64_t address)
 {
-	return !(address & (GPGPU_VM_PAGE_SIZE - 1)) && address >= GPGPU_VM_PAGE_SIZE &&
-		address <= GPGPU_VRAM_USABLE_SIZE - GPGPU_VM_PAGE_SIZE &&
-		gpgpu_vram_contains(s, address, GPGPU_VM_PAGE_SIZE);
+	return !(address & (GPGPU_VM_PAGE_SIZE - 1)) &&
+		user_physical_valid(s, address, GPGPU_VM_PAGE_SIZE);
 }
 
 /* 同步遍历；表项不经过用户地址翻译，避免递归及管理域混淆。 */
@@ -41,17 +51,20 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t address, uint64_t
 	for (unsigned int level = 0; level < 3; level++) {
 		uint32_t index = (address >> shifts[level]) & (level ? 511 : 3);
 		uint64_t entry;
+		uint8_t raw[8];
 
 		if (!vm_page_valid(s, table))
 			return GPGPU_VM_FAULT_TABLE;
-		entry = ldq_le_p(s->vram.ptr + table + index * 8);
+		if (gpgpu_phys_access(s, table + index * 8, raw, sizeof(raw), false) != MEMTX_OK)
+			return GPGPU_VM_FAULT_TABLE;
+		entry = ldq_le_p(raw);
 		if (!(entry & GPGPU_VM_VALID))
 			return GPGPU_VM_FAULT_UNMAPPED;
 		if (entry & ~(GPGPU_VM_ADDR_MASK | (level == 2 ? GPGPU_VM_FLAGS : GPGPU_VM_VALID)))
 			return GPGPU_VM_FAULT_TABLE;
 		table = entry & GPGPU_VM_ADDR_MASK;
 		if (level == 2) {
-			if (!(entry & GPGPU_VM_SYSTEM) && !vm_page_valid(s, table))
+			if (!vm_page_valid(s, table))
 				return GPGPU_VM_FAULT_TABLE;
 			*pte = entry;
 		}
@@ -103,15 +116,9 @@ bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addre
 			goto fail;
 		physical = (pte & GPGPU_VM_ADDR_MASK) + offset;
 		reason = GPGPU_VM_FAULT_STORAGE;
-		if (pte & GPGPU_VM_SYSTEM) {
-			if (gpgpu_host_access(s, physical, bytes, count,
-					      access == GPGPU_VM_WRITE) != MEMTX_OK)
-				goto fail;
-		} else if (access == GPGPU_VM_WRITE) {
-			memcpy(s->vram.ptr + physical, bytes, count);
-		} else {
-			memcpy(bytes, s->vram.ptr + physical, count);
-		}
+		if (gpgpu_phys_access(s, physical, bytes, count, access == GPGPU_VM_WRITE) !=
+		    MEMTX_OK)
+			goto fail;
 		address += count;
 		bytes += count;
 		length -= count;
@@ -122,6 +129,21 @@ fail:
 	if (counted)
 		s->vm.contexts[vmid].accesses--;
 	return gpgpu_vm_fail(s, vmid, slot, address, access, phase, reason);
+}
+
+/* 访问域由调用者决定；GPUVM 开关只决定用户地址是否经过翻译。 */
+bool gpgpu_user_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, void *data,
+		       size_t length, uint32_t access, uint32_t phase)
+{
+	if (s->gpuvm)
+		return gpgpu_vm_access(s, vmid, slot, address, data, length, access, phase);
+	if (!length || (length <= 8 && (!is_power_of_2(length) || (address & (length - 1)))) ||
+	    (access != GPGPU_VM_READ && access != GPGPU_VM_WRITE && access != GPGPU_VM_EXEC) ||
+	    !user_physical_valid(s, address, length))
+		return gpgpu_vm_fail(s, vmid, slot, address, access, phase, GPGPU_VM_FAULT_RANGE);
+	if (gpgpu_phys_access(s, address, data, length, access == GPGPU_VM_WRITE) != MEMTX_OK)
+		return gpgpu_vm_fail(s, vmid, slot, address, access, phase, GPGPU_VM_FAULT_STORAGE);
+	return true;
 }
 
 /* 上下文有驻留队列或在途访问时，Host 不能变更页表根或失效。 */
@@ -138,7 +160,7 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr addr)
 	if (addr == GPGPU_REG_VM_VERSION)
 		return GPGPU_VM_VERSION;
 	if (addr == GPGPU_REG_VM_MODE)
-		return s->gpuvm ? 2 : 0;
+		return s->gpuvm ? 1 : 0;
 	if (addr == GPGPU_REG_VM_FIRMWARE)
 		return s->vm.firmware;
 	if (addr == GPGPU_REG_VM_STATUS)
@@ -177,9 +199,9 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr addr)
 /* 同步失效先清旧 ACK；设备主锁及访问计数阻止旧遍历重新填充。 */
 void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value)
 {
-	if (!s->gpuvm)
-		goto invalid;
 	if (addr == GPGPU_REG_VM_INVALIDATE) {
+		if (!s->gpuvm)
+			goto invalid;
 		if (s->vm.status & GPGPU_VM_BUSY)
 			goto invalid;
 		s->vm.status = GPGPU_VM_BUSY;
@@ -199,7 +221,7 @@ void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value)
 
 		if (addr < base || addr >= base + 0x20)
 			continue;
-		if (vm_busy(s, id))
+		if (!s->gpuvm || vm_busy(s, id))
 			goto invalid;
 		if (addr == base + GPGPU_VM_ENABLE) {
 			if (value > 1 || (value && !vm_page_valid(s, vm->root)))
@@ -247,7 +269,7 @@ void gpgpu_vm_reset_firmware(GPGPUState *s)
 
 bool gpgpu_vm_set_firmware(GPGPUState *s, uint32_t version)
 {
-	if (!s->gpuvm || version != GPGPU_VM_VERSION)
+	if (version != GPGPU_VM_VERSION)
 		return false;
 	s->vm.firmware = version;
 	return true;

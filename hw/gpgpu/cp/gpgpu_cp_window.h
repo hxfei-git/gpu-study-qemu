@@ -20,8 +20,8 @@ void gpgpu_cp_window_reset(GPGPUState *s);
 
 /**
  * struct GPGPUCPWindowState - 由窗口模块保存的地址与故障归属
- * @host_iova_base: 完整 Host DMA 地址或 GPUVA 窗口基址，低 16 位为零。
- * @vm_domain: 管理物理域或用户 GPUVM 域。
+ * @host_iova_base: GPU 物理地址或 GPUVA 窗口基址，低 16 位为零。
+ * @vm_domain: 管理物理域或用户访问域。
  * @vm_id: 用户地址空间编号。
  * @vm_slot: 故障归属的 HQD 槽号。
  * @vm_phase: 访问所处的固件执行阶段。

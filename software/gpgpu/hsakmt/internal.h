@@ -17,7 +17,6 @@
  * @references: 成功打开且尚未关闭的连接引用数。
  * @objects: 尚未释放的内存、队列和事件总数。
  * @calls: 正在执行的库调用数，防止最后关闭与调用并发。
- * @info: 首次打开时查询到的队列 ABI 信息。
  * @path: 打开的设备路径，用于核对重复打开的目标。
  * @closing: 正在由最后关闭调用清理对象，拒绝其他线程进入。
  * @closer: 执行关闭清理的线程，允许其调用对象销毁接口。
@@ -34,7 +33,6 @@ struct GpgpuKmtContext {
 	unsigned int references;
 	unsigned int objects;
 	unsigned int calls;
-	struct gpgpu_queue_info info;
 	char *path;
 	bool closing;
 	pthread_t closer;
@@ -56,7 +54,7 @@ void gpgpu_kmt_end(GpgpuKmtContext *context);
 void gpgpu_kmt_objects(GpgpuKmtContext *context, int change);
 /* 执行一次带连接保护的 ioctl。 */
 GpgpuKmtStatus gpgpu_kmt_ioctl(GpgpuKmtContext *context, unsigned long command, void *request);
-/* 将既有队列/事件操作明确路由到独立 DRM 编号。 */
+/* 执行 DRM ioctl，调用者已持有连接使用计数。 */
 int gpgpu_kmt_raw_ioctl(GpgpuKmtContext *context, unsigned long command, void *request);
 /*
  * gpgpu_kmt_range() - 校验内存对象中的一个非空范围

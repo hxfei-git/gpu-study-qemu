@@ -39,38 +39,24 @@ static int cp_packet_valid(const GpgpuAqlPacket *p, u32 grid[3], u32 block[3])
 }
 
 /*
- * cp_descriptor() - 读取并验证 VRAM 中的 Kernel 描述对象
+ * cp_descriptor() - 经用户访问域读取并验证 Kernel 描述对象
  *
- * 检查代码、参数大小和地址范围，避免访问固件保留区。
+ * 检查 ABI、代码和参数范围；存储访问另由公共入口检查保护区。
  */
 static int cp_descriptor(u32 slot, const GpgpuAqlPacket *packet, GpgpuKernelDescriptor *desc)
 {
-	u64 limit = cp_gpuvm ? GPGPU_VM_ADDRESS_LIMIT : GPGPU_VRAM_USABLE_SIZE;
+	u64 limit = GPGPU_VM_ADDRESS_LIMIT;
 
 	if (!cp_range(packet->kernel_object, sizeof(*desc), 8) ||
-	    packet->kernel_object > limit - sizeof(*desc))
+	    !cp_read_object(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid,
+			    GPGPU_QUEUE_ERROR_DESCRIPTOR, packet->kernel_object, desc,
+			    sizeof(*desc)))
 		return 0;
-	if (cp_gpuvm) {
-		if (!cp_read_object(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_DESCRIPTOR,
-				    packet->kernel_object, desc, sizeof(*desc)))
-			return 0;
-	} else {
-		volatile const u32 *source =
-			(volatile const u32 *)(unsigned long)packet->kernel_object;
-
-		desc->code_entry = source[0];
-		desc->code_size = source[1];
-		desc->kernarg_size = source[2];
-		desc->reserved = source[3];
-	}
-	return !desc->reserved && desc->code_size && !(desc->code_size & 3) &&
-		!(desc->code_entry & 3) && desc->code_entry < limit &&
+	return desc->kernel_abi_version == GPGPU_KERNEL_ABI_VERSION && desc->code_size &&
+		!(desc->code_size & 3) && !(desc->code_entry & 3) && desc->code_entry < limit &&
 		desc->code_size <= limit - desc->code_entry && desc->kernarg_size >= 4 &&
 		desc->kernarg_size <= GPGPU_KERNEL_ARGS_MAX && !(desc->kernarg_size & 3) &&
-		cp_range(packet->kernarg_address, desc->kernarg_size, 8) &&
-		(!cp_gpuvm ||
-		 (packet->kernarg_address < GPGPU_VM_ADDRESS_LIMIT &&
-		  desc->kernarg_size <= GPGPU_VM_ADDRESS_LIMIT - packet->kernarg_address));
+		cp_range(packet->kernarg_address, desc->kernarg_size, 8);
 }
 
 /*
@@ -87,16 +73,16 @@ int cp_aql(u32 slot)
 
 	if (!cp_next_packet(slot, &address, sizeof(packet)))
 		return 0;
-	if (!cp_read32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING, address,
-		       &packet.full_header)) {
+	if (!cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
+		       address, &packet.full_header)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
 	}
 	if ((packet.full_header & 0xff) == GPGPU_AQL_INVALID)
 		return 0;
 	cp_fence();
-	if (!cp_read_object(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING, address + 4,
-			    (char *)&packet + 4, sizeof(packet) - 4)) {
+	if (!cp_read_object(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
+			    address + 4, (char *)&packet + 4, sizeof(packet) - 4)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
 	}
@@ -109,16 +95,16 @@ int cp_aql(u32 slot)
 		return 0;
 	}
 	if (!cp_range(packet.completion_signal, sizeof(GpgpuSignal), 8) ||
-	    !cp_read64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal, &value) ||
 	    value != 1 ||
-	    !cp_read32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 8, &event) ||
 	    !event ||
-	    !cp_read32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 12, &reserved) ||
 	    reserved ||
-	    !cp_read64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 16, &mailbox)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SIGNAL);
 		return 0;
@@ -131,10 +117,8 @@ int cp_aql(u32 slot)
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_EXECUTOR);
 		return 0;
 	}
-	if (cp_gpuvm) {
-		cp_reg_write(GPGPU_REG_DISPATCH_VMID, cp_slots[slot].vmid);
-		cp_reg_write(GPGPU_REG_DISPATCH_SLOT, slot);
-	}
+	cp_reg_write(GPGPU_REG_DISPATCH_VMID, cp_slots[slot].vmid);
+	cp_reg_write(GPGPU_REG_DISPATCH_SLOT, slot);
 	cp_reg_write(GPGPU_REG_KERNEL_ADDR_LO, desc.code_entry);
 	cp_reg_write(GPGPU_REG_KERNEL_ADDR_HI, 0);
 	cp_reg_write(GPGPU_REG_KERNEL_CODE_SIZE, desc.code_size);
@@ -168,24 +152,25 @@ int cp_aql(u32 slot)
 		return 1;
 	}
 	cp_fence();
-	if (!cp_read64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	if (!cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal, &value) ||
 	    value != 1 ||
-	    !cp_write64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_write64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 			packet.completion_signal, value - 1)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SIGNAL);
 		return 1;
 	}
 	cp_fence();
-	if (!cp_write64(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_MAILBOX, mailbox, event)) {
+	if (!cp_write64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_MAILBOX,
+			mailbox, event)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_MAILBOX);
 		return 1;
 	}
 	cp_fence();
 	if (!cp_ih_submit(slot, GPGPU_IH_SIGNAL_NOTIFY, event))
 		return 1;
-	if (!cp_write32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE, address,
-			GPGPU_AQL_INVALID)) {
+	if (!cp_write32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE,
+			address, GPGPU_AQL_INVALID)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RETIRE);
 		return 1;
 	}

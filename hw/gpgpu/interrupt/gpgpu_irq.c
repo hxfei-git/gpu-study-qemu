@@ -24,8 +24,6 @@ static void gpgpu_update_irq(GPGPUState *s, GPGPUIrq events)
 	events &= pending;
 	pci_set_irq(pdev, pending && !msix_enabled(pdev) && !msi_enabled(pdev));
 	if (msix_enabled(pdev)) {
-		if (events & GPGPU_IRQ_KERNEL_DONE)
-			msix_notify(pdev, GPGPU_MSIX_VEC_KERNEL);
 		if (events & GPGPU_IRQ_DMA_DONE)
 			msix_notify(pdev, GPGPU_MSIX_VEC_DMA);
 		if (events & GPGPU_IRQ_IH)
@@ -76,9 +74,7 @@ void gpgpu_irq_write(GPGPUState *s, hwaddr addr, uint32_t val)
 	case GPGPU_REG_IRQ_ENABLE: {
 		GPGPUIrq old = s->irq.enable;
 
-		s->irq.enable = val &
-			(GPGPU_IRQ_KERNEL_DONE | GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR |
-			 GPGPU_IRQ_IH);
+		s->irq.enable = val & (GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR | GPGPU_IRQ_IH);
 		if ((s->irq.enable & GPGPU_IRQ_IH) && gpgpu_ih_pending(s))
 			s->irq.status |= GPGPU_IRQ_IH;
 		gpgpu_update_irq(s, s->irq.enable & ~old);

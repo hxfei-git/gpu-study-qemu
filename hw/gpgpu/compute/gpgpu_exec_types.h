@@ -10,27 +10,15 @@
 #define GPGPU_MAX_TOTAL_THREADS 65536
 
 /**
- * enum GPGPUExecMode - 提交时确定的执行及地址解释方式
- * @GPGPU_EXEC_SYNC: 同步执行，代码和参数都使用 VRAM 字节偏移。
- * @GPGPU_EXEC_PHYSICAL_QUEUE: 分段执行，代码使用 VRAM 偏移，参数使用 Host DMA 地址。
- * @GPGPU_EXEC_GPUVM_QUEUE: 分段执行，代码和参数使用任务所属 VMID 的 GPUVA。
- */
-typedef enum GPGPUExecMode {
-	GPGPU_EXEC_SYNC,
-	GPGPU_EXEC_PHYSICAL_QUEUE,
-	GPGPU_EXEC_GPUVM_QUEUE,
-} GPGPUExecMode;
-
-/**
  * struct GPGPUKernelParams - 提交时保存的派发配置
- * @kernel_addr: 代码入口；同步和物理队列为 VRAM 偏移，GPUVM 队列为 GPUVA。
- * @kernel_args: 参数基址；同步为 VRAM 偏移，物理队列为 Host DMA 地址。
+ * @kernel_addr: 代码入口；GPUVM 开启时为 GPUVA，关闭时为 GPU 物理地址。
+ * @kernel_args: 参数基址；与代码入口使用相同的地址模式。
  * @grid_dim: X/Y/Z 方向的工作组数。
  * @block_dim: 工作组 X/Y/Z 方向的线程数。
- * @code_size: 代码范围的字节数，队列模式用于取指边界检查。
- * @args_size: 参数块字节数，队列模式用于只读参数窗口检查。
+ * @code_size: 代码范围的字节数，用于取指边界检查。
+ * @args_size: 参数块字节数，用于派发前检查地址范围。
  * @shared_mem_size: 每工作组共享内存字节数，当前仅接受零。
- * @vmid: GPUVM 队列所属地址空间编号。
+ * @vmid: 用户队列所属地址空间编号，关闭翻译时仍用于归属。
  * @source_slot: GPUVM 访问故障归属的 HQD 槽号。
  *
  * GPUVM 队列的 kernel_args 同样为 GPUVA。参数类型不含可变执行进度；
@@ -66,7 +54,7 @@ typedef enum GPGPUExecStatus {
  * @error: 已有 GPGPU_EXEC_ERR_* 编码，error_valid 为真时有效。
  * @error_valid: 本次失败是否产生细分错误；为假时不覆盖原细分错误寄存器。
  *
- * 同步路径保留原有错误锁存差异。队列路径在提交时清错，并由 Dispatch
+ * 队列任务在提交时清错，并由 Dispatch
  * 为没有细分错误的失败补入默认指令错误。
  */
 typedef struct GPGPUExecResult {
