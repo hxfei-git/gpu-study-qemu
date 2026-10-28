@@ -71,7 +71,7 @@ static void bo_close(struct drm_gem_object *obj, struct drm_file *file)
 
 	mutex_lock(&dev->lock);
 	m->id = 0;
-	if (m->client && !m->gpu_va && !m->users)
+	if (m->client && !m->bound && !m->users)
 		gpgpu_gem_drop(m);
 	mutex_unlock(&dev->lock);
 }
@@ -122,7 +122,7 @@ static const struct drm_gem_object_funcs bo_funcs = {
 /* 创建引用先保留在会话列表，GEM handle 另持有一个引用。 */
 static int bo_create(struct gpgpu_qclient *c, struct gpgpu_bo_create *r)
 {
-	struct gpgpu_memory_request req = {
+	struct gpgpu_bo_create req = {
 		.kind = r->kind,
 		.size = r->size,
 		.alignment = r->alignment,
@@ -240,7 +240,7 @@ static int vm_invalidate(struct gpgpu_qclient *c)
 	return 0;
 }
 
-/* 首次 GPU 映射取得固定 VMID，并预先建立内部通知页。 */
+/* 首次绑定取得队列来源编号，并为两种模式建立内部通知页。 */
 static int vm_bind(struct gpgpu_qclient *c)
 {
 	struct gpgpu_qdev *dev = c->dev;
@@ -256,24 +256,26 @@ static int vm_bind(struct gpgpu_qclient *c)
 		c->vmid = 0;
 		return -ENOSPC;
 	}
-	ret = table_alloc(c, &c->root);
-	if (ret)
-		goto fail;
 	c->notify_cpu = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE, &c->notify_dma, GFP_KERNEL);
 	if (!c->notify_cpu) {
 		ret = -ENOMEM;
 		goto fail;
 	}
 	memset(c->notify_cpu, 0, PAGE_SIZE);
-	if ((c->notify_dma & (PAGE_SIZE - 1)) || (c->notify_dma >> 48)) {
+	if ((c->notify_dma & (PAGE_SIZE - 1)) ||
+	    !gpgpu_dma_address(dev, c->notify_dma, PAGE_SIZE, &c->notify_address)) {
 		ret = -ERANGE;
 		goto fail;
 	}
+	if (!dev->gpuvm)
+		return 0;
+	ret = table_alloc(c, &c->root);
+	if (ret)
+		goto fail;
 	ret = vm_leaf(c, GPGPU_VM_NOTIFY_VA, true, &leaf);
 	if (ret)
 		goto fail;
-	writeq((u64)c->notify_dma | GPGPU_VM_VALID | GPGPU_VM_SYSTEM | GPGPU_VM_READ |
-		       GPGPU_VM_WRITE,
+	writeq(c->notify_address | GPGPU_VM_VALID | GPGPU_VM_READ | GPGPU_VM_WRITE,
 	       dev->vram + leaf);
 	base = GPGPU_REG_VM_CONTEXT(c->vmid);
 	gpgpu_qwrite64(dev, base + GPGPU_VM_ROOT_LO, c->root);
@@ -291,16 +293,14 @@ fail:
 	return ret;
 }
 
-/* 普通映射范围：零页、控制页、参数窗和通知页都不开放。 */
+/* 普通 GPUVA 仅排除零页和内部通知末页。 */
 static bool vm_range(u64 address, u64 size)
 {
 	return address >= PAGE_SIZE && !(address & (PAGE_SIZE - 1)) && size &&
-		size <= GPGPU_VM_NOTIFY_VA && address <= GPGPU_VM_NOTIFY_VA - size &&
-		!(address < GPGPU_VM_CTRL_VA + PAGE_SIZE && address + size > GPGPU_VM_CTRL_VA) &&
-		!(address < GPGPU_VM_ARGS_END && address + size > GPGPU_VM_ARGS_VA);
+		size <= GPGPU_VM_NOTIFY_VA && address <= GPGPU_VM_NOTIFY_VA - size;
 }
 
-/* MAP 已验证全部输入后才写表，写表失败保留对象引用至安全清理。 */
+/* 两种模式都取得绑定引用；写表或失效失败继续保留到安全清理。 */
 static int vm_map(struct gpgpu_qclient *c, struct gpgpu_vm_map *r)
 {
 	struct gpgpu_qmemory *m = gpgpu_memory_find(c, r->handle), *other;
@@ -309,24 +309,34 @@ static int vm_map(struct gpgpu_qclient *c, struct gpgpu_vm_map *r)
 
 	if (c->vm_failed || gpgpu_vm_queue_live(c))
 		return -EBUSY;
-	if (!m || !m->gem_ready || m->gpu_va || r->reserved || !r->permissions ||
-	    (r->permissions & ~GPGPU_VM_PERMS) || !vm_range(r->address, m->mapped_size))
+	if (!m || !m->gem_ready || m->bound || r->reserved || !r->permissions ||
+	    (r->permissions & ~GPGPU_VM_PERMS))
 		return -EINVAL;
-	list_for_each_entry(other, &c->memory, node) {
-		if (other->gpu_va && r->address < other->gpu_va + other->mapped_size &&
-		    other->gpu_va < r->address + m->mapped_size)
-			return -EEXIST;
+	if (!c->dev->gpuvm && r->address)
+		return -EOPNOTSUPP;
+	if (c->dev->gpuvm && !vm_range(r->address, m->mapped_size))
+		return -EINVAL;
+	if (c->dev->gpuvm) {
+		list_for_each_entry(other, &c->memory, node) {
+			if (other->bound && r->address < other->gpu_address + other->mapped_size &&
+			    other->gpu_address < r->address + m->mapped_size)
+				return -EEXIST;
+		}
 	}
-	target = m->kind == GPGPU_MEMORY_HOST ? m->dma : m->offset;
-	if ((target & (PAGE_SIZE - 1)) || target >= (1ULL << 48) ||
-	    m->mapped_size > (1ULL << 48) - target)
+	target = m->physical_address;
+	if ((target & (PAGE_SIZE - 1)) || target >= (1ULL << 32) ||
+	    m->mapped_size > (1ULL << 32) - target)
 		return -ERANGE;
 	ret = vm_bind(c);
 	if (ret)
 		return ret;
-	m->gpu_va = r->address;
+	m->gpu_address = c->dev->gpuvm ? r->address : target;
 	m->permissions = r->permissions;
+	m->bound = true;
 	drm_gem_object_get(&m->gem);
+	r->address = m->gpu_address;
+	if (!c->dev->gpuvm)
+		return 0;
 	for (u64 i = 0; i < m->mapped_size; i += PAGE_SIZE) {
 		u32 leaf;
 
@@ -335,45 +345,48 @@ static int vm_map(struct gpgpu_qclient *c, struct gpgpu_vm_map *r)
 			c->vm_failed = true;
 			return ret;
 		}
-		writeq((target + i) | GPGPU_VM_VALID | r->permissions |
-			       (m->kind == GPGPU_MEMORY_HOST ? GPGPU_VM_SYSTEM : 0),
-		       c->dev->vram + leaf);
+		writeq((target + i) | GPGPU_VM_VALID | r->permissions, c->dev->vram + leaf);
 	}
 	return vm_invalidate(c);
 }
 
-/* UNMAP 以 GPUVA 定位，支持已经关闭 GEM 句柄的对象。 */
+/* 地址定位独立绑定，允许 GEM handle 已关闭后再安全解绑。 */
 static int vm_unmap(struct gpgpu_qclient *c, struct gpgpu_vm_map *r)
 {
 	struct gpgpu_qmemory *m;
 	int ret;
 
-	if (c->vm_failed || gpgpu_vm_queue_live(c))
+	if (c->vm_failed || gpgpu_vm_queue_live(c) || c->dev->dma_uncertain)
 		return -EBUSY;
-	if (r->handle || r->permissions || r->reserved || !r->address)
+	if (r->handle || r->permissions || r->reserved)
 		return -EINVAL;
 	list_for_each_entry(m, &c->memory, node) {
-		if (m->gpu_va != r->address)
+		if (!m->bound || m->gpu_address != r->address)
 			continue;
-		for (u64 i = 0; i < m->mapped_size; i += PAGE_SIZE) {
-			u32 leaf;
+		if (m->users)
+			return -EBUSY;
+		if (c->dev->gpuvm) {
+			for (u64 i = 0; i < m->mapped_size; i += PAGE_SIZE) {
+				u32 leaf;
 
-			if (!vm_leaf(c, r->address + i, false, &leaf))
-				writeq(0, c->dev->vram + leaf);
+				if (!vm_leaf(c, r->address + i, false, &leaf))
+					writeq(0, c->dev->vram + leaf);
+			}
+			ret = vm_invalidate(c);
+			if (ret)
+				return ret;
 		}
-		ret = vm_invalidate(c);
-		if (ret)
-			return ret;
-		m->gpu_va = 0;
+		m->bound = false;
+		m->gpu_address = 0;
 		drm_gem_object_put(&m->gem); /* 列表引用仍在。 */
-		if (!m->id && !m->users)
+		if (!m->id)
 			gpgpu_gem_drop(m);
 		return 0;
 	}
 	return -ENOENT;
 }
 
-/* 文件释放前已结束 ioctl/VMA；未知访问保留到设备确实停机。 */
+/* 仅在队列、DMA 与旧通知都结束后，撤销绑定并释放内部存储。 */
 int gpgpu_vm_cleanup(struct gpgpu_qclient *c)
 {
 	struct gpgpu_qdev *dev = c->dev;
@@ -387,15 +400,19 @@ int gpgpu_vm_cleanup(struct gpgpu_qclient *c)
 		if (gpgpu_vm_queue_live(c) || dev->dma_uncertain)
 			return -EBUSY;
 		gpgpu_ih_drain_locked(dev);
-		base = GPGPU_REG_VM_CONTEXT(c->vmid);
-		writel(0, dev->regs + base + GPGPU_VM_ENABLE);
-		if (readl(dev->regs + base + GPGPU_VM_ENABLE) || vm_invalidate(c))
-			return -EIO;
-		gpgpu_qwrite64(dev, base + GPGPU_VM_ROOT_LO, 0);
+		if (dev->gpuvm) {
+			base = GPGPU_REG_VM_CONTEXT(c->vmid);
+			writel(0, dev->regs + base + GPGPU_VM_ENABLE);
+			if (readl(dev->regs + base + GPGPU_VM_ENABLE) || vm_invalidate(c))
+				return -EIO;
+			gpgpu_qwrite64(dev, base + GPGPU_VM_ROOT_LO, 0);
+		}
 	}
+	gpgpu_event_release_all(c);
 	list_for_each_entry(m, &c->memory, node) {
-		if (m->gpu_va) {
-			m->gpu_va = 0;
+		if (m->bound) {
+			m->bound = false;
+			m->gpu_address = 0;
 			drm_gem_object_put(&m->gem);
 		}
 	}
@@ -407,6 +424,7 @@ int gpgpu_vm_cleanup(struct gpgpu_qclient *c)
 	if (c->notify_cpu)
 		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, c->notify_cpu, c->notify_dma);
 	c->notify_cpu = NULL;
+	c->notify_address = 0;
 	clear_bit(c->vmid, &dev->vmids);
 	c->vmid = c->root = 0;
 	return 0;
@@ -417,7 +435,7 @@ void gpgpu_vm_save_fault(struct gpgpu_user_queue *q)
 {
 	struct gpgpu_qdev *dev = q->client->dev;
 
-	if (!dev->gpuvm || !dev->present || q->fault.reason)
+	if (!dev->present || q->fault.reason)
 		return;
 	for (u32 slot = 2; slot < 4; slot++) {
 		u64 mqd;
@@ -426,7 +444,7 @@ void gpgpu_vm_save_fault(struct gpgpu_user_queue *q)
 		writel(slot, dev->regs + GPGPU_REG_HQD_SELECT);
 		mqd = readl(dev->regs + GPGPU_REG_HQD_WINDOW + GPGPU_HQD_MQD_LO);
 		mqd |= (u64)readl(dev->regs + GPGPU_REG_HQD_WINDOW + GPGPU_HQD_MQD_HI) << 32;
-		if (mqd != q->mqd_dma)
+		if (mqd != q->mqd_address)
 			continue;
 		reason = readl(dev->regs + base + GPGPU_VM_FAULT_REASON);
 		q->fault = (struct gpgpu_vm_fault) {
@@ -489,11 +507,10 @@ static int vm_ioctl(struct drm_device *drm, void *data, struct drm_file *file, u
 			.page_size = PAGE_SIZE,
 			.user_vmids = 2,
 			.queues_per_vm = 1,
-			.range_count = 3,
+			.range_count = dev->gpuvm ? 1 : 0,
 			.bindings = hweight_long(dev->vmids),
-			.ranges = { { PAGE_SIZE, GPGPU_VM_CTRL_VA },
-				    { GPGPU_VM_CTRL_VA + PAGE_SIZE, GPGPU_VM_ARGS_VA },
-				    { GPGPU_VM_ARGS_END, GPGPU_VM_NOTIFY_VA } },
+			.ranges = { { dev->gpuvm ? PAGE_SIZE : 0,
+				      dev->gpuvm ? GPGPU_VM_NOTIFY_VA : 0 } },
 		};
 		break;
 	}
@@ -515,10 +532,7 @@ static int vm_ioctl(struct drm_device *drm, void *data, struct drm_file *file, u
 		break;
 	case GPGPU_DRM_QUEUE_QUERY:
 	case GPGPU_DRM_QUEUE_DESTROY:
-		ret = gpgpu_queue_operation(c,
-					    cmd == GPGPU_DRM_QUEUE_QUERY ? GPGPU_IOC_QUEUE_QUERY :
-									   GPGPU_IOC_QUEUE_DESTROY,
-					    data);
+		ret = gpgpu_queue_operation(c, cmd, data);
 		break;
 	case GPGPU_DRM_FAULT: {
 		struct gpgpu_vm_fault *r = data;
@@ -534,12 +548,14 @@ static int vm_ioctl(struct drm_device *drm, void *data, struct drm_file *file, u
 		r->queue_id = q->id;
 		break;
 	}
-	default: {
-		unsigned int commands[] = { GPGPU_IOC_EVENT_CREATE, GPGPU_IOC_EVENT_QUERY,
-					    GPGPU_IOC_EVENT_WAIT, GPGPU_IOC_EVENT_DESTROY };
-
-		ret = gpgpu_event_operation(c, commands[_IOC_NR(cmd) - 0x48], data);
-	}
+	case GPGPU_DRM_EVENT_CREATE:
+	case GPGPU_DRM_EVENT_QUERY:
+	case GPGPU_DRM_EVENT_WAIT:
+	case GPGPU_DRM_EVENT_DESTROY:
+		ret = gpgpu_event_operation(c, cmd, data);
+		break;
+	default:
+		ret = -ENOTTY;
 	}
 out:
 	mutex_unlock(&dev->lock);
@@ -648,8 +664,8 @@ static const struct drm_driver vm_driver = {
 	.ioctls = vm_ioctls,
 	.num_ioctls = ARRAY_SIZE(vm_ioctls),
 	.name = "gpgpu",
-	.desc = "GPGPU 固定存储 GPUVM",
-	.major = 1,
+	.desc = "GPGPU 固定存储队列",
+	.major = 2,
 	.minor = 0,
 };
 

@@ -38,7 +38,7 @@ static bool hqd_field(hwaddr addr)
 /*
  * hqd_address() - 拼接 HQD 内相邻的地址寄存器
  *
- * low 指向低 32 位偏移，返回完整的 64 位 Host 地址。
+ * low 指向低 32 位偏移，返回完整的 64 位 GPU 地址。
  */
 static uint64_t hqd_address(uint32_t *hqd, unsigned int low)
 {
@@ -48,11 +48,12 @@ static uint64_t hqd_address(uint32_t *hqd, unsigned int low)
 /*
  * hqd_range() - 检查 HQD 地址对齐与范围溢出
  *
- * 调用者提供非零长度及 2 的幂对齐值，以末字节检查避免加法溢出。
+ * 调用者提供非零长度及 2 的幂对齐值，用减法检查完整范围是否落在 32 位地址空间。
  */
 static bool hqd_range(uint64_t addr, uint64_t size, unsigned int alignment)
 {
-	return !(addr & (alignment - 1)) && addr <= UINT64_MAX - (size - 1);
+	return !(addr & (alignment - 1)) && addr < GPGPU_VM_ADDRESS_LIMIT &&
+		size <= GPGPU_VM_ADDRESS_LIMIT - addr;
 }
 
 /*
@@ -118,10 +119,11 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 		break;
 	case GPGPU_HQD_ACTIVE:
 		valid = val <= 1 && (!val || hqd_complete(hqd));
-		if (valid && val && s->gpuvm && slot >= 2) {
+		if (valid && val && slot >= 2) {
 			unsigned int vmid = hqd[GPGPU_HQD_VMID / 4];
 
-			valid = vmid >= 1 && vmid <= GPGPU_VM_USERS && gpgpu_vm_enabled(s, vmid) &&
+			valid = vmid >= 1 && vmid <= GPGPU_VM_USERS &&
+				(!s->gpuvm || gpgpu_vm_enabled(s, vmid)) &&
 				hqd_address(hqd, GPGPU_HQD_RING_LO) <=
 					GPGPU_VM_ADDRESS_LIMIT - hqd[GPGPU_HQD_CONTROL / 4] &&
 				hqd_address(hqd, GPGPU_HQD_RPTR_ADDR_LO) < GPGPU_VM_ADDRESS_LIMIT &&
@@ -129,7 +131,7 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 		}
 		break;
 	case GPGPU_HQD_VMID:
-		valid = s->gpuvm && slot >= 2 ? val <= GPGPU_VM_USERS : val == 0;
+		valid = slot >= 2 ? val <= GPGPU_VM_USERS : val == 0;
 		break;
 	case GPGPU_HQD_AQL:
 		valid = val <= 1;
@@ -156,10 +158,8 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 	if (!valid)
 		goto invalid;
 	hqd[addr / 4] = val;
-	if (addr == GPGPU_HQD_ACTIVE && val) {
-		s->hqd.queue_mode = true;
+	if (addr == GPGPU_HQD_ACTIVE && val)
 		s->hqd.doorbell_pending[slot] = true;
-	}
 	return;
 invalid:
 	gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
@@ -224,16 +224,6 @@ bool gpgpu_hqd_vmid_active(GPGPUState *s, unsigned int vmid)
 		if (gpgpu_hqd_binding_valid(s, slot, vmid))
 			return true;
 	return false;
-}
-
-bool gpgpu_hqd_queue_mode(GPGPUState *s)
-{
-	return s->hqd.queue_mode;
-}
-
-void gpgpu_hqd_enter_queue_mode(GPGPUState *s)
-{
-	s->hqd.queue_mode = true;
 }
 
 void gpgpu_hqd_notify(GPGPUState *s, hwaddr offset)

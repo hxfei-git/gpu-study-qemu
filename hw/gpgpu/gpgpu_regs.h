@@ -32,7 +32,7 @@
 #define GPGPU_REG_IRQ_STATUS     0x0204     /* 中断状态 (挂起的中断) */
 #define GPGPU_REG_IRQ_ACK        0x0208     /* 中断确认 (写 1 清除) */
 
-/* 启动描述符可读写；DISPATCH 只写。 */
+/* 启动描述符由 CP 写入，Host 只读；DISPATCH 仅允许 CP 提交。 */
 #define GPGPU_REG_KERNEL_ADDR_LO 0x0300     /* 内核代码地址低 32 位 */
 #define GPGPU_REG_KERNEL_ADDR_HI 0x0304     /* 内核代码地址高 32 位 */
 #define GPGPU_REG_KERNEL_ARGS_LO 0x0308     /* 内核参数地址低 32 位 */
@@ -44,7 +44,7 @@
 #define GPGPU_REG_BLOCK_DIM_Y    0x0320     /* Block Y 维度 */
 #define GPGPU_REG_BLOCK_DIM_Z    0x0324     /* Block Z 维度 */
 #define GPGPU_REG_SHARED_MEM_SIZE 0x0328    /* 每 block 字节数 */
-#define GPGPU_REG_DISPATCH       0x0330     /* 写任意值启动内核执行 */
+#define GPGPU_REG_DISPATCH       0x0330     /* CP 写 1 提交 Kernel */
 
 /* DMA 描述符和控制寄存器可读写；DMA_STATUS 只读。 */
 #define GPGPU_REG_DMA_SRC_LO     0x0400     /* DMA 源地址低 32 位 */
@@ -63,29 +63,15 @@
 /* CP_CTRL 的只读连接标记，表明已接入原生 CP。 */
 #define GPGPU_CP_PRESENT         (1 << 1)
 
-/* CP 本地地址，非 BAR0 偏移；IOVA 基址按 64 KiB 对齐。 */
+/* CP 本地地址，非 BAR0 偏移；目标 GPU 地址基址按 64 KiB 对齐。 */
 /* CP 本地 Host 访存窗口起始地址。 */
 #define GPGPU_CP_HOST_WINDOW_BASE 0x80000000
-/* CP Host 窗口字节容量，也是 IOVA 基址对齐单位。 */
+/* CP Host 窗口字节容量，也是目标地址基址对齐单位。 */
 #define GPGPU_CP_HOST_WINDOW_SIZE 0x00010000
 /* CP 本地窗口映射基址寄存器，保存低 32 位。 */
 #define GPGPU_CP_IOVA_BASE_LO    0xfffe0000
 /* CP 本地窗口映射基址寄存器，保存高 32 位。 */
 #define GPGPU_CP_IOVA_BASE_HI    0xfffe0004
-
-/* 可读写的教学寄存器，与 RV32 解释器控制窗口分开。 */
-#define GPGPU_REG_THREAD_ID_X    0x1000     /* threadIdx.x */
-#define GPGPU_REG_THREAD_ID_Y    0x1004     /* threadIdx.y */
-#define GPGPU_REG_THREAD_ID_Z    0x1008     /* threadIdx.z */
-#define GPGPU_REG_BLOCK_ID_X     0x1010     /* Block 在 Grid 中的 X 索引 */
-#define GPGPU_REG_BLOCK_ID_Y     0x1014     /* Block 在 Grid 中的 Y 索引 */
-#define GPGPU_REG_BLOCK_ID_Z     0x1018     /* Block 在 Grid 中的 Z 索引 */
-#define GPGPU_REG_WARP_ID        0x1020     /* Warp 在 Block 中的索引 */
-#define GPGPU_REG_LANE_ID        0x1024     /* lane 0-31 */
-
-/* BARRIER：预留；THREAD_MASK：可读写的教学寄存器。 */
-#define GPGPU_REG_BARRIER        0x2000     /* 保留；读 0，写入忽略 */
-#define GPGPU_REG_THREAD_MASK    0x2004     /* 活跃线程掩码 */
 
 /**
  * enum GPGPUControl - GLOBAL_CTRL 控制标志
@@ -113,27 +99,23 @@ typedef enum GPGPUStatus {
  * enum GPGPUError - ERROR_STATUS 错误标志，写 1 清除
  * @GPGPU_ERR_INVALID_CMD: 寄存器访问、命令或配置非法。
  * @GPGPU_ERR_VRAM_FAULT: VRAM 访问越界。
- * @GPGPU_ERR_KERNEL_FAULT: 同步 Kernel 解释执行失败。
  * @GPGPU_ERR_DMA_FAULT: DMA 描述符或 Host 传输失败。
  * @GPGPU_ERR_IH_FAULT: IH 通道配置、协议或记录提交失败。
  */
 typedef enum GPGPUError {
 	GPGPU_ERR_INVALID_CMD = 1 << 0,
 	GPGPU_ERR_VRAM_FAULT = 1 << 1,
-	GPGPU_ERR_KERNEL_FAULT = 1 << 2,
 	GPGPU_ERR_DMA_FAULT = 1 << 3,
 	GPGPU_ERR_IH_FAULT = 1 << 4,
 } GPGPUError;
 
 /**
  * enum GPGPUIrq - IRQ_ENABLE/STATUS/ACK 共用的事件位
- * @GPGPU_IRQ_KERNEL_DONE: 同步计算完成。
  * @GPGPU_IRQ_DMA_DONE: DMA 搬运完成。
  * @GPGPU_IRQ_ERROR: 设备已锁存错误。
  * @GPGPU_IRQ_IH: IH Ring 中存在待消费记录。
  */
 typedef enum GPGPUIrq {
-	GPGPU_IRQ_KERNEL_DONE = 1 << 0,
 	GPGPU_IRQ_DMA_DONE = 1 << 1,
 	GPGPU_IRQ_ERROR = 1 << 2,
 	GPGPU_IRQ_IH = 1 << 3,
@@ -170,6 +152,6 @@ typedef enum GPGPUDMAStatus {
 /* DEV_ID 读回的教学设备签名。 */
 #define GPGPU_DEV_ID_VALUE 0x47505055
 /* DEV_VERSION 读回的设备版本编码。 */
-#define GPGPU_DEV_VERSION_VALUE 0x00010000
+#define GPGPU_DEV_VERSION_VALUE 0x00020000
 
 #endif /* HW_GPGPU_REGS_H */

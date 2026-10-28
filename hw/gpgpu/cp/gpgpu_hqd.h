@@ -78,20 +78,6 @@ bool gpgpu_hqd_binding_valid(GPGPUState *s, unsigned int slot, unsigned int vmid
 bool gpgpu_hqd_vmid_active(GPGPUState *s, unsigned int vmid);
 
 /**
- * gpgpu_hqd_queue_mode() - 查询本轮是否已进入队列模式
- * @s: 设备实例；调用期间须保持设备存活。
- *
- * Return: 队列模式锁存值，整体寄存器复位时清除。
- */
-bool gpgpu_hqd_queue_mode(GPGPUState *s);
-
-/**
- * gpgpu_hqd_enter_queue_mode() - 锁存队列模式以阻止 Host 同步派发
- * @s: 设备实例；调用期间须保持设备存活。
- */
-void gpgpu_hqd_enter_queue_mode(GPGPUState *s);
-
-/**
  * gpgpu_hqd_notify() - 为匹配的已使能队列记录门铃提示
  * @s: 设备实例；调用期间须保持设备存活。
  * @offset: BAR4 内已验证对齐的字节偏移。
@@ -105,17 +91,15 @@ void gpgpu_hqd_notify(GPGPUState *s, hwaddr offset);
 void gpgpu_hqd_reset(GPGPUState *s);
 
 /**
- * struct GPGPUHQDState - 由 HQD 模块维护的槽与队列模式
+ * struct GPGPUHQDState - 由 HQD 模块维护的槽状态
  * @select: Host 间接窗口选择的槽号。
  * @slots: 四个槽的 32 位寄存器，每槽按字节偏移除以 4 索引。
  * @doorbell_pending: 各槽的通知提示，不替代共享读写进度。
- * @queue_mode: 激活队列或接受 CP 派发后锁存，设备复位时清除。
  */
 typedef struct GPGPUHQDState {
 	uint32_t select;
 	uint32_t slots[4][0x100 / 4];
 	bool doorbell_pending[4];
-	bool queue_mode;
 } GPGPUHQDState;
 
 #endif /* HW_CP_GPGPU_HQD_H */

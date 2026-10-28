@@ -4,7 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "gpgpu_uapi.h"
+#include <stdbool.h>
 #include "gpgpu_queue.h"
 #include "gpgpu_drm.h"
 
@@ -40,13 +40,12 @@ typedef enum GpgpuKmtStatus {
  * @context: 所属共享连接，对象销毁前连接必须存活。
  * @handle: 驱动分配的会话内句柄。
  * @kind: GPGPU_MEMORY_HOST 或 GPGPU_MEMORY_VRAM。
- * @vram_offset: VRAM 对象的字节偏移；Host 对象为零。
  * @size: 实际分配的字节数，可能大于请求长度。
- * @host_address: Host 对象的完整物理地址；不是 CPU 指针。
  * @mmap_offset: 传给 mmap 的字节偏移令牌；VRAM 对象不映射。
  * @cpu: Host 对象的用户态映射；VRAM 对象为 NULL。
  * @queue_users: 库内队列持有的引用数，由 gpgpu_kmt_lock 保护。
- * @gpu_va: 整对象 GPUVA；零表示没有映射。
+ * @gpu_address: 提交给设备的 GPUVA 或 GPU 物理地址。
+ * @bound: 已建立绑定，解绑成功前保留存储。
  * @mapped_size: CPU/GPU 可见的 4 KiB 对齐字节数。
  * @next: 连接中同类对象的下一个节点，供正常关闭使用。
  */
@@ -54,13 +53,12 @@ typedef struct GpgpuKmtMemory {
 	GpgpuKmtContext *context;
 	uint32_t handle;
 	uint32_t kind;
-	uint32_t vram_offset;
 	uint64_t size;
-	uint64_t host_address;
 	uint64_t mmap_offset;
 	void *cpu;
 	unsigned int queue_users;
-	uint64_t gpu_va;	     /* GPUVM 模式的整对象起始地址。 */
+	uint64_t gpu_address;
+	bool bound; /* 绑定引用独立于地址和页表存在。 */
 	uint64_t mapped_size;	     /* CPU mmap 与 GPU 映射长度。 */
 	struct GpgpuKmtMemory *next; /* 连接中的正常关闭清理链。 */
 } GpgpuKmtMemory;
@@ -100,7 +98,7 @@ typedef struct GpgpuKmtQueue {
  * @context: 所属共享连接。
  * @id: 会话内非零事件编号，存活期间不复用。
  * @queue_id: 产生此事件通知的队列编号。
- * @mailbox_address: 驱动分配的 8 字节通知槽的 Host 物理地址。
+ * @mailbox_address: 驱动分配的 8 字节通知槽的 GPU 地址。
  * @next: 连接中同类对象的下一个节点，供正常关闭使用。
  */
 typedef struct GpgpuKmtEvent {
@@ -119,18 +117,16 @@ typedef struct GpgpuKmtEvent {
 GpgpuKmtStatus gpgpuKmtOpen(const char *device, GpgpuKmtContext **context);
 /* 释放一个共享连接引用。 */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context);
-/* 查询队列模式的设备能力。 */
-GpgpuKmtStatus gpgpuKmtGetInfo(GpgpuKmtContext *context, struct gpgpu_queue_info *info);
 /* 取得库状态码的中文说明。 */
 const char *gpgpuKmtStatusName(GpgpuKmtStatus status);
 
 /*
- * 成功返回句柄及独立的 CPU/Host 物理地址/VRAM 偏移；释放前停止所有使用。
+ * 成功返回句柄、CPU 映射与统一 GPU 地址；释放前停止所有使用。
  */
 /* 申请 Host 或 VRAM 内存对象。 */
 GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
 				   uint64_t alignment, GpgpuKmtMemory *memory);
-/* GPUVM 分配并同步映射；fixed_va=0 自动选址，其余值供固定地址验收。 */
+/* 分配并绑定整对象；GPUVM 关闭时 fixed_va 必须为零。 */
 GpgpuKmtStatus gpgpuKmtAllocMemoryEx(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
 				     uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
 				     GpgpuKmtMemory *memory);
@@ -160,7 +156,7 @@ GpgpuKmtStatus gpgpuKmtQueryQueue(GpgpuKmtQueue *queue, struct gpgpu_queue_state
 /* 卸载队列并释放用户态映射。 */
 GpgpuKmtStatus gpgpuKmtDestroyQueue(GpgpuKmtQueue *queue);
 
-/* 事件等待只调用内核事件接口；Signal 主动检查由实验调用方负责。 */
+/* 事件接口配合公共 Signal 等待使用。 */
 /* 为源队列创建完成事件。 */
 GpgpuKmtStatus gpgpuKmtCreateEvent(GpgpuKmtQueue *queue, GpgpuKmtEvent *event);
 /* 查询驱动已保存的事件状态。 */
@@ -169,4 +165,16 @@ GpgpuKmtStatus gpgpuKmtQueryEvent(GpgpuKmtEvent *event, struct gpgpu_event_reque
 GpgpuKmtStatus gpgpuKmtWaitEvent(GpgpuKmtEvent *event, uint32_t timeout_ms);
 /* 销毁通知事件并释放库对象引用。 */
 GpgpuKmtStatus gpgpuKmtDestroyEvent(GpgpuKmtEvent *event);
+/* 连接普通内存与 Doorbell 的发布顺序。 */
+void gpgpuKmtHostFence(void);
+/* 预留一个 AQL 槽；失败后停止使用该队列，不回滚已预留编号。 */
+GpgpuKmtStatus gpgpuKmtReserve(GpgpuKmtQueue *queue, uint32_t *number);
+/* 填写包体、发布 Header 并以 8 字节写入 Doorbell。 */
+GpgpuKmtStatus gpgpuKmtPublish(GpgpuKmtQueue *queue, uint32_t number,
+                             const GpgpuAqlPacket *packet);
+/* 先轮询约 200 us，再阻塞等待事件并复查 Signal。 */
+GpgpuKmtStatus gpgpuKmtWaitSignal(GpgpuSignal *signal, GpgpuKmtEvent *event,
+                                uint32_t timeout_ms);
+/* 停止生产后等待 R == W，卸载未确认时保持全部资源。 */
+GpgpuKmtStatus gpgpuKmtDrainQueue(GpgpuKmtQueue *queue, uint32_t timeout_ms);
 #endif

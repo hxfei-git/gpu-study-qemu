@@ -103,9 +103,9 @@ static void gpgpu_memory_delete(struct gpgpu_qmemory *m)
 /*
  * gpgpu_memory_alloc() - 为会话分配 Host 或 VRAM 对象
  *
- * 校验大小和对齐，建立底层存储后返回句柄、映射令牌与对应地址。
+ * 校验大小和对齐，建立底层存储；GEM 包装随后分配用户句柄和映射令牌。
  */
-int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request *r)
+int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_bo_create *r)
 {
 	struct gpgpu_qdev *dev = client->dev;
 	struct gpgpu_qmemory *m;
@@ -114,7 +114,7 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 
 	if ((r->kind != GPGPU_MEMORY_HOST && r->kind != GPGPU_MEMORY_VRAM) || !r->size ||
 	    r->size > GPGPU_VRAM_USABLE_SIZE || !alignment || !is_power_of_2(alignment) ||
-	    alignment > GPGPU_QUEUE_RING_MAX || client->next_memory == GPGPU_DB_MMAP_PAGE) {
+	    alignment > GPGPU_QUEUE_RING_MAX || !client->next_memory) {
 		return -EINVAL;
 	}
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
@@ -127,7 +127,6 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 	m->kind = r->kind;
 	m->size = ALIGN(r->size, PAGE_SIZE);
 	INIT_LIST_HEAD(&m->blocks);
-	atomic_set(&m->maps, 0);
 	if (m->kind == GPGPU_MEMORY_HOST) {
 		/*
 		 * dma_alloc_coherent 按分配阶对齐；
@@ -139,9 +138,10 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 			ret = -ENOMEM;
 			goto fail;
 		}
-		if (m->dma & (alignment - 1)) {
+		if ((m->dma & (alignment - 1)) ||
+		    !gpgpu_dma_address(dev, m->dma, m->size, &m->physical_address)) {
 			dma_free_coherent(&dev->pdev->dev, m->size, m->cpu, m->dma);
-			ret = -EINVAL;
+			ret = -ERANGE;
 			goto fail;
 		}
 		memset(m->cpu, 0, m->size);
@@ -157,8 +157,8 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 			goto fail;
 		block = list_first_entry(&m->blocks, struct gpu_buddy_block, link);
 		m->offset = gpu_buddy_block_offset(block);
-		if (dev->gpuvm)
-			memset_io(dev->vram + m->offset, 0, m->size);
+		m->physical_address = m->offset;
+		memset_io(dev->vram + m->offset, 0, m->size);
 #else
 		ret = -EOPNOTSUPP;
 		goto fail;
@@ -167,40 +167,11 @@ int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request
 	m->id = client->next_memory++;
 	list_add_tail(&m->node, &client->memory);
 	r->handle = m->id;
-	r->size = m->size;
-	r->vram_offset = m->offset;
-	r->mmap_offset = m->kind == GPGPU_MEMORY_HOST ? (u64)m->id << PAGE_SHIFT : 0;
-	r->host_address = m->dma;
+	r->mapped_size = m->mapped_size;
 	return 0;
 fail:
 	kfree(m);
 	return ret;
-}
-
-/*
- * gpgpu_memory_free() - 在引用与设备访问允许时释放内存
- *
- * 持锁检查队列、DMA 和 VMA 引用；存在未知访问或故障队列时保留资源。
- */
-int gpgpu_memory_free(struct gpgpu_qclient *client, u32 id)
-{
-	struct gpgpu_qmemory *m = gpgpu_memory_find(client, id);
-	struct gpgpu_user_queue *q;
-
-	if (!m)
-		return -EINVAL;
-	if (m->users || atomic_read(&m->maps) || client->dev->dma_uncertain)
-		return -EBUSY;
-	/*
-	 * 超时或错误后的未知设备访问
-	 * 也可能涉及不透明 Kernel 参数。
-	 */
-	list_for_each_entry(q, &client->queues, node) {
-		if (!q->dead && (q->uncertain || q->state != GPGPU_QUEUE_READY))
-			return -EBUSY;
-	}
-	gpgpu_memory_delete(m);
-	return 0;
 }
 
 /*
@@ -253,9 +224,9 @@ int gpgpu_memory_copy(struct gpgpu_qclient *client, struct gpgpu_memory_copy *r)
 	spin_unlock_irqrestore(&dev->irq_lock, flags);
 	dma_wmb();
 	gpgpu_qwrite64(dev, GPGPU_REG_DMA_SRC_LO,
-		       d2h ? v->offset + r->vram_offset : h->dma + r->host_offset);
+		       d2h ? v->offset + r->vram_offset : h->physical_address + r->host_offset);
 	gpgpu_qwrite64(dev, GPGPU_REG_DMA_DST_LO,
-		       d2h ? h->dma + r->host_offset : v->offset + r->vram_offset);
+		       d2h ? h->physical_address + r->host_offset : v->offset + r->vram_offset);
 	writel(r->size, dev->regs + GPGPU_REG_DMA_SIZE);
 	writel(GPGPU_DMA_START | GPGPU_DMA_IRQ | (d2h ? GPGPU_DMA_D2H : 0),
 	       dev->regs + GPGPU_REG_DMA_CTRL);

@@ -35,6 +35,8 @@
 | TLB | Translation Lookaside Buffer | 地址翻译缓存 |
 | TTM | Translation Table Maps | 图形对象存储位置与迁移管理框架 |
 
+本文保留各阶段的历史工作与验收记录，不再作为当前任务清单。版本 2 统一使用 DRM/GEM、AQL、连续 VRAM／Outbound 地址空间与 CSR 启动接口；当前构建和唯一核心计算入口见 [README](README.md#5-构建运行与本次结果)。后续实验计划统一在父目录[实验大纲](<../../../QEMU GPGPU 实验大纲.md>)维护。
+
 第一阶段六项已完成，按下列顺序单独提交。提交正文说明做了什么、核心思想、
 完成方法和验证结果。运行命令、架构与能力覆盖见 [README.md](README.md)。
 

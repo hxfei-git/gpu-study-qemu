@@ -46,7 +46,7 @@ static struct gpgpu_user_queue *find_mqd(struct gpgpu_qdev *dev, u64 mqd)
 
 	list_for_each_entry(c, &dev->clients, node) {
 		list_for_each_entry(q, &c->queues, node) {
-			if (q->mqd_dma == mqd)
+			if (q->mqd_address == mqd)
 				return q;
 		}
 	}
@@ -99,9 +99,9 @@ void gpgpu_ih_drain_locked(struct gpgpu_qdev *dev)
 		} else if (type == GPGPU_IH_QUEUE_ERROR) {
 			if (q) {
 				gpgpu_events_fault(dev, q, data);
-			} else if (mqd == dev->management[1].mqd_dma) {
+			} else if (mqd == dev->management[1].mqd_address) {
 				WRITE_ONCE(dev->management[1].failed, true);
-			} else if (mqd == dev->management[0].mqd_dma) {
+			} else if (mqd == dev->management[0].mqd_address) {
 				WRITE_ONCE(dev->management[0].failed, true);
 				WRITE_ONCE(dev->fatal, true);
 				gpgpu_events_fault(dev, NULL, data);
@@ -209,11 +209,8 @@ static struct gpgpu_qevent *find_event(struct gpgpu_qclient *client, u32 id)
  */
 static void delete_event(struct gpgpu_qclient *client, struct gpgpu_qevent *e)
 {
-	if (client->dev->gpuvm)
-		clear_bit(e->mailbox_slot, client->notify_slots);
-	else
-		dma_free_coherent(&client->dev->pdev->dev, sizeof(*e->mailbox), e->mailbox,
-				  e->mailbox_dma);
+	WRITE_ONCE(*e->mailbox, cpu_to_le64(0));
+	clear_bit(e->mailbox_slot, client->notify_slots);
 	list_del(&e->node);
 	kfree(e);
 }
@@ -231,7 +228,7 @@ int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
 	long waited;
 	int ret = 0;
 
-	if (command == GPGPU_IOC_EVENT_CREATE) {
+	if (command == GPGPU_DRM_EVENT_CREATE) {
 		struct gpgpu_user_queue *q = gpgpu_queue_find(client, r->queue_id);
 
 		if (!q || q->dead || q->state != GPGPU_QUEUE_READY || !client->next_event)
@@ -239,43 +236,35 @@ int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
 		e = kzalloc(sizeof(*e), GFP_KERNEL);
 		if (!e)
 			return -ENOMEM;
-		if (dev->gpuvm) {
-			e->mailbox_slot = find_first_zero_bit(client->notify_slots, 512);
-			if (!client->notify_cpu || e->mailbox_slot >= 512) {
-				kfree(e);
-				return -ENOSPC;
-			}
-			set_bit(e->mailbox_slot, client->notify_slots);
-			e->mailbox = (u64 *)client->notify_cpu + e->mailbox_slot;
-			e->mailbox_dma = GPGPU_VM_NOTIFY_VA + e->mailbox_slot * 8;
-		} else {
-			e->mailbox = dma_alloc_coherent(&dev->pdev->dev, sizeof(*e->mailbox),
-							&e->mailbox_dma, GFP_KERNEL);
-			if (!e->mailbox) {
-				kfree(e);
-				return -ENOMEM;
-			}
+		e->mailbox_slot = find_first_zero_bit(client->notify_slots, 512);
+		if (!client->notify_cpu || e->mailbox_slot >= 512) {
+			kfree(e);
+			return -ENOSPC;
 		}
+		set_bit(e->mailbox_slot, client->notify_slots);
+		e->mailbox = (u64 *)client->notify_cpu + e->mailbox_slot;
+		e->mailbox_address = (dev->gpuvm ? GPGPU_VM_NOTIFY_VA : client->notify_address) +
+			e->mailbox_slot * 8;
 		*e->mailbox = 0;
 		e->queue = q;
 		e->id = client->next_event++;
 		init_waitqueue_head(&e->wait);
 		list_add_tail(&e->node, &client->events);
 		r->event_id = e->id;
-		r->mailbox_address = e->mailbox_dma;
+		r->mailbox_address = e->mailbox_address;
 	} else {
 		e = find_event(client, r->event_id);
 		if (!e)
 			return -EINVAL;
 	}
-	if (command == GPGPU_IOC_EVENT_DESTROY) {
+	if (command == GPGPU_DRM_EVENT_DESTROY) {
 		gpgpu_ih_drain_locked(dev);
 		if (e->waiters || (!e->queue->dead && e->state != GPGPU_EVENT_NOTIFIED))
 			return -EBUSY;
 		delete_event(client, e);
 		return 0;
 	}
-	if (command == GPGPU_IOC_EVENT_WAIT) {
+	if (command == GPGPU_DRM_EVENT_WAIT) {
 		e->waiters++;
 		mutex_unlock(&dev->lock);
 		if (!r->timeout_ms) {
@@ -300,7 +289,7 @@ int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
 	r->state = e->state;
 	r->error = e->error;
 	r->queue_id = e->queue->id;
-	if (command == GPGPU_IOC_EVENT_WAIT && e->state == GPGPU_EVENT_FAILED)
+	if (command == GPGPU_DRM_EVENT_WAIT && e->state == GPGPU_EVENT_FAILED)
 		ret = -EIO;
 	return ret;
 }

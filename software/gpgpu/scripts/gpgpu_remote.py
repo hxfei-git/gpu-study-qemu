@@ -13,7 +13,7 @@ import time
 
 
 class RemoteDevice:
-    def __init__(self, binary, log_directory, startup_timeout=15, gpuvm=False):
+    def __init__(self, binary, log_directory, startup_timeout=15, gpuvm=True):
         self.gpuvm = gpuvm
         self.binary = Path(binary)
         self.log_directory = Path(log_directory)
@@ -36,8 +36,7 @@ class RemoteDevice:
             "-nodefaults", "-display", "none", "-monitor", "none",
             "-serial", "none", "-object", json.dumps(server),
         ]
-        if self.gpuvm:
-            command += ["-global", "gpgpu.gpuvm=on"]
+        command += ["-global", "gpgpu.gpuvm=" + ("on" if self.gpuvm else "off")]
         (self.log_directory / "device-command.json").write_text(
             json.dumps(command, ensure_ascii=False, indent=2) + "\n")
         try:
@@ -84,6 +83,7 @@ def main():
     parser.add_argument("--device-qemu", type=Path, required=True)
     parser.add_argument("--log-dir", type=Path,
                         default=Path("build/gpgpu-remote"))
+    parser.add_argument("--gpuvm", choices=("on", "off"), default="on")
     parser.add_argument("--startup-timeout", type=float, default=15)
     parser.add_argument("--timeout", type=float, default=0,
                         help="Host 最大运行秒数；0 表示不限时")
@@ -103,7 +103,8 @@ def main():
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
-    remote = RemoteDevice(args.device_qemu, args.log_dir, args.startup_timeout)
+    remote = RemoteDevice(args.device_qemu, args.log_dir, args.startup_timeout,
+                          gpuvm=args.gpuvm == "on")
     host = None
     try:
         remote.start()

@@ -13,6 +13,7 @@
 #include "memory/gpgpu_vram.h"
 #include "memory/gpgpu_vm.h"
 #include "memory/gpgpu_dma.h"
+#include "memory/gpgpu_host.h"
 #include "interrupt/gpgpu_ih.h"
 #include "interrupt/gpgpu_irq.h"
 
@@ -34,10 +35,10 @@
  * @dispatch: Dispatch 模块维护的配置、任务句柄与结果。
  * @vram: VRAM 模块拥有的共享存储。
  * @vm: GPUVM 模块拥有的地址翻译状态。
+ * @physical: 全设备 Outbound 配置与物理在途访问。
  * @dma: DMA 模块拥有的描述符与完成定时器。
  * @ih: IH 模块拥有的记录 Ring。
  * @irq: IRQ 模块拥有的中断锁存。
- * @simt: MMIO 模块维护的教学读回寄存器。
  */
 struct GPGPUState {
 	PCIDevice parent_obj;
@@ -56,10 +57,10 @@ struct GPGPUState {
 	GPGPUDispatchState dispatch;
 	GPGPUVRAMState vram;
 	GPGPUVMState vm;
+	GPGPUPhysicalState physical;
 	GPGPUDMAState dma;
 	GPGPUIHState ih;
 	GPGPUIRQState irq;
-	GPGPUSIMTContext simt;
 };
 
 #endif /* HW_GPGPU_INTERNAL_H */

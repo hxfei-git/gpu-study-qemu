@@ -14,18 +14,17 @@ extern char cp_fault_load32[], cp_fault_load64[];
 extern char cp_fault_store32[], cp_fault_store64[], cp_access_failed[];
 
 /*
- * cp_window() - 将一次 Host 访问映射到 CP 本地窗口
+ * cp_window() - 将一次 GPU 存储访问映射到 CP 本地窗口
  *
  * 先记录槽位和阶段，再配置 64 KiB 窗口基址并返回窗口内地址。
  */
-static unsigned long cp_window(u32 slot, u32 vmid, u32 phase, u64 address)
+static unsigned long cp_window(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address)
 {
 	cp_access.slot = slot;
 	cp_access.phase = phase;
 	cp_access.address = address;
 	cp_fence();
-	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_DOMAIN =
-		vmid ? GPGPU_VM_DOMAIN_USER : GPGPU_VM_DOMAIN_MANAGEMENT;
+	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_DOMAIN = domain;
 	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_ID = vmid;
 	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_SLOT = slot;
 	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_PHASE = phase;
@@ -37,59 +36,59 @@ static unsigned long cp_window(u32 slot, u32 vmid, u32 phase, u64 address)
 }
 
 /*
- * cp_read32() - 从 Host RAM 完整读取一个 32 位标量
+ * cp_read32() - 从指定域完整读取一个 32 位标量
  *
  * 校验范围后调用可恢复访存汇编；成功返回 1，异常或非法地址返回 0。
  */
-int cp_read32(u32 slot, u32 vmid, u32 phase, u64 address, u32 *value)
+int cp_read32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 *value)
 {
 	if (!cp_range(address, 4, 4))
 		return 0;
-	return cp_access_load32(cp_window(slot, vmid, phase, address), value);
+	return cp_access_load32(cp_window(slot, domain, vmid, phase, address), value);
 }
 
 /*
- * cp_read64() - 从 Host RAM 完整读取一个 64 位标量
+ * cp_read64() - 从指定域完整读取一个 64 位标量
  *
  * 使用单条 64 位 load，不能拆成两次 32 位共享值读取；成功返回 1。
  */
-int cp_read64(u32 slot, u32 vmid, u32 phase, u64 address, u64 *value)
+int cp_read64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 *value)
 {
 	if (!cp_range(address, 8, 8))
 		return 0;
-	return cp_access_load64(cp_window(slot, vmid, phase, address), value);
+	return cp_access_load64(cp_window(slot, domain, vmid, phase, address), value);
 }
 
 /*
- * cp_write32() - 向 Host RAM 完整写入一个 32 位标量
+ * cp_write32() - 向指定域完整写入一个 32 位标量
  *
  * 记录访问归属并调用可恢复 store；失败返回 0，不重试已经执行的写入。
  */
-int cp_write32(u32 slot, u32 vmid, u32 phase, u64 address, u32 value)
+int cp_write32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 value)
 {
 	if (!cp_range(address, 4, 4))
 		return 0;
-	return cp_access_store32(cp_window(slot, vmid, phase, address), value);
+	return cp_access_store32(cp_window(slot, domain, vmid, phase, address), value);
 }
 
 /*
- * cp_write64() - 向 Host RAM 完整写入一个 64 位标量
+ * cp_write64() - 向指定域完整写入一个 64 位标量
  *
  * 使用单条 64 位 store 发布 Signal、通知槽或完成序号；成功返回 1。
  */
-int cp_write64(u32 slot, u32 vmid, u32 phase, u64 address, u64 value)
+int cp_write64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 value)
 {
 	if (!cp_range(address, 8, 8))
 		return 0;
-	return cp_access_store64(cp_window(slot, vmid, phase, address), value);
+	return cp_access_store64(cp_window(slot, domain, vmid, phase, address), value);
 }
 
 /*
- * cp_read_object() - 读取初始化后固定的 Host 对象
+ * cp_read_object() - 读取初始化后固定的 GPU 对象
  *
  * 按 32 位分段复制，任一访问失败即停止；动态 Header 和进度须单独读取。
  */
-int cp_read_object(u32 slot, u32 vmid, u32 phase, u64 address, void *dest, u32 size)
+int cp_read_object(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, void *dest, u32 size)
 {
 	u32 *words = dest;
 	u32 i;
@@ -98,7 +97,7 @@ int cp_read_object(u32 slot, u32 vmid, u32 phase, u64 address, void *dest, u32 s
 		return 0;
 	/* 对象初始化后固定；动态首部与进度单独使用完整标量接口。 */
 	for (i = 0; i < size / 4; i++)
-		if (!cp_read32(slot, vmid, phase, address + 4 * i, &words[i]))
+		if (!cp_read32(slot, domain, vmid, phase, address + 4 * i, &words[i]))
 			return 0;
 	return 1;
 }

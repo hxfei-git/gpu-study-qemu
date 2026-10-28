@@ -3,16 +3,15 @@
 # 矩阵按行存储：A[rows][inner]、B[inner][cols]、C[rows][cols]。
 .include "gpgpu_kernel.inc"
 matmul:
-	lui t0, GPGPU_CTRL_HI
-	lw t1, BLOCK_X(t0)
-	lw t2, BLOCK_DIM_X(t0)
+	csrr t1, BLOCK_ID_X
+	csrr t2, BLOCK_DIM_X
 	mul t1, t1, t2
-	lw t2, THREAD_X(t0)
+	csrr t2, THREAD_ID_X
 	add s0, t1, t2
-	lw t1, BLOCK_Y(t0)
-	lw t2, BLOCK_DIM_Y(t0)
+	csrr t1, BLOCK_ID_Y
+	csrr t2, BLOCK_DIM_Y
 	mul t1, t1, t2
-	lw t2, THREAD_Y(t0)
+	csrr t2, THREAD_ID_Y
 	add s1, t1, t2
 	lw s2, 16(a0)
 	bgeu s0, s2, done

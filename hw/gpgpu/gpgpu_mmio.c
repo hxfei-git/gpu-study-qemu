@@ -10,6 +10,7 @@
 #include "cp/gpgpu_hqd.h"
 #include "compute/gpgpu_dispatch.h"
 #include "memory/gpgpu_dma.h"
+#include "memory/gpgpu_host.h"
 #include "memory/gpgpu_vm.h"
 #include "memory/gpgpu_vram.h"
 #include "interrupt/gpgpu_irq.h"
@@ -34,6 +35,8 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 	}
 	if (addr >= 0x0900 && addr < 0x0b00)
 		return gpgpu_vm_read(s, addr);
+	if ((addr & ~0xffULL) == GPGPU_REG_OUTBOUND_GPU_BASE)
+		return gpgpu_outbound_read(s, addr);
 	if (addr == GPGPU_REG_HQD_SELECT)
 		return gpgpu_hqd_selected(s);
 	if ((addr & ~0xffULL) == GPGPU_REG_HQD_WINDOW)
@@ -71,24 +74,6 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned int size)
 		return s->global_status;
 	case GPGPU_REG_ERROR_STATUS:
 		return s->error_status;
-	case GPGPU_REG_THREAD_ID_X:
-		return s->simt.thread_id[0];
-	case GPGPU_REG_THREAD_ID_Y:
-		return s->simt.thread_id[1];
-	case GPGPU_REG_THREAD_ID_Z:
-		return s->simt.thread_id[2];
-	case GPGPU_REG_BLOCK_ID_X:
-		return s->simt.block_id[0];
-	case GPGPU_REG_BLOCK_ID_Y:
-		return s->simt.block_id[1];
-	case GPGPU_REG_BLOCK_ID_Z:
-		return s->simt.block_id[2];
-	case GPGPU_REG_WARP_ID:
-		return s->simt.warp_id;
-	case GPGPU_REG_LANE_ID:
-		return s->simt.lane_id;
-	case GPGPU_REG_THREAD_MASK:
-		return s->simt.thread_mask;
 	default:
 		return 0;
 	}
@@ -107,6 +92,10 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		if ((addr & ~0xffULL) == GPGPU_REG_IH_BASE_LO)
 			gpgpu_ih_write(s, UINT64_MAX, 0, false);
+		return;
+	}
+	if ((addr & ~0xffULL) == GPGPU_REG_OUTBOUND_GPU_BASE) {
+		gpgpu_outbound_write(s, addr, val);
 		return;
 	}
 	if (addr >= 0x0900 && addr < 0x0b00) {
@@ -131,7 +120,7 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		gpgpu_irq_write(s, addr, val);
 		return;
 	case GPGPU_REG_KERNEL_ADDR_LO:
-		gpgpu_dispatch_write(s, addr, val);
+		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return;
 	case GPGPU_REG_DMA_SRC_LO:
 		gpgpu_dma_write(s, addr, val);
@@ -152,33 +141,6 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val, unsigned i
 		s->error_status &= ~(uint32_t)val;
 		if (!s->error_status)
 			s->global_status &= ~GPGPU_STATUS_ERROR;
-		break;
-	case GPGPU_REG_THREAD_ID_X:
-		s->simt.thread_id[0] = (uint32_t)val;
-		break;
-	case GPGPU_REG_THREAD_ID_Y:
-		s->simt.thread_id[1] = (uint32_t)val;
-		break;
-	case GPGPU_REG_THREAD_ID_Z:
-		s->simt.thread_id[2] = (uint32_t)val;
-		break;
-	case GPGPU_REG_BLOCK_ID_X:
-		s->simt.block_id[0] = (uint32_t)val;
-		break;
-	case GPGPU_REG_BLOCK_ID_Y:
-		s->simt.block_id[1] = (uint32_t)val;
-		break;
-	case GPGPU_REG_BLOCK_ID_Z:
-		s->simt.block_id[2] = (uint32_t)val;
-		break;
-	case GPGPU_REG_WARP_ID:
-		s->simt.warp_id = (uint32_t)val;
-		break;
-	case GPGPU_REG_LANE_ID:
-		s->simt.lane_id = (uint32_t)val;
-		break;
-	case GPGPU_REG_THREAD_MASK:
-		s->simt.thread_mask = (uint32_t)val;
 		break;
 	default:
 		break;
@@ -260,8 +222,3 @@ const MemoryRegionOps gpgpu_cp_regs_ops = {
 	.valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 	.impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 };
-
-void gpgpu_mmio_reset(GPGPUState *s)
-{
-	memset(&s->simt, 0, sizeof(s->simt));
-}

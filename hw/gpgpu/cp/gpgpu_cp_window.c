@@ -22,7 +22,7 @@ static MemTxResult gpgpu_cp_host_access(GPGPUState *s, hwaddr addr, uint8_t *buf
 		return MEMTX_ERROR;
 
 	if (s->cp.window.vm_domain == GPGPU_VM_DOMAIN_USER) {
-		return gpgpu_vm_access(s, s->cp.window.vm_id, s->cp.window.vm_slot, iova, buf, size,
+		return gpgpu_user_access(s, s->cp.window.vm_id, s->cp.window.vm_slot, iova, buf, size,
 				       is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ,
 				       s->cp.window.vm_phase) ?
 			MEMTX_OK :
@@ -31,7 +31,7 @@ static MemTxResult gpgpu_cp_host_access(GPGPUState *s, hwaddr addr, uint8_t *buf
 	if (s->cp.window.vm_domain != GPGPU_VM_DOMAIN_MANAGEMENT)
 		return MEMTX_ERROR;
 	/* 直接访存，不使用 Host DMA 描述符、状态或完成中断。 */
-	return gpgpu_host_access(s, iova, buf, size, is_write);
+	return gpgpu_phys_access(s, iova, buf, size, is_write);
 }
 
 static MemTxResult gpgpu_cp_host_read(void *opaque, hwaddr addr, uint64_t *val, unsigned int size,

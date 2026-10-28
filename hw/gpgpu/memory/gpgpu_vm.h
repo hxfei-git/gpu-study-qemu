@@ -9,7 +9,7 @@
 
 /**
  * struct GPGPUVMContext - GPUVM 管理的一份地址空间上下文
- * @root: VRAM 中的根目录字节偏移。
+ * @root: 根目录的 GPU 物理地址，可位于 VRAM 或 Outbound。
  * @enabled: 页表发布和失效完成后由 Host 启用。
  * @accesses: 在途访问次数，包含可能让出设备主锁的跨进程 DMA。
  */
@@ -66,6 +66,10 @@ typedef struct GPGPUVMFault {
  */
 bool gpgpu_vm_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, void *data,
 		     size_t length, uint32_t access, uint32_t phase);
+
+/* 用户统一入口：按设备属性翻译或直通，并保持源槽故障归属。 */
+bool gpgpu_user_access(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, void *data,
+		       size_t length, uint32_t access, uint32_t phase);
 
 /**
  * gpgpu_vm_fail() - 为非法窗口访问记录首次 GPUVM 故障
@@ -133,7 +137,7 @@ void gpgpu_vm_reset_firmware(GPGPUState *s);
  * @s: 设备实例；调用期间须保持设备存活。
  * @version: 固件写入的版本号。
  *
- * Return: GPUVM 模式且版本匹配时保存并返回 true。
+ * Return: 统一访存协议版本匹配时保存并返回 true。
  */
 bool gpgpu_vm_set_firmware(GPGPUState *s, uint32_t version);
 

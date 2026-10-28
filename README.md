@@ -66,7 +66,7 @@ make -f Makefile.camp build
 # Run a specific experiment
 make -f Makefile.camp test-cpu
 make -f Makefile.camp test-soc
-make -f Makefile.camp test-gpgpu
+make -f Makefile.camp test-gpgpu-stack
 make -f Makefile.camp test-rust
 
 # Run all experiments
@@ -103,14 +103,14 @@ Implement peripheral device models (GPIO, PWM, WDT, SPI, Flash) for the G233 SoC
 - Run: `make -f Makefile.camp test-soc`
 - Docs: [Experiment Manual](https://qemu.gevico.online/exercise/2026/stage1/soc/g233-exper-manual/) | [G233 SoC Datasheet](https://qemu.gevico.online/exercise/2026/stage1/soc/g233-datasheet/)
 
-### GPGPU Experiment (QTest)
+### GPGPU 实验（DRM/AQL 核心计算）
 
-Implement a PCIe GPGPU device with SIMT execution engine, DMA, and low-precision float support. Tests verify device registers, VRAM, kernel execution, and FP8/FP4 conversions.
+当前软件栈通过 DRM/GEM、AQL Queue、RV64 CP 和 Signal/IH 运行 RV32 Kernel。用户访存按 `gpuvm=on/off` 翻译或直通，物理空间连续分为 VRAM 与 Outbound，线程启动信息通过只读 CSR 获取。
 
-- Device: `hw/gpgpu/` (PCI device `gpgpu`)
-- Tests: `tests/qtest/gpgpu-test.c` (17 subtests)
-- Run: `make -f Makefile.camp test-gpgpu`
-- Docs: [Experiment Manual](https://qemu.gevico.online/exercise/2026/stage1/gpu/gpu-exper-manual/) | [GPU Datasheet](https://qemu.gevico.online/exercise/2026/stage1/gpu/gpu-datasheet/)
+- 设备与软件：[软件栈说明](software/gpgpu/README.md)。
+- 计算示例：向量加法、矩阵乘法和 ReLU，保留原规模及逐元素比较。
+- 唯一验证入口：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
+- 原 GPGPU 专用 QTest 与评分任务已删除，历史结果保留在软件栈说明中。
 
 ### Rust Experiment (QTest + Unit)
 
@@ -131,7 +131,7 @@ make -f Makefile.camp configure  # Configure QEMU
 make -f Makefile.camp build      # Build QEMU
 make -f Makefile.camp test-cpu   # CPU experiment tests
 make -f Makefile.camp test-soc   # SoC experiment tests
-make -f Makefile.camp test-gpgpu # GPGPU experiment tests
+make -f Makefile.camp test-gpgpu-stack # GPGPU experiment tests
 make -f Makefile.camp test-rust  # Rust experiment tests
 make -f Makefile.camp test       # All tests
 make -f Makefile.camp clean      # Clean build

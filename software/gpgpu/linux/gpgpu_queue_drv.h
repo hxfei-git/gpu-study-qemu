@@ -13,7 +13,6 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include "gpgpu_regs.h"
-#include "gpgpu_uapi.h"
 #include "gpgpu_queue.h"
 #include "gpgpu_drm.h"
 #if IS_REACHABLE(CONFIG_DRM)
@@ -24,8 +23,6 @@ struct drm_file;
 
 /* 驱动管理请求与队列模式 DMA 的等待上限，单位毫秒。 */
 #define GPGPU_Q_TIMEOUT_MS 5000U
-/* mmap 页偏移中的 Doorbell 令牌，与内存句柄区分。 */
-#define GPGPU_DB_MMAP_PAGE 0x100000UL
 /* GPUVM 的 Doorbell 令牌低于 GEM 的 4 GiB 偏移起点。 */
 #define GPGPU_VM_DB_MMAP_PAGE 0x10000UL
 /* 队列模式使用的四类中断位掩码。 */
@@ -48,14 +45,15 @@ struct gpgpu_qclient;
  * @size: 实际分配的字节数。
  * @cpu: Host 对象的内核虚拟地址，VRAM 对象不使用。
  * @dma: Host 对象的完整 DMA 地址；启用系统 IOMMU 时为 IOVA。
- * @maps: 仍存活的用户 VMA 数，非零时禁止释放。
  * @blocks: VRAM 对象持有的 gpu_buddy 块链表。
  * @dev: 独立持有引用的设备状态。
  * @gem: 包装固定存储的 GEM 对象。
  * @gem_ready: 已建立 GEM 创建引用，列表持有该引用。
  * @logical_size: 应用请求的逻辑字节数。
  * @mapped_size: CPU/GPU 可见的 4 KiB 对齐字节数。
- * @gpu_va: 整对象 GPUVA；零表示没有映射。
+ * @gpu_address: 绑定后供用户队列使用的地址。
+ * @physical_address: 固定存储的 GPU 物理地址。
+ * @bound: 是否持有绑定引用，不由地址值推断。
  * @permissions: GPU 读、写和取指权限位。
  */
 struct gpgpu_qmemory {
@@ -68,7 +66,9 @@ struct gpgpu_qmemory {
 	bool gem_ready;	  /* 创建引用由会话列表持有。 */
 	u64 logical_size; /* 应用申请长度。 */
 	u64 mapped_size;  /* GPU 映射与 CPU mmap 可见的页对齐长度。 */
-	u64 gpu_va;	  /* 已映射时的 GPUVA，零表示未映射。 */
+	u64 gpu_address; /* 绑定后供用户队列使用的地址。 */
+	u64 physical_address; /* 固定存储的 GPU 物理地址。 */
+	bool bound; /* 独立于地址值和页表存在的绑定引用。 */
 	u32 permissions;  /* GPU 读写取指权限。 */
 	u32 id;
 	u32 kind;
@@ -77,7 +77,6 @@ struct gpgpu_qmemory {
 	size_t size;
 	void *cpu;
 	dma_addr_t dma;
-	atomic_t maps;
 	struct list_head blocks;
 };
 
@@ -90,7 +89,8 @@ struct gpgpu_qmemory {
  * @rptr: 内核映射中的 32 位消费进度地址。
  * @wptr: 内核映射中的 32 位预留进度地址。
  * @mqd: 独占 MQD 的内核虚拟地址。
- * @mqd_dma: MQD 的完整管理 DMA 地址，也是 IH 队列匹配键。
+ * @mqd_dma: MQD 的原始 DMA 地址，仅供 DMA API 使用。
+ * @mqd_address: MQD 的 GPU 物理地址，也是 IH 队列匹配键。
  * @id: 会话内唯一队列编号。
  * @db_index: 会话 Doorbell 页内的 8 字节入口编号。
  * @state: 对用户回报的 READY/UNLOADING/FAULTED 状态。
@@ -109,6 +109,7 @@ struct gpgpu_user_queue {
 	u32 *wptr;
 	GpgpuMqd *mqd;
 	dma_addr_t mqd_dma;
+	u64 mqd_address; /* 设备协议与 IH 匹配使用 GPU 物理地址。 */
 	u32 id;
 	u32 db_index;
 	u32 state;
@@ -124,7 +125,7 @@ struct gpgpu_user_queue {
  * @node: 所属会话 events 链表节点。
  * @queue: 产生通知的源队列，事件存活期间不能删除该对象。
  * @mailbox: 8 字节一致性通知槽的内核映射。
- * @mailbox_dma: 通知槽的设备地址；GPUVM 模式为内部通知页 GPUVA。
+ * @mailbox_address: 通知槽的 GPU 地址，随设备模式采用 GPUVA 或物理地址。
  * @id: 会话内非零且不复用的存活事件编号。
  * @state: 先保存状态再唤醒，多个等待者均可观察。
  * @error: 事件失败时保存的错误值。
@@ -136,7 +137,7 @@ struct gpgpu_qevent {
 	struct list_head node;
 	struct gpgpu_user_queue *queue;
 	u64 *mailbox;
-	dma_addr_t mailbox_dma;
+	u64 mailbox_address;
 	u32 id;
 	u32 state;
 	u32 error;
@@ -152,20 +153,21 @@ struct gpgpu_qevent {
  * @queues: 本会话的队列对象链表，包含尚不能回收的旧对象。
  * @events: 本会话的事件对象链表。
  * @dev: 所属设备，会话持有一个设备引用。
- * @next_memory: 下一个内存句柄，不能进入 Doorbell 令牌区。
+ * @next_memory: GEM 包装前分配临时内部编号，回绕为零后停止分配。
  * @next_queue: 下一个队列编号，回绕为零后停止分配。
  * @next_event: 下一个事件编号，回绕为零后停止分配。
  * @db_page: 设备 Doorbell 空间内的页号，零表示尚未分配。
  * @db_maps: 本会话 Doorbell 页的存活用户 VMA 数。
  * @orphan: 文件已关闭但设备访问未结束，保留到设备停机。
  * @owner: 创建会话的线程组 ID，用于拒绝其他进程复用。
- * @drm_file: GPUVM 文件上下文，旧模式为 NULL。
+ * @drm_file: DRM 文件上下文。
  * @vmid: 本对象所属的设备地址空间编号，管理访问为零。
  * @root: 根目录在 VRAM 中的字节偏移。
  * @vm_failed: 页表更新失败或结果未知，禁止重建 Queue。
  * @tables: 驱动私有页表页链表。
  * @notify_cpu: 内部通知页的内核映射，不映射给应用。
- * @notify_dma: 内部通知页的 DMA 字节地址。
+ * @notify_dma: 内部通知页的原始 DMA 地址。
+ * @notify_address: 内部通知页的 GPU 物理地址。
  * @notify_slots: 通知页的 512 个槽占用位图。
  */
 struct gpgpu_qclient {
@@ -181,22 +183,25 @@ struct gpgpu_qclient {
 	atomic_t db_maps;
 	bool orphan;
 	pid_t owner;
-	struct drm_file *drm_file; /* GPUVM 文件上下文，旧模式为 NULL。 */
-	u32 vmid;		   /* 首次映射取得并持有到 VM 销毁。 */
+	struct drm_file *drm_file; /* DRM 文件上下文。 */
+	u32 vmid;		   /* 首次绑定取得并持有到上下文清理。 */
 	u32 root;		   /* VRAM 页表根偏移。 */
 	bool vm_failed;		   /* 更新结果未知时禁止重建队列。 */
 	struct list_head tables;   /* 驱动私有表页，不进入用户对象链表。 */
 	void *notify_cpu;	   /* 内部 4 KiB 通知页。 */
 	dma_addr_t notify_dma;
+	u64 notify_address; /* 通知页的 GPU 物理地址。 */
 	DECLARE_BITMAP(notify_slots, 512);
 };
 
 /**
  * struct gpgpu_management_ring - 驱动拥有的 KIQ 或 HIQ 及共享进度
  * @mqd: 管理队列 MQD 的内核映射。
- * @mqd_dma: 管理队列 MQD 的完整 Host 物理地址。
+ * @mqd_dma: 管理队列 MQD 的原始 DMA 地址。
+ * @mqd_address: 管理队列 MQD 的 GPU 物理地址。
  * @storage: Ring 与附加进度页的连续内核映射。
- * @dma: storage 的 DMA 基址，队列模式下为物理地址。
+ * @dma: storage 的原始 DMA 基址。
+ * @address: storage 的 GPU 物理基址。
  * @rptr: 附加页内的 32 位消费进度。
  * @wptr: 附加页内的 32 位已发布进度。
  * @doorbell: BAR4 内的 Doorbell 字节偏移。
@@ -205,8 +210,10 @@ struct gpgpu_qclient {
 struct gpgpu_management_ring {
 	GpgpuMqd *mqd;
 	dma_addr_t mqd_dma;
+	u64 mqd_address; /* 设备协议与 IH 匹配使用 GPU 物理地址。 */
 	void *storage;
 	dma_addr_t dma;
+	u64 address; /* Ring 与进度存储的 GPU 物理基址。 */
 	u32 *rptr;
 	u32 *wptr;
 	u32 doorbell;
@@ -217,12 +224,14 @@ struct gpgpu_management_ring {
  * struct gpgpu_management_request - 一次管理请求独占的结果区，超时后继续保留
  * @node: 设备 requests 链表节点。
  * @result: 16 字节结果区的内核映射。
- * @dma: 结果区的完整 Host 物理地址。
+ * @dma: 结果区的原始 DMA 地址。
+ * @address: 结果区的 GPU 物理地址。
  */
 struct gpgpu_management_request {
 	struct list_head node;
 	GpgpuManagementResult *result;
 	dma_addr_t dma;
+	u64 address; /* 完成写回使用的 GPU 物理地址。 */
 };
 
 /**
@@ -253,12 +262,14 @@ struct gpgpu_management_request {
  * @next_sequence: 下一个管理完成序号，从 1 开始且不回绕复用。
  * @management: KIQ 和 HIQ，分别使用下标 0 和 1。
  * @ih: Host IH Ring 的内核虚拟地址。
- * @ih_dma: IH Ring 的完整 Host 物理地址。
+ * @ih_dma: IH Ring 的原始 DMA 地址。
+ * @ih_address: IH Ring 的 GPU 物理地址。
+ * @vram_size: 设备显存大小，也是 Outbound 的 GPU 基址。
  * @ih_rptr: Host 下一条待消费的 32 位记录编号。
  * @vm_serial: 跨管理等待串行队列和映射变更，不阻塞事件等待。
  * @gpuvm: 本连接或设备是否采用 GPUVM 地址语义。
  * @vmids: 用户 VMID 1、2 的占用位图。
- * @drm: GPUVM 模式注册的 DRM 设备。
+ * @drm: 两种地址模式共用的 DRM 设备。
  */
 struct gpgpu_qdev {
 	struct pci_dev *pdev;
@@ -285,7 +296,7 @@ struct gpgpu_qdev {
 	bool started;
 	bool gpuvm;		/* 本次启动使用 GPUVM。 */
 	unsigned long vmids;	/* 固定用户 VMID 占用位图。 */
-	struct drm_device *drm; /* 仅 GPUVM 模式注册。 */
+	struct drm_device *drm; /* 两种地址模式共用。 */
 	struct list_head clients;
 	struct list_head requests;
 	struct list_head reserved_blocks;
@@ -296,6 +307,8 @@ struct gpgpu_qdev {
 	struct gpgpu_management_ring management[2];
 	GpgpuIhRecord *ih;
 	dma_addr_t ih_dma;
+	u64 ih_address;
+	u32 vram_size;
 	u32 ih_rptr;
 };
 
@@ -318,9 +331,7 @@ irqreturn_t gpgpu_qdev_irq(struct gpgpu_qdev *dev);
 int gpgpu_qopen(struct gpgpu_qdev *dev, struct file *file);
 /* 结束文件对应的队列会话。 */
 int gpgpu_qrelease(struct inode *inode, struct file *file);
-/* 校验并分发队列模式 ioctl。 */
-long gpgpu_qioctl(struct file *file, unsigned int command, unsigned long argument);
-/* 建立队列内存或 Doorbell 用户映射。 */
+/* 建立 Doorbell 用户映射；CPU 存储映射由 GEM 保活。 */
 int gpgpu_qmmap(struct file *file, struct vm_area_struct *vma);
 
 /*
@@ -336,9 +347,7 @@ struct gpgpu_qmemory *gpgpu_memory_find(struct gpgpu_qclient *client, u32 id);
 /* 检查对象内字节范围。 */
 bool gpgpu_memory_range(struct gpgpu_qmemory *memory, u64 offset, u64 size);
 /* 为会话分配 Host 或 VRAM 对象。 */
-int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_memory_request *r);
-/* 在引用与设备访问允许时释放内存。 */
-int gpgpu_memory_free(struct gpgpu_qclient *client, u32 id);
+int gpgpu_memory_alloc(struct gpgpu_qclient *client, struct gpgpu_bo_create *r);
 /* 释放已结束会话的全部内存。 */
 void gpgpu_memory_release_all(struct gpgpu_qclient *client);
 /* 通过 DMA 同步搬运两个对象内的数据。 */
@@ -362,13 +371,28 @@ int gpgpu_queue_operation(struct gpgpu_qclient *c, unsigned int command,
 			  struct gpgpu_queue_state *r);
 /* GEM 存储回收及句柄验证。 */
 void gpgpu_memory_storage_free(struct gpgpu_qmemory *m);
-/* GPUVM 生命周期和 DRM 入口；不支持 DRM 的旧内核使用空实现。 */
+/* 绑定生命周期和 DRM 入口；缺少所需内核配置时拒绝注册。 */
 int gpgpu_drm_register(struct gpgpu_qdev *dev);
 void gpgpu_drm_unregister(struct gpgpu_qdev *dev);
 void gpgpu_gem_drop(struct gpgpu_qmemory *m);
 int gpgpu_vm_cleanup(struct gpgpu_qclient *c);
 bool gpgpu_vm_queue_live(struct gpgpu_qclient *c);
 void gpgpu_vm_save_fault(struct gpgpu_user_queue *q);
+/* 只转换已分配的完整 DMA 区间，DMA API 始终使用原 dma_addr_t。 */
+static inline bool gpgpu_dma_address(struct gpgpu_qdev *dev, dma_addr_t dma,
+                                     u64 size, u64 *address)
+{
+	u64 iova = (u64)dma;
+	u64 limit = 1ULL << 31;
+	u64 window_size = (1ULL << 32) - dev->vram_size;
+
+	if (!size || iova >= limit || size > limit - iova ||
+	    iova >= window_size || size > window_size - iova)
+		return false;
+	*address = (u64)dev->vram_size + iova;
+	return true;
+}
+
 /*
  * gpgpu_qwrite64() - 写入一对 32 位地址配置寄存器
  *

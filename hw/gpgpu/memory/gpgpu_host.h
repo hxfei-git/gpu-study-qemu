@@ -1,37 +1,29 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* 封装底层 Host DMA 传输，不持有描述符或完成事件。 */
+/* GPU 物理地址经 VRAM 或 Outbound 路由，Host DMA 地址只留在底层。 */
 #ifndef HW_MEMORY_GPGPU_HOST_H
 #define HW_MEMORY_GPGPU_HOST_H
 
 #include "hw/gpgpu/gpgpu.h"
 #include "exec/memattrs.h"
+#include "exec/hwaddr.h"
 
-/**
- * gpgpu_host_read() - 读取 Host 存储
- * @s: 设备实例；调用期间须保持设备存活。
- * @address: 设备发出的 Host DMA 地址；系统 IOMMU 语义由现有传输层处理。
- * @data: 传输缓冲区。
- * @length: 传输字节数。
- *
- * 同步返回，不修改描述符 DMA 状态；失败时可能已有部分传输。
- *
- * Return: 底层完整成功时为 true。
- */
-bool gpgpu_host_read(GPGPUState *s, uint64_t address, void *data, size_t length);
+typedef struct GPGPUPhysicalState {
+	uint64_t gpu_base;
+	uint64_t size;
+	uint64_t host_base;
+	uint32_t status;
+	unsigned int accesses;
+	bool enabled;
+} GPGPUPhysicalState;
 
-/**
- * gpgpu_host_access() - 保留底层访问结果的 Host 传输入口
- * @s: 设备实例；调用期间须保持设备存活。
- * @address: Host DMA 字节地址。
- * @data: 传输缓冲区。
- * @length: 传输字节数。
- * @is_write: 为 true 表示从缓冲区写入 Host。
- *
- * 供 CP 窗口保留原 MemTxResult 语义。
- *
- * Return: 底层访问结果，成功为 MEMTX_OK。
- */
-MemTxResult gpgpu_host_access(GPGPUState *s, uint64_t address, void *data, size_t length,
+/* 检查完整范围是否可由当前 VRAM/Outbound 配置路由。 */
+bool gpgpu_phys_contains(GPGPUState *s, uint64_t address, uint64_t length);
+/* 公共物理入口；调用者持设备主锁，DMA 期间在途计数阻止重配。 */
+MemTxResult gpgpu_phys_access(GPGPUState *s, uint64_t address, void *data, size_t length,
 			      bool is_write);
+/* Outbound 配置为全设备共享，只有停止所有访问后才允许写入。 */
+uint32_t gpgpu_outbound_read(GPGPUState *s, hwaddr addr);
+void gpgpu_outbound_write(GPGPUState *s, hwaddr addr, uint32_t value);
+void gpgpu_outbound_reset(GPGPUState *s);
 
 #endif /* HW_MEMORY_GPGPU_HOST_H */

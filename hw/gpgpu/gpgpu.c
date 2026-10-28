@@ -16,6 +16,7 @@
 #include "compute/gpgpu_exec_types.h"
 #include "memory/gpgpu_vram.h"
 #include "memory/gpgpu_vm.h"
+#include "memory/gpgpu_host.h"
 #include "memory/gpgpu_dma.h"
 #include "interrupt/gpgpu_ih.h"
 #include "interrupt/gpgpu_irq.h"
@@ -31,6 +32,11 @@
 /* 停止原生 CP 和任务后，依次复位各模块；此入口保留 VRAM。 */
 void gpgpu_reset_state(GPGPUState *s)
 {
+	/* 跨进程 DMA 可能临时让出主锁；其返回前不能释放或重配地址空间。 */
+	if (s->physical.accesses) {
+		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+		return;
+	}
 	gpgpu_cp_device_reset(s);
 	gpgpu_dispatch_reset(s);
 	gpgpu_vm_reset(s);
@@ -40,8 +46,8 @@ void gpgpu_reset_state(GPGPUState *s)
 	s->global_status = GPGPU_STATUS_READY;
 	s->error_status = 0;
 	gpgpu_irq_clear(s);
-	gpgpu_mmio_reset(s);
 	gpgpu_dma_reset(s);
+	gpgpu_outbound_reset(s);
 }
 
 /* 全局错误由设备锁存，再交 IRQ 模块通知 Host。 */
@@ -63,10 +69,10 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 	uint8_t *pci_conf = pdev->config;
 
 	if (s->warp_size != GPGPU_WARP_SIZE || s->vram_size < 4096 ||
-	    s->vram_size > GPGPU_CORE_CTRL_BASE || !is_power_of_2(s->vram_size)) {
+	    s->vram_size >= (1ULL << 31) || !is_power_of_2(s->vram_size)) {
 		error_setg(errp,
 			   "GPGPU: warp_size must be 32; vram_size must be a "
-			   "power of two between 4 KiB and 2 GiB");
+			   "power of two from 4 KiB to less than 2 GiB");
 		return;
 	}
 
@@ -96,6 +102,7 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 	}
 	gpgpu_dma_init(s);
 	gpgpu_dispatch_init(s);
+	gpgpu_outbound_reset(s);
 
 	s->global_status = GPGPU_STATUS_READY;
 }
@@ -127,13 +134,15 @@ static void gpgpu_reset(DeviceState *dev)
 	GPGPUState *s = GPGPU(dev);
 
 	gpgpu_reset_state(s);
+	if (s->physical.accesses)
+		return;
 	/* 复位发生在 realize 成功之后，此时 VRAM 已分配。 */
 	gpgpu_vram_reset(s);
 	gpgpu_irq_reset(s);
 }
 
 static const Property gpgpu_properties[] = {
-	DEFINE_PROP_BOOL("gpuvm", GPGPUState, gpuvm, false),
+	DEFINE_PROP_BOOL("gpuvm", GPGPUState, gpuvm, true),
 	DEFINE_PROP_UINT32("num_cus", GPGPUState, num_cus, GPGPU_DEFAULT_NUM_CUS),
 	DEFINE_PROP_UINT32("warps_per_cu", GPGPUState, warps_per_cu, GPGPU_DEFAULT_WARPS_PER_CU),
 	DEFINE_PROP_UINT32("warp_size", GPGPUState, warp_size, GPGPU_DEFAULT_WARP_SIZE),

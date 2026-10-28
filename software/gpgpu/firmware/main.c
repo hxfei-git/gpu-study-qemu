@@ -91,7 +91,8 @@ int cp_next_packet(u32 slot, u64 *address, u32 packet_size)
 	poll = cp_hqd_address(slot, GPGPU_HQD_WPTR_ADDR_LO);
 	if (capacity < GPGPU_QUEUE_RING_MIN || capacity > GPGPU_QUEUE_RING_MAX ||
 	    (capacity & (capacity - 1)) || !cp_range(ring, capacity, 64) || !cp_range(poll, 4, 8) ||
-	    !cp_read32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING, poll, &wptr)) {
+	    !cp_read32(slot, cp_slots[slot].domain, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
+		       poll, &wptr)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
 	}
@@ -119,7 +120,8 @@ int cp_retire(u32 slot)
 
 	cp_fence();
 	cp_hqd_write(slot, GPGPU_HQD_RPTR, rptr);
-	if (!cp_write32(slot, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE, report, rptr)) {
+	if (!cp_write32(slot, cp_slots[slot].domain, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE,
+			report, rptr)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RETIRE);
 		return 0;
 	}
@@ -136,12 +138,10 @@ void cp_main(void)
 	u32 first = 2;
 	u32 slot;
 
-	cp_gpuvm = cp_reg_read(GPGPU_REG_VM_MODE) == 2;
-	if (cp_gpuvm) {
-		if (cp_reg_read(GPGPU_REG_VM_VERSION) != GPGPU_VM_VERSION)
-			cp_fatal();
-		cp_reg_write(GPGPU_REG_VM_FIRMWARE, GPGPU_VM_VERSION);
-	}
+	cp_gpuvm = cp_reg_read(GPGPU_REG_VM_MODE) != 0;
+	if (cp_reg_read(GPGPU_REG_VM_VERSION) != GPGPU_VM_VERSION)
+		cp_fatal();
+	cp_reg_write(GPGPU_REG_VM_FIRMWARE, GPGPU_VM_VERSION);
 	/* 固件只接受 Host 在冷启动时准备的 KIQ；保留旧 HQD 不等于恢复。 */
 	if (!cp_hqd_read(0, GPGPU_HQD_ACTIVE) || cp_hqd_read(0, GPGPU_HQD_AQL) ||
 	    cp_hqd_read(0, GPGPU_HQD_ERROR)) {

@@ -52,8 +52,8 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
 	host_addr = ctrl & GPGPU_DMA_DIR_FROM_VRAM ? s->dma.dst_addr : s->dma.src_addr;
 
 	if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) || !s->dma.size ||
-	    !gpgpu_vram_contains(s, vram_addr, s->dma.size) ||
-	    host_addr > UINT64_MAX - (s->dma.size - 1)) {
+	    !gpgpu_vram_contains(s, vram_addr, s->dma.size) || host_addr < s->vram_size ||
+	    !gpgpu_phys_contains(s, host_addr, s->dma.size)) {
 		s->dma.status = GPGPU_DMA_ERROR;
 		gpgpu_set_error(s, GPGPU_ERR_DMA_FAULT);
 		return;
@@ -62,7 +62,7 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
 	s->dma.status = GPGPU_DMA_BUSY;
 	if (ctrl & GPGPU_DMA_DIR_FROM_VRAM) {
 		result =
-			gpgpu_host_access(s, host_addr, s->vram.ptr + vram_addr, s->dma.size, true);
+			gpgpu_phys_access(s, host_addr, s->vram.ptr + vram_addr, s->dma.size, true);
 	} else {
 		hwaddr mapped_size = s->dma.size;
 		void *vram = address_space_map(&s->vram.as, vram_addr, &mapped_size, true,
@@ -70,7 +70,7 @@ static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
 
 		/* 连续 RAM 范围已在上面检查，应始终完整映射。 */
 		assert(vram && mapped_size == s->dma.size);
-		result = gpgpu_host_access(s, host_addr, vram, s->dma.size, false);
+		result = gpgpu_phys_access(s, host_addr, vram, s->dma.size, false);
 		/* 失败可能已有部分写入，因此失效整个范围。 */
 		address_space_unmap(&s->vram.as, vram, mapped_size, true, s->dma.size);
 	}

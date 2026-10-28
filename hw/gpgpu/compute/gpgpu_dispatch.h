@@ -15,7 +15,7 @@ typedef struct GPGPUDispatchTask GPGPUDispatchTask;
  * @task: 当前队列任务的句柄，内部上下文由 Core 管理。
  * @timer: 使用虚拟时钟推进任务的定时器。
  * @status: IDLE、BUSY、DONE 或 FAILED，队列终态由 CP 写 ACK 确认。
- * @error: 本次细分错误，保留同步与队列路径各自的清除规则。
+ * @error: 本次细分错误，提交或确认结果时清除。
  *
  * 设备内嵌这份状态；其他模块通过以下入口访问，不能修改任务句柄和寄存器。
  */
@@ -35,17 +35,6 @@ typedef struct GPGPUDispatchState {
  * Return: 当前 32 位寄存器值，未定义偏移返回零；读取不清除状态。
  */
 uint32_t gpgpu_dispatch_read(GPGPUState *s, hwaddr addr);
-
-/**
- * gpgpu_dispatch_write() - 处理 Host 同步派发配置和启动命令
- * @s: 目标设备，在现有设备主锁保护下调用。
- * @addr: BAR0 寄存器字节偏移。
- * @value: 写入的 32 位值。
- *
- * 队列模式拒绝此入口。同步启动返回前完成计算和通知发布；非法配置保持
- * 原有状态并锁存全局命令错误。
- */
-void gpgpu_dispatch_write(GPGPUState *s, hwaddr addr, uint32_t value);
 
 /**
  * gpgpu_dispatch_cp_write() - 处理 CP 的配置、提交及结果确认

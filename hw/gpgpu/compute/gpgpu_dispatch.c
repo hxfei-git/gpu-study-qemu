@@ -15,42 +15,9 @@
 #include "hw/gpgpu/gpgpu_internal.h"
 #include "hw/gpgpu/cp/gpgpu_hqd.h"
 #include "hw/gpgpu/memory/gpgpu_vm.h"
-#include "hw/gpgpu/memory/gpgpu_vram.h"
 #include "hw/gpgpu/interrupt/gpgpu_ih.h"
 #include "hw/gpgpu/interrupt/gpgpu_irq.h"
 #include "gpgpu_core.h"
-
-/*
- * gpgpu_dispatch_kernel() - 执行 Host 同步派发命令
- *
- * 检查配置后运行整个网格，结束时清 BUSY 并上报完成或错误中断。
- */
-static void gpgpu_dispatch_kernel(GPGPUState *s)
-{
-	const GPGPUKernelParams *p = &s->dispatch.kernel;
-	GPGPUExecResult result;
-
-	if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) || (s->global_status & GPGPU_STATUS_BUSY) ||
-	    !p->grid_dim[0] || !p->grid_dim[1] || !p->grid_dim[2] || !p->block_dim[0] ||
-	    !p->block_dim[1] || !p->block_dim[2] || p->shared_mem_size ||
-	    !gpgpu_vram_word_valid(s, p->kernel_addr) ||
-	    !gpgpu_vram_word_valid(s, p->kernel_args)) {
-		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
-		return;
-	}
-
-	s->global_status |= GPGPU_STATUS_BUSY;
-	result = gpgpu_core_exec_kernel(s, p);
-	if (result.error_valid)
-		s->dispatch.error = result.error;
-	s->global_status &= ~GPGPU_STATUS_BUSY;
-	s->global_status |= GPGPU_STATUS_READY;
-
-	if (result.status == GPGPU_EXEC_FAILED)
-		gpgpu_set_error(s, GPGPU_ERR_KERNEL_FAULT);
-	else
-		gpgpu_raise_irq(s, GPGPU_IRQ_KERNEL_DONE);
-}
 
 /*
  * 按寄存器偏移读回保存值，64 位地址仍拆成高、低两个寄存器。
@@ -160,21 +127,6 @@ static void kernel_config_write(GPGPUState *s, hwaddr addr, uint32_t val)
 }
 
 /*
- * 先排除队列模式和非空闲执行器，再区分同步启动与普通配置写入。
- */
-void gpgpu_dispatch_write(GPGPUState *s, hwaddr addr, uint32_t val)
-{
-	if (s->gpuvm || gpgpu_hqd_queue_mode(s) || s->dispatch.status != GPGPU_DISPATCH_IDLE) {
-		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
-		return;
-	}
-	if (addr == GPGPU_REG_DISPATCH)
-		gpgpu_dispatch_kernel(s);
-	else
-		kernel_config_write(s, addr, val);
-}
-
-/*
  * dispatch_validate() - 校验队列模式的派发快照
  *
  * 检查代码、参数和队列绑定，网格规模由 Core 创建任务时检查。
@@ -183,21 +135,17 @@ static bool dispatch_validate(GPGPUState *s, const GPGPUKernelParams *p)
 {
 	if (!(s->global_ctrl & GPGPU_CTRL_ENABLE) || p->shared_mem_size || (p->kernel_addr & 3) ||
 	    !p->code_size || (p->code_size & 3) ||
-	    !(s->gpuvm ? (p->kernel_addr < GPGPU_VM_ADDRESS_LIMIT &&
-			  p->code_size <= GPGPU_VM_ADDRESS_LIMIT - p->kernel_addr) :
-			 gpgpu_vram_contains(s, p->kernel_addr, p->code_size)) ||
+	    p->kernel_addr >= GPGPU_VM_ADDRESS_LIMIT ||
+	    p->code_size > GPGPU_VM_ADDRESS_LIMIT - p->kernel_addr ||
 	    (p->kernel_args & 7) || p->args_size < 4 || p->args_size > GPGPU_KERNEL_ARGS_MAX ||
-	    (p->args_size & 3) || p->kernel_args > UINT64_MAX - (p->args_size - 1)) {
+	    (p->args_size & 3) || p->kernel_args >= GPGPU_VM_ADDRESS_LIMIT ||
+	    p->args_size > GPGPU_VM_ADDRESS_LIMIT - p->kernel_args)
 		return false;
-	}
-	if (s->gpuvm &&
-	    (p->vmid < 1 || p->vmid > GPGPU_VM_USERS || !gpgpu_vm_enabled(s, p->vmid) ||
-	     p->source_slot < 2 || p->source_slot >= 4 ||
-	     !gpgpu_hqd_binding_valid(s, p->source_slot, p->vmid) ||
-	     p->kernel_args >= GPGPU_VM_ADDRESS_LIMIT ||
-	     p->args_size > GPGPU_VM_ADDRESS_LIMIT - p->kernel_args))
+	if (p->source_slot < 2 || p->source_slot >= GPGPU_QUEUE_SLOTS ||
+	    !gpgpu_hqd_binding_valid(s, p->source_slot, p->vmid))
 		return false;
-
+	if (s->gpuvm && !gpgpu_vm_enabled(s, p->vmid))
+		return false;
 	return true;
 }
 
@@ -260,22 +208,19 @@ void gpgpu_dispatch_cp_write(GPGPUState *s, hwaddr addr, uint32_t val)
 			s->dispatch.status = GPGPU_DISPATCH_FAILED;
 			return;
 		}
-		s->dispatch.task = gpgpu_core_create_task(s, &s->dispatch.kernel,
-							  s->gpuvm ? GPGPU_EXEC_GPUVM_QUEUE :
-								     GPGPU_EXEC_PHYSICAL_QUEUE);
+		s->dispatch.task = gpgpu_core_create_task(s, &s->dispatch.kernel, s->gpuvm);
 		if (!s->dispatch.task) {
 			s->dispatch.error = GPGPU_EXEC_ERR_INVALID_CONFIG;
 			s->dispatch.status = GPGPU_DISPATCH_FAILED;
 			return;
 		}
-		gpgpu_hqd_enter_queue_mode(s);
 		s->dispatch.status = GPGPU_DISPATCH_BUSY;
 		s->global_status |= GPGPU_STATUS_BUSY;
 		timer_mod(s->dispatch.timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000);
 		return;
 	}
 	if ((addr < GPGPU_REG_KERNEL_ADDR_LO || addr > GPGPU_REG_KERNEL_ARGS_SIZE) &&
-	    !(s->gpuvm && (addr == GPGPU_REG_DISPATCH_VMID || addr == GPGPU_REG_DISPATCH_SLOT)))
+	    !(addr == GPGPU_REG_DISPATCH_VMID || addr == GPGPU_REG_DISPATCH_SLOT))
 		goto invalid;
 	kernel_config_write(s, addr, val);
 	return;

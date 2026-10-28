@@ -30,7 +30,7 @@ changed_files=0
 for source_file in "$shared_source/Makefile" "$shared_source/gpgpu_pci_main.c" \
     "$shared_source/gpgpu_memory.c" "$shared_source/gpgpu_queue.c" \
     "$shared_source/gpgpu_event.c" "$shared_source/gpgpu_queue_drv.h" \
-    "$shared_source/gpgpu_regs.h" "$shared_stack/include/gpgpu_uapi.h" \
+    "$shared_source/gpgpu_regs.h" \
     "$shared_stack/include/gpgpu_queue.h" "$shared_stack/include/gpgpu_vm.h" \
     "$shared_stack/include/gpgpu_drm.h" "$shared_source/gpgpu_gpuvm.c"; do
     destination="$module_source/${source_file##*/}"

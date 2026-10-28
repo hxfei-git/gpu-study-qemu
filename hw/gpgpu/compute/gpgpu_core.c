@@ -12,7 +12,6 @@
 #include "gpgpu_core.h"
 #include "gpgpu_compute_internal.h"
 #include "gpgpu_isa.h"
-#include "gpgpu_memory.h"
 #include "software/gpgpu/include/gpgpu_queue.h"
 
 /* 先除后乘检查维度，防止乘法溢出或线程身份超出既有编码范围。 */
@@ -37,25 +36,31 @@ static bool core_set_shape(GPGPUDispatchTask *task)
 }
 
 /* 仅激活实际存在的线程，所有 lane 从同一个入口和初始浮点状态开始。 */
-static void core_init_warp(GPGPUWarp *warp, uint32_t pc, uint32_t thread_id_base,
+static void core_init_warp(GPGPUWarp *warp, const GPGPUKernelParams *params,
+			   uint32_t thread_id_base,
 			   const uint32_t block_id[3], uint32_t num_threads, uint32_t warp_id,
 			   uint32_t block_id_linear)
 {
 	memset(warp, 0, sizeof(*warp));
 
-	warp->thread_id_base = thread_id_base;
-	warp->warp_id = warp_id;
-
-	for (int i = 0; i < 3; i++)
-		warp->block_id[i] = block_id[i];
+	for (int i = 0; i < 3; i++) {
+		warp->startup_sgpr[i] = block_id[i];
+		warp->startup_sgpr[3 + i] = params->block_dim[i];
+		warp->startup_sgpr[6 + i] = params->grid_dim[i];
+	}
 
 	warp->active_mask = num_threads == GPGPU_WARP_SIZE ? UINT32_MAX : (1U << num_threads) - 1;
 
 	for (uint32_t lane_id = 0; lane_id < num_threads; lane_id++) {
 		GPGPULane *lane = &warp->lanes[lane_id];
+		uint32_t thread = thread_id_base + lane_id;
 
+		lane->startup_vgpr[0] = thread % params->block_dim[0];
+		lane->startup_vgpr[1] = thread / params->block_dim[0] % params->block_dim[1];
+		lane->startup_vgpr[2] = thread / params->block_dim[0] / params->block_dim[1];
+		lane->gpr[10] = params->kernel_args;
 		lane->active = true;
-		lane->pc = pc;
+		lane->pc = params->kernel_addr;
 		lane->mhartid = MHARTID_ENCODE(block_id_linear, warp_id, lane_id);
 		set_float_rounding_mode(float_round_nearest_even, &lane->fp_status);
 		set_float_detect_tininess(float_tininess_after_rounding, &lane->fp_status);
@@ -66,7 +71,7 @@ static void core_init_warp(GPGPUWarp *warp, uint32_t pc, uint32_t thread_id_base
 
 /*
  * 一轮依次执行全部活跃 lane 的一条指令。预算按轮计数，不随活跃 lane 数变化；
- * 队列任务保存跨回调计数，同步任务用本次调用的局部计数。
+ * 任务保存跨回调计数，同一 warp 分段继续时不重新初始化启动状态。
  */
 static GPGPUExecResult core_exec_warp(GPGPUDispatchTask *task, uint32_t max_cycles)
 {
@@ -75,21 +80,14 @@ static GPGPUExecResult core_exec_warp(GPGPUDispatchTask *task, uint32_t max_cycl
 	uint32_t cycles = 0;
 
 	while (warp->active_mask) {
-		if (cycles >= max_cycles) {
-			if (ctx->mode == GPGPU_EXEC_SYNC) {
-				gpgpu_exec_fail(ctx, 0);
-				return ctx->result;
-			}
+		if (cycles >= max_cycles)
 			return (GPGPUExecResult) { .status = GPGPU_EXEC_CONTINUE };
+		if (task->warp_cycles >= 100000) {
+			gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_BUDGET);
+			return ctx->result;
 		}
-		if (ctx->mode != GPGPU_EXEC_SYNC) {
-			if (task->warp_cycles >= 100000) {
-				gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_BUDGET);
-				return ctx->result;
-			}
-			task->warp_cycles++;
-			task->total_cycles++;
-		}
+		task->warp_cycles++;
+		task->total_cycles++;
 		for (unsigned int lane_id = 0; lane_id < GPGPU_WARP_SIZE; lane_id++)
 			if (warp->lanes[lane_id].active && !gpgpu_isa_step(ctx, warp, lane_id))
 				return ctx->result;
@@ -98,55 +96,15 @@ static GPGPUExecResult core_exec_warp(GPGPUDispatchTask *task, uint32_t max_cycl
 	return (GPGPUExecResult) { .status = GPGPU_EXEC_COMPLETE };
 }
 
-/* 同步路径在本次 MMIO 调用内完成网格，保持原来的工作组与 warp 顺序。 */
-GPGPUExecResult gpgpu_core_exec_kernel(GPGPUState *s, const GPGPUKernelParams *params)
-{
-	GPGPUDispatchTask task = {
-		.exec = { .device = s, .params = *params, .mode = GPGPU_EXEC_SYNC },
-	};
-	const GPGPUKernelParams *p = &task.exec.params;
-	uint32_t pc = p->kernel_addr;
-
-	if (!core_set_shape(&task)) {
-		gpgpu_exec_fail(&task.exec, 0);
-		return task.exec.result;
-	}
-	for (uint32_t bz = 0; bz < p->grid_dim[2]; bz++) {
-		for (uint32_t by = 0; by < p->grid_dim[1]; by++) {
-			for (uint32_t bx = 0; bx < p->grid_dim[0]; bx++) {
-				uint32_t linear = bx + by * p->grid_dim[0] +
-					bz * p->grid_dim[0] * p->grid_dim[1];
-				uint32_t block_id[3] = { bx, by, bz };
-
-				for (uint32_t warp_id = 0; warp_id < task.warp_count; warp_id++) {
-					uint32_t first = warp_id * GPGPU_WARP_SIZE;
-					uint32_t count = MIN(GPGPU_WARP_SIZE,
-							     task.threads_per_block - first);
-					GPGPUExecResult result;
-
-					core_init_warp(&task.warp, pc, first, block_id, count,
-						       warp_id, linear);
-					for (uint32_t i = 0; i < count; i++)
-						task.warp.lanes[i].gpr[10] = p->kernel_args;
-					result = core_exec_warp(&task, 100000);
-					if (result.status == GPGPU_EXEC_FAILED)
-						return result;
-				}
-			}
-		}
-	}
-	return (GPGPUExecResult) { .status = GPGPU_EXEC_COMPLETE };
-}
-
-/* 参数和模式在这里固定；创建成功后才交由 Dispatch 安排执行。 */
+/* 保存参数和 GPUVM 状态；创建成功后才交由 Dispatch 安排执行。 */
 GPGPUDispatchTask *gpgpu_core_create_task(GPGPUState *s, const GPGPUKernelParams *params,
-					  GPGPUExecMode mode)
+					  bool gpuvm_enabled)
 {
 	GPGPUDispatchTask *task = g_new0(GPGPUDispatchTask, 1);
 
 	task->exec.device = s;
 	task->exec.params = *params;
-	task->exec.mode = mode;
+	task->exec.gpuvm_enabled = gpuvm_enabled;
 	if (!core_set_shape(task)) {
 		g_free(task);
 		return NULL;
@@ -169,10 +127,8 @@ GPGPUExecResult gpgpu_core_step_task(GPGPUDispatchTask *task)
 		uint32_t first = task->warp_index * GPGPU_WARP_SIZE;
 		uint32_t count = MIN(GPGPU_WARP_SIZE, task->threads_per_block - first);
 
-		core_init_warp(&task->warp, params->kernel_addr, first, block_id, count,
+		core_init_warp(&task->warp, params, first, block_id, count,
 			       task->warp_index, task->block_index);
-		for (unsigned int i = 0; i < count; i++)
-			task->warp.lanes[i].gpr[10] = GPGPU_KERNEL_ARGS_WINDOW;
 		task->warp_ready = true;
 		task->warp_cycles = 0;
 	}
