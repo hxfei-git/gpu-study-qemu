@@ -220,6 +220,10 @@ struct gpgpu_vm_fault {
 	gpgpu_u32 access;
 	gpgpu_u32 phase;
 };
+/*
+ * 用户态库运行在只有 musl 头文件的客体中，没有 <drm/drm.h>，因此在这里给出
+ * 标准 DRM_IOCTL_GEM_CLOSE 的同等定义（编号 0x09，布局与内核一致）。
+ */
 /**
  * struct gpgpu_gem_close - 标准 DRM GEM_CLOSE 输入
  * @handle: 需要关闭的本文件 GEM handle。
