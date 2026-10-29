@@ -258,7 +258,7 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr reg)
 
 	switch (reg) {
 	case GPGPU_REG_VM_VERSION:
-		return GPGPU_VM_VERSION;
+		return GPGPU_PROTOCOL_VERSION;
 	case GPGPU_REG_VM_MODE:
 		return s->gpuvm;
 	case GPGPU_REG_VM_FIRMWARE:
@@ -354,7 +354,7 @@ invalid:
 
 bool gpgpu_vm_firmware_handshake(GPGPUState *s, uint32_t version)
 {
-	if (version != GPGPU_VM_VERSION)
+	if (version != GPGPU_PROTOCOL_VERSION)
 		return false;
 	s->vm.firmware = version;
 	return true;

@@ -404,7 +404,7 @@ static void test_management(void)
 	cp_boot(&s, false, 4096);
 	queue_mqd(&s, 1);
 	queue_map(&s, 1);
-	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_FIRMWARE), ==, GPGPU_VM_VERSION);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_FIRMWARE), ==, GPGPU_PROTOCOL_VERSION);
 	queue_mqd(&s, 2);
 	queue_map(&s, 2);
 	queue_mqd(&s, 3);

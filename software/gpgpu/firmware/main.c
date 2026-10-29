@@ -20,9 +20,9 @@ static void cp_boot_check(void)
 {
 	/* 1. 版本握手。 */
 	cp_gpuvm = cp_reg_read(GPGPU_REG_VM_MODE) != 0;
-	if (cp_reg_read(GPGPU_REG_VM_VERSION) != GPGPU_VM_VERSION)
+	if (cp_reg_read(GPGPU_REG_VM_VERSION) != GPGPU_PROTOCOL_VERSION)
 		cp_fatal();
-	cp_reg_write(GPGPU_REG_VM_FIRMWARE, GPGPU_VM_VERSION);
+	cp_reg_write(GPGPU_REG_VM_FIRMWARE, GPGPU_PROTOCOL_VERSION);
 
 	/* 2. KIQ。 */
 	if (!cp_hqd_read(GPGPU_HQD_SLOT_KIQ, GPGPU_HQD_ACTIVE) ||

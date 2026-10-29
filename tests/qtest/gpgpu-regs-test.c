@@ -83,7 +83,7 @@ static void test_identity(void)
 	g_assert_cmphex(rd(&t, GPGPU_REG_DEV_VERSION), ==, GPGPU_DEV_VERSION_VALUE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_VRAM_SIZE_LO), ==, GPGPU_TEST_VRAM_SIZE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_VRAM_SIZE_HI), ==, 0);
-	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_VERSION), ==, GPGPU_VM_VERSION);
+	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_VERSION), ==, GPGPU_PROTOCOL_VERSION);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_MODE), ==, 1);
 	g_assert_cmphex(rd(&t, GPGPU_REG_GLOBAL_STATUS), ==, GPGPU_STATUS_READY);
 	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
@@ -176,10 +176,13 @@ static void test_dma_unrouted(void)
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_STATUS), ==, GPGPU_OUTBOUND_ERROR);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 
-	/* 2. 复位后 Outbound 布局固定为 VRAM 之后的整个 32 位空间。 */
+	/* 2. Outbound 布局固定为 VRAM 之后的整个 32 位空间，布局寄存器只读。 */
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_SIZE_LO), ==,
 			(uint32_t)(GPGPU_VM_ADDRESS_LIMIT - GPGPU_TEST_VRAM_SIZE));
+	wr(&t, GPGPU_REG_OUTBOUND_GPU_BASE, 0);
+	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
+	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
 
 	/* 3. H2D 描述符：Host 端未路由，立即失败。 */
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);

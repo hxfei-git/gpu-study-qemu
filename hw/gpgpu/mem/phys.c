@@ -82,57 +82,20 @@ uint32_t gpgpu_outbound_read(GPGPUState *s, hwaddr reg)
 	}
 }
 
-/* 使能只接受唯一的固定布局：窗口紧接 VRAM，覆盖到 4 GiB，映射到 IOVA 0。 */
-static bool outbound_layout_valid(GPGPUState *s)
-{
-	GPGPUPhysState *p = &s->phys;
-
-	return p->gpu_base == s->vram_size && !p->host_base &&
-		p->size == GPGPU_VM_ADDRESS_LIMIT - s->vram_size;
-}
-
 /*
- * 1. 所有设备引擎停止、且无在途访问时才接受配置；2. CONTROL 使能前核对布局；
- * 3. 窗口使能期间其余字段只读。任何拒绝都置 ERROR 并锁存 INVALID_CMD。
+ * 布局固定且只读，Host 只能写 CONTROL：所有设备引擎停止、且无在途访问时
+ * 才接受，值只能是 0 或 GPGPU_OUTBOUND_ENABLE。其余写入置 ERROR 并锁存
+ * INVALID_CMD。
  */
 void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 {
 	GPGPUPhysState *p = &s->phys;
 
-	/* 1. 停机检查。 */
-	if (p->accesses || !gpgpu_engines_idle(s))
+	if (reg != GPGPU_REG_OUTBOUND_CONTROL || (value & ~GPGPU_OUTBOUND_ENABLE) ||
+	    p->accesses || !gpgpu_engines_idle(s))
 		goto invalid;
-
-	/* 2. 使能控制。 */
-	if (reg == GPGPU_REG_OUTBOUND_CONTROL) {
-		if (value & ~GPGPU_OUTBOUND_ENABLE)
-			goto invalid;
-		if (value && !outbound_layout_valid(s))
-			goto invalid;
-		p->enabled = value;
-		p->status = GPGPU_OUTBOUND_ACK;
-		return;
-	}
-
-	/* 3. 布局字段。 */
-	if (p->enabled)
-		goto invalid;
-	switch (reg) {
-	case GPGPU_REG_OUTBOUND_GPU_BASE:
-		p->gpu_base = value;
-		break;
-	case GPGPU_REG_OUTBOUND_SIZE_LO:
-	case GPGPU_REG_OUTBOUND_SIZE_HI:
-		gpgpu_reg64_write(&p->size, reg - GPGPU_REG_OUTBOUND_SIZE_LO, value);
-		break;
-	case GPGPU_REG_OUTBOUND_HOST_LO:
-	case GPGPU_REG_OUTBOUND_HOST_HI:
-		gpgpu_reg64_write(&p->host_base, reg - GPGPU_REG_OUTBOUND_HOST_LO, value);
-		break;
-	default:
-		goto invalid;
-	}
-	p->status = 0;
+	p->enabled = value;
+	p->status = GPGPU_OUTBOUND_ACK;
 	return;
 invalid:
 	p->status = GPGPU_OUTBOUND_ERROR;

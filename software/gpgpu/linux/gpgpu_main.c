@@ -55,7 +55,7 @@ static int gpgpu_check_device(struct pci_dev *pdev, void __iomem *regs, bool *gp
 	u32 mode = readl(regs + GPGPU_REG_VM_MODE);
 	u32 vram_size = readl(regs + GPGPU_REG_VRAM_SIZE_LO);
 
-	if (mode > 1 || readl(regs + GPGPU_REG_VM_VERSION) != GPGPU_VM_VERSION)
+	if (mode > 1 || readl(regs + GPGPU_REG_VM_VERSION) != GPGPU_PROTOCOL_VERSION)
 		return -EPROTONOSUPPORT;
 	if (readl(regs + GPGPU_REG_DEV_ID) != GPGPU_DEV_ID_VALUE ||
 	    readl(regs + GPGPU_REG_VRAM_SIZE_HI) || vram_size <= PAGE_SIZE ||
