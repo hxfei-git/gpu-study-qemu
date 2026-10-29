@@ -19,13 +19,13 @@
 
 /**
  * struct GPGPUPhysState - Outbound 窗口配置与在途访问
- * @gpu_base: 窗口在 GPU 物理空间的起点，使能时等于 vram_size。
- * @size: 窗口字节数，使能时等于 4 GiB - vram_size。
- * @host_base: 窗口起点对应的 Host IOVA，使能时为 0。
+ * @gpu_base: 窗口在 GPU 物理空间的起点，固定为 vram_size。
+ * @size: 窗口字节数，固定为 4 GiB - vram_size。
+ * @host_base: 窗口起点对应的 Host IOVA，固定为 0。
  * @status: 最近一次配置写入的 ACK 或 ERROR。
  * @accesses: 在途物理访问数。跨进程 DMA 可能暂时释放主锁，计数非零时
  *            拒绝设备复位和 Outbound 重配。
- * @enabled: 窗口已使能；使能期间配置只读。
+ * @enabled: 窗口已使能。
  */
 typedef struct GPGPUPhysState {
 	uint64_t gpu_base;
@@ -69,7 +69,7 @@ bool gpgpu_phys_busy(GPGPUState *s);
 uint32_t gpgpu_outbound_read(GPGPUState *s, hwaddr reg);
 void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value);
 
-/* 恢复复位布局：窗口未使能，配置为 [vram_size, 4 GiB) 到 IOVA 0。 */
+/* 复位：窗口未使能，布局为 [vram_size, 4 GiB) 到 IOVA 0。 */
 void gpgpu_outbound_reset(GPGPUState *s);
 
 #endif /* HW_GPGPU_MEM_PHYS_H */

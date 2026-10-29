@@ -67,11 +67,11 @@
 /* ERROR_STATUS：BAR2 访问越界。 */
 #define GPGPU_ERR_VRAM_FAULT (1u << 1)
 /* ERROR_STATUS：DMA 描述符非法或传输失败。 */
-#define GPGPU_ERR_DMA_FAULT (1u << 3)
+#define GPGPU_ERR_DMA_FAULT (1u << 2)
 /* ERROR_STATUS：IH 通道配置、协议或提交失败。 */
-#define GPGPU_ERR_IH_FAULT (1u << 4)
-/* ERROR_STATUS：CP 固件报告不可恢复异常。 */
-#define GPGPU_ERR_FIRMWARE (1u << 5)
+#define GPGPU_ERR_IH_FAULT (1u << 3)
+/* ERROR_STATUS：CP 固件报告不可恢复异常；也是固件 DEVICE_ERROR 记录唯一允许的值。 */
+#define GPGPU_ERR_FIRMWARE (1u << 4)
 
 /* ---- 0x200 中断 ---- */
 
@@ -83,22 +83,22 @@
 #define GPGPU_REG_IRQ_ACK 0x0208
 
 /* IRQ 事件：DMA 传输完成。 */
-#define GPGPU_IRQ_DMA_DONE (1u << 1)
+#define GPGPU_IRQ_DMA_DONE (1u << 0)
 /* IRQ 事件：锁存了新的全局错误。 */
-#define GPGPU_IRQ_ERROR (1u << 2)
+#define GPGPU_IRQ_ERROR (1u << 1)
 /* IRQ 事件：IH Ring 中有未消费记录。 */
-#define GPGPU_IRQ_IH (1u << 3)
+#define GPGPU_IRQ_IH (1u << 2)
 /* 设备定义的全部 IRQ 事件。 */
 #define GPGPU_IRQ_ALL (GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR | GPGPU_IRQ_IH)
 
-/* MSI-X 向量数；向量 0 不使用。 */
-#define GPGPU_MSIX_VECTORS 4
+/* MSI-X 向量数，每类 IRQ 事件一个。 */
+#define GPGPU_MSIX_VECTORS 3
 /* DMA 完成使用的 MSI-X 向量。 */
-#define GPGPU_MSIX_VEC_DMA 1
+#define GPGPU_MSIX_VEC_DMA 0
 /* 全局错误使用的 MSI-X 向量。 */
-#define GPGPU_MSIX_VEC_ERROR 2
+#define GPGPU_MSIX_VEC_ERROR 1
 /* IH 非空使用的 MSI-X 向量。 */
-#define GPGPU_MSIX_VEC_IH 3
+#define GPGPU_MSIX_VEC_IH 2
 
 /* ---- 0x300 Dispatch：CP 写配置并提交，Host 只读 ---- */
 
@@ -307,11 +307,11 @@ enum GpgpuDispatchError {
 
 /* ---- 0x900 GPUVM 控制 ---- */
 
-/* 只读：GPGPU_VM_VERSION。 */
+/* 只读：GPGPU_PROTOCOL_VERSION。 */
 #define GPGPU_REG_VM_VERSION 0x0900
 /* 只读：1 表示设备以 gpuvm=on 启动。 */
 #define GPGPU_REG_VM_MODE 0x0904
-/* CP 启动时写回 GPGPU_VM_VERSION 完成握手；Host 只读。 */
+/* CP 启动时写回 GPGPU_PROTOCOL_VERSION 完成握手；Host 只读。 */
 #define GPGPU_REG_VM_FIRMWARE 0x0908
 /* 写用户 VMID 触发该 VM 的同步 TLB 失效。 */
 #define GPGPU_REG_VM_INVALIDATE 0x0910
@@ -372,17 +372,22 @@ enum GpgpuDispatchError {
 /* 执行器访问阶段：读写数据。 */
 #define GPGPU_VM_PHASE_DATA 0x102U
 
-/* ---- 0xb00 Outbound：GPU 物理地址 [VRAM 容量, 4 GiB) 映射到 Host IOVA ---- */
+/*
+ * ---- 0xb00 Outbound：GPU 物理地址 [VRAM 容量, 4 GiB) 映射到 Host IOVA ----
+ *
+ * 窗口布局固定：起点等于 VRAM 容量，覆盖到 4 GiB，起点对应 IOVA 0，
+ * 布局寄存器只读。驱动在启动 CP 前写 CONTROL 打开窗口。
+ */
 
-/* 窗口在 GPU 物理空间的起点，须等于 VRAM 容量。 */
+/* 只读：窗口在 GPU 物理空间的起点，等于 VRAM 容量。 */
 #define GPGPU_REG_OUTBOUND_GPU_BASE 0x0b00
-/* 窗口字节数低 32 位。 */
+/* 只读：窗口字节数低 32 位。 */
 #define GPGPU_REG_OUTBOUND_SIZE_LO 0x0b04
-/* 窗口字节数高 32 位。 */
+/* 只读：窗口字节数高 32 位。 */
 #define GPGPU_REG_OUTBOUND_SIZE_HI 0x0b08
-/* 窗口起点对应的 Host IOVA 低 32 位，须为零。 */
+/* 只读：窗口起点对应的 Host IOVA 低 32 位，为 0。 */
 #define GPGPU_REG_OUTBOUND_HOST_LO 0x0b0c
-/* 窗口起点对应的 Host IOVA 高 32 位。 */
+/* 只读：窗口起点对应的 Host IOVA 高 32 位，为 0。 */
 #define GPGPU_REG_OUTBOUND_HOST_HI 0x0b10
 /* GPGPU_OUTBOUND_ENABLE；只在 CP 保持复位且无活跃访问时可写。 */
 #define GPGPU_REG_OUTBOUND_CONTROL 0x0b14
@@ -395,7 +400,7 @@ enum GpgpuDispatchError {
 #define GPGPU_OUTBOUND_ACK 1U
 /* OUTBOUND_STATUS：仍有经窗口的在途访问。 */
 #define GPGPU_OUTBOUND_BUSY 2U
-/* OUTBOUND_STATUS：最近一次写入被拒绝。 */
+/* OUTBOUND_STATUS：最近一次写入被拒绝（含写只读布局寄存器）。 */
 #define GPGPU_OUTBOUND_ERROR 4U
 
 #endif /* GPGPU_REGS_H */

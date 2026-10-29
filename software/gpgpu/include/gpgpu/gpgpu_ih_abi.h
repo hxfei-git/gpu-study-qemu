@@ -15,7 +15,7 @@
  * enum GpgpuIhType - IH 记录类型，决定 data 和来源字段的含义
  * @GPGPU_IH_SIGNAL_NOTIFY: 用户任务完成；data 为事件编号。
  * @GPGPU_IH_QUEUE_ERROR: 队列首次出错；data 为 GpgpuQueueError。
- * @GPGPU_IH_DEVICE_ERROR: 固件级错误；data 为 GPGPU_ERR_* 位，hqd_slot 全 1，mqd_addr 为 0。
+ * @GPGPU_IH_DEVICE_ERROR: 固件级错误；data 必须为 GPGPU_ERR_FIRMWARE，hqd_slot 全 1，mqd_addr 为 0。
  */
 enum GpgpuIhType {
 	GPGPU_IH_SIGNAL_NOTIFY = 1,

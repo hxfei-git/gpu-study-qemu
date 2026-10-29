@@ -380,7 +380,7 @@ def check_compute_log(log, mode):
         raise RuntimeError("三个示例的数值比较结果不完整")
     if not re.search(r"^GPGPU demos: 3/3 PASS$", log, re.M):
         raise RuntimeError("示例未正常完成回收")
-    if f"GPGPU DRM ABI=2 GPUVM={mode}" not in log:
+    if f"GPGPU DRM ABI=3 GPUVM={mode}" not in log:
         raise RuntimeError("设备返回的地址模式或接口版本与本次运行不符")
     return values
 

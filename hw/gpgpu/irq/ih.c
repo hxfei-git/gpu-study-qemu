@@ -63,7 +63,8 @@ static bool ih_record_valid(const GpgpuIhRecord *r)
 		return slot < GPGPU_HQD_SLOTS && !(mqd & 7) && data &&
 			data <= GPGPU_QUEUE_ERROR_SAVE;
 	case GPGPU_IH_DEVICE_ERROR:
-		return slot == UINT32_MAX && !mqd && data;
+		/* 固件只能报告固件异常，不能借记录写入任意全局错误位。 */
+		return slot == UINT32_MAX && !mqd && data == GPGPU_ERR_FIRMWARE;
 	default:
 		return false;
 	}
@@ -117,7 +118,7 @@ static uint32_t ih_submit(GPGPUState *s, uint32_t addr)
 	/* 5. 发布并通知。 */
 	ih->wptr++;
 	if (le32_to_cpu(record.type) == GPGPU_IH_DEVICE_ERROR)
-		gpgpu_set_error(s, le32_to_cpu(record.data));
+		gpgpu_set_error(s, GPGPU_ERR_FIRMWARE);
 	gpgpu_raise_irq(s, GPGPU_IRQ_IH);
 	return GPGPU_IH_OK;
 }

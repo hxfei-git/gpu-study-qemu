@@ -186,12 +186,15 @@ static int gpgpu_load_firmware(struct gpgpu_device *dev)
 	return 0;
 }
 
-/* 第 2 步：Outbound 使用唯一的固定布局 [vram_size, 4 GiB) → IOVA 0。 */
+/*
+ * 第 2 步：Outbound 布局由设备固定为 [vram_size, 4 GiB) → IOVA 0，驱动只核对
+ * 布局与 gpgpu_dma_buf_alloc() 的换算一致，然后打开窗口。
+ */
 static int gpgpu_enable_outbound(struct gpgpu_device *dev)
 {
-	gpgpu_wreg(dev, GPGPU_REG_OUTBOUND_GPU_BASE, dev->vram_size);
-	gpgpu_wreg64(dev, GPGPU_REG_OUTBOUND_SIZE_LO, (1ULL << 32) - dev->vram_size);
-	gpgpu_wreg64(dev, GPGPU_REG_OUTBOUND_HOST_LO, 0);
+	if (gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_GPU_BASE) != dev->vram_size ||
+	    gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_HOST_LO) || gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_HOST_HI))
+		return -EIO;
 	gpgpu_wreg(dev, GPGPU_REG_OUTBOUND_CONTROL, GPGPU_OUTBOUND_ENABLE);
 	return gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_STATUS) == GPGPU_OUTBOUND_ACK ? 0 : -EIO;
 }
@@ -232,7 +235,7 @@ static int gpgpu_map_hiq(struct gpgpu_device *dev)
 	mutex_unlock(&dev->lock);
 	if (ret)
 		return ret;
-	if (gpgpu_rreg(dev, GPGPU_REG_VM_FIRMWARE) != GPGPU_VM_VERSION)
+	if (gpgpu_rreg(dev, GPGPU_REG_VM_FIRMWARE) != GPGPU_PROTOCOL_VERSION)
 		return -EPROTONOSUPPORT;
 	return status == GPGPU_MANAGEMENT_OK ? 0 : -EIO;
 }

@@ -19,9 +19,10 @@ typedef __u64 gpgpu_u64;
 typedef uint32_t gpgpu_u32;
 typedef uint64_t gpgpu_u64;
 #endif
+#include "../gpgpu_version.h"
 
-/* 每个 ioctl 参数首字段 version 必须填写的接口版本。 */
-#define GPGPU_DRM_VERSION 2U
+/* 每个 ioctl 参数首字段 version 必须填写的接口版本，等于协议版本。 */
+#define GPGPU_DRM_VERSION GPGPU_PROTOCOL_VERSION
 
 /* COPY 方向：Host 对象到 VRAM 对象。 */
 #define GPGPU_COPY_H2D 0U
@@ -221,9 +222,15 @@ struct gpgpu_vm_fault {
 	gpgpu_u32 phase;
 };
 /*
- * 用户态库运行在只有 musl 头文件的客体中，没有 <drm/drm.h>，因此在这里给出
- * 标准 DRM_IOCTL_GEM_CLOSE 的同等定义（编号 0x09，布局与内核一致）。
+ * 用户态库运行在只有 musl 头文件的客体中，没有 <drm/drm.h>，因此这里按
+ * DRM 的约定自行展开：DRM 命令的类型码为 'd'，驱动私有命令从
+ * DRM_COMMAND_BASE（0x40）开始编号；GEM_CLOSE 是 DRM 核心命令 0x09。
  */
+#define GPGPU_DRM_IOCTL_BASE 'd'
+#define GPGPU_DRM_COMMAND_BASE 0x40
+#define GPGPU_DRM_IOW(n, type) _IOW(GPGPU_DRM_IOCTL_BASE, GPGPU_DRM_COMMAND_BASE + (n), type)
+#define GPGPU_DRM_IOWR(n, type) _IOWR(GPGPU_DRM_IOCTL_BASE, GPGPU_DRM_COMMAND_BASE + (n), type)
+
 /**
  * struct gpgpu_gem_close - 标准 DRM GEM_CLOSE 输入
  * @handle: 需要关闭的本文件 GEM handle。
@@ -233,20 +240,20 @@ struct gpgpu_gem_close {
 	gpgpu_u32 handle;
 	gpgpu_u32 pad;
 };
-#define GPGPU_DRM_GEM_CLOSE _IOW('d', 0x09, struct gpgpu_gem_close)
-#define GPGPU_DRM_INFO _IOWR('d', 0x40, struct gpgpu_vm_info)
-#define GPGPU_DRM_BO_CREATE _IOWR('d', 0x41, struct gpgpu_bo_create)
-#define GPGPU_DRM_MAP _IOWR('d', 0x42, struct gpgpu_vm_map)
-#define GPGPU_DRM_UNMAP _IOW('d', 0x43, struct gpgpu_vm_map)
-#define GPGPU_DRM_COPY _IOW('d', 0x44, struct gpgpu_memory_copy)
-#define GPGPU_DRM_QUEUE_CREATE _IOWR('d', 0x45, struct gpgpu_queue_create)
-#define GPGPU_DRM_QUEUE_QUERY _IOWR('d', 0x46, struct gpgpu_queue_state)
-#define GPGPU_DRM_QUEUE_DESTROY _IOWR('d', 0x47, struct gpgpu_queue_state)
-#define GPGPU_DRM_EVENT_CREATE _IOWR('d', 0x48, struct gpgpu_event_request)
-#define GPGPU_DRM_EVENT_QUERY _IOWR('d', 0x49, struct gpgpu_event_request)
-#define GPGPU_DRM_EVENT_WAIT _IOWR('d', 0x4a, struct gpgpu_event_request)
-#define GPGPU_DRM_EVENT_DESTROY _IOWR('d', 0x4b, struct gpgpu_event_request)
-#define GPGPU_DRM_FAULT _IOWR('d', 0x4c, struct gpgpu_vm_fault)
+#define GPGPU_DRM_GEM_CLOSE _IOW(GPGPU_DRM_IOCTL_BASE, 0x09, struct gpgpu_gem_close)
+#define GPGPU_DRM_INFO GPGPU_DRM_IOWR(0x00, struct gpgpu_vm_info)
+#define GPGPU_DRM_BO_CREATE GPGPU_DRM_IOWR(0x01, struct gpgpu_bo_create)
+#define GPGPU_DRM_MAP GPGPU_DRM_IOWR(0x02, struct gpgpu_vm_map)
+#define GPGPU_DRM_UNMAP GPGPU_DRM_IOW(0x03, struct gpgpu_vm_map)
+#define GPGPU_DRM_COPY GPGPU_DRM_IOW(0x04, struct gpgpu_memory_copy)
+#define GPGPU_DRM_QUEUE_CREATE GPGPU_DRM_IOWR(0x05, struct gpgpu_queue_create)
+#define GPGPU_DRM_QUEUE_QUERY GPGPU_DRM_IOWR(0x06, struct gpgpu_queue_state)
+#define GPGPU_DRM_QUEUE_DESTROY GPGPU_DRM_IOWR(0x07, struct gpgpu_queue_state)
+#define GPGPU_DRM_EVENT_CREATE GPGPU_DRM_IOWR(0x08, struct gpgpu_event_request)
+#define GPGPU_DRM_EVENT_QUERY GPGPU_DRM_IOWR(0x09, struct gpgpu_event_request)
+#define GPGPU_DRM_EVENT_WAIT GPGPU_DRM_IOWR(0x0a, struct gpgpu_event_request)
+#define GPGPU_DRM_EVENT_DESTROY GPGPU_DRM_IOWR(0x0b, struct gpgpu_event_request)
+#define GPGPU_DRM_FAULT GPGPU_DRM_IOWR(0x0c, struct gpgpu_vm_fault)
 _Static_assert(sizeof(struct gpgpu_memory_copy) == 40, "copy ABI");
 _Static_assert(sizeof(struct gpgpu_queue_create) == 64, "queue create ABI");
 _Static_assert(sizeof(struct gpgpu_queue_state) == 24, "queue state ABI");
