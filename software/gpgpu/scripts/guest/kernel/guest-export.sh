@@ -30,8 +30,6 @@ printf 'Linux %s; gpu_buddy built-in; %s build\n' "$release" "$mode" \
     > "$shared/kernel-packages"
 printf '%s\n' 'kernel/fs/9p/*' 'kernel/net/9p/*' \
     > /etc/mkinitfs/features.d/gpgpu9p.modules
-mkinitfs -i /mnt/gpgpu-src/module-init.sh -F 'base virtio gpgpu9p' \
-    -o "$shared/initramfs-module" "$release"
 mkinitfs -i /mnt/gpgpu-src/developer-init.sh -F 'base virtio ext4 gpgpu9p' \
     -o "$shared/initramfs-developer" "$release"
 

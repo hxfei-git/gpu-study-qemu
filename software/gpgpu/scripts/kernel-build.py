@@ -22,29 +22,25 @@ import gpgpu_linux as MODULE
 
 
 MATERIALS = MODULE.SOURCE / "kernel"
+# 作为构建起点的 Alpine 发行版开发环境的内核版本。
+BASE_RELEASE = "6.18.57-0-virt"
 
 
-def checksum(path, algorithm="sha256"):
-    """分块读取文件并计算指定算法的散列，避免一次载入大归档。"""
-    digest = hashlib.new(algorithm)
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+checksum = MODULE.file_digest
 
 
-def download_checked(path, url, expected):
-    """固定下载文件的内容；已缓存文件也必须重新核对散列。"""
+def download_checked(path, url, expected, algorithm="sha256", timeout=120):
+    """下载到 path 并核对散列；已有缓存也重新核对。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
         temporary = path.with_suffix(".download")
-        with urllib.request.urlopen(url, timeout=120) as response:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
             with temporary.open("wb") as stream:
                 shutil.copyfileobj(response, stream)
-        if checksum(temporary) != expected:
+        if checksum(temporary, algorithm) != expected:
             raise RuntimeError(f"下载校验失败：{path.name}")
         temporary.replace(path)
-    if checksum(path) != expected:
+    if checksum(path, algorithm) != expected:
         raise RuntimeError(f"缓存校验失败：{path.name}")
 
 
@@ -250,16 +246,7 @@ def prepare_sources(output):
         retained = MODULE.ROOT / "build/gpgpu-kernel/downloads" / item["name"]
         if not path.exists() and retained.is_file():
             shutil.copy2(retained, path)
-        if not path.is_file():
-            temporary = path.with_suffix(".download")
-            with urllib.request.urlopen(item["url"], timeout=60) as response:
-                with temporary.open("wb") as stream:
-                    shutil.copyfileobj(response, stream)
-            if checksum(temporary, "sha512") != item["sha512"]:
-                raise RuntimeError(f"下载校验失败：{path.name}")
-            temporary.replace(path)
-        if checksum(path, "sha512") != item["sha512"]:
-            raise RuntimeError(f"缓存源码校验失败：{path.name}")
+        download_checked(path, item["url"], item["sha512"], "sha512", timeout=60)
 
     digest = hashlib.sha256()
     source_inputs = ["sources.json", "APKBUILD", "virt.aarch64.config",
@@ -315,9 +302,9 @@ def build(args, output):
         raise RuntimeError("构建目录必须与原发行版环境分开")
     base_metadata = MODULE.environment_metadata(base)
     if not base_metadata:
-        raise RuntimeError("先运行 linux/Makefile 的 prepare 建立发行版编译环境")
-    if base_metadata["kernel_release"] != "6.18.57-0-virt":
-        raise RuntimeError("本配方要求保留的 Alpine 6.18.57-0-virt 环境")
+        raise RuntimeError(f"缺少 Alpine {BASE_RELEASE} 发行版开发环境：{base}")
+    if base_metadata["kernel_release"] != BASE_RELEASE:
+        raise RuntimeError(f"本配方要求保留的 Alpine {BASE_RELEASE} 环境")
     packages = json.loads((MATERIALS / "cached-packages.json").read_text())
     for name, record in packages.items():
         if checksum(base / "apk-cache" / name) != record["sha256"]:
@@ -347,17 +334,7 @@ def build(args, output):
         shutil.copytree(base / "apk-cache", cache)
     dependencies = json.loads((MATERIALS / "build-dependencies.json").read_text())
     for item in dependencies:
-        path = cache / item["cache_name"]
-        if not path.is_file():
-            temporary = path.with_suffix(".download")
-            with urllib.request.urlopen(item["url"], timeout=60) as response:
-                with temporary.open("wb") as stream:
-                    shutil.copyfileobj(response, stream)
-            if checksum(temporary) != item["sha256"]:
-                raise RuntimeError(f"构建依赖下载校验失败：{path.name}")
-            temporary.replace(path)
-        if checksum(path) != item["sha256"]:
-            raise RuntimeError(f"构建依赖缓存校验失败：{path.name}")
+        download_checked(cache / item["cache_name"], item["url"], item["sha256"], timeout=60)
     (output / "build-dependencies").write_text(
         "".join(item["cache_name"] + "\n" for item in dependencies))
     command = MODULE.base_command(args.memory)
@@ -380,7 +357,7 @@ def build(args, output):
     guest = MODULE.Guest(command, output / "kernel-console.log")
     try:
         guest.wait(rb"^GPGPU_DEVELOPER_READY$")
-        script = "guest-cross.sh" if args.build_mode == "cross" else "guest-build.sh"
+        script = "guest-cross.sh" if args.build_mode == "cross" else "native-build.sh"
         guest_log = "kernel-export.log" if args.build_mode == "cross" else "kernel-build.log"
         # 旧开发盘的 init 继续挂载脚本与产物；固定内核材料由软件栈共享提供。
         guest.send("mkdir -p /mnt/gpgpu-stack\n"
@@ -404,8 +381,7 @@ def build(args, output):
         if option not in config:
             raise RuntimeError(f"构建配置缺少 {option}")
     environment = {
-        "source_hash": MODULE.inputs_hash(MODULE.ENVIRONMENT_INPUTS,
-                                          MODULE.ENVIRONMENT_VERSION),
+        "source_hash": MODULE.environment_hash(),
         "kernel_source_hash": (output / "source.sha256").read_text().strip(),
         "kernel_release": release,
         "disk_size": disk.stat().st_size,

@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""使用当前检出的路径准备、验收或启动 ARM64 驱动客体。"""
+"""ARM64 驱动客体的模块编译、交互运行与核心验收。
+
+子命令：
+  module      在已保存的开发客体中重编驱动模块
+  run         启动远端 CP 设备与开发客体，进入交互 shell
+  stack-test  GPUVM 开、关各运行一次三个计算示例，并核对结果
+
+所有子命令都需要先用 kernel-build.py 准备好内核环境。
+"""
 
 import argparse
 import fcntl
@@ -30,27 +38,35 @@ ROOT = STACK.parents[1]
 QEMU_DIRECTORY = ROOT / "build" / "arm64-qemu"
 QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-aarch64"
 DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv64"
-RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt", "initramfs-module")
+# 模块清单 module-test.json 中登记的运行文件。
+RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt")
 BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
                  "kernel-packages")
-# 驱动构建指纹的输入：驱动源码、共享协议头和客体编译脚本。
+# 驱动构建指纹的输入：驱动源码、共享协议头（相对 linux/）与客体编译脚本。
 BUILD_INPUT_GLOBS = ("Makefile", "*.c", "*.h",
                      "../include/gpgpu/*.h", "../include/gpgpu/uapi/*.h")
-BUILD_VERSION = 5
-ENVIRONMENT_INPUTS = ("guest-build.sh", "developer-init.sh",
-                      "guest-dev-init.sh", "module-init.sh")
-ENVIRONMENT_FILES = ("vmlinuz-virt", "initramfs-module",
-                     "initramfs-developer") + BUILD_RECORDS
-ENVIRONMENT_VERSION = 1
+BUILD_SCRIPT = "build-module.sh"
+# 指纹格式版本：输入集合或计算方式改变时递增，使已有模块缓存失效。
+BUILD_VERSION = 6
+# 写入 environment.json 的客体初始化脚本指纹，仅作记录，不参与缓存判断。
+ENVIRONMENT_INPUTS = ("developer-init.sh", "guest-dev-init.sh")
+ENVIRONMENT_FILES = ("vmlinuz-virt", "initramfs-developer") + BUILD_RECORDS
+# 环境指纹格式版本。
+ENVIRONMENT_VERSION = 2
 
 
-def sha256(path):
-    """分块计算文件 SHA-256，用于核对镜像、模块和缓存内容。"""
-    digest = hashlib.sha256()
+def file_digest(path, algorithm="sha256"):
+    """分块计算文件散列，避免一次载入大文件。"""
+    digest = hashlib.new(algorithm)
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256(path):
+    """文件的 SHA-256，用于核对镜像、模块和缓存内容。"""
+    return file_digest(path)
 
 
 def read_metadata(output, manifest, filenames):
@@ -92,74 +108,72 @@ def environment_metadata(output):
     return metadata
 
 
-def inputs_hash(filenames, version):
-    """按原逻辑名称和实际内容计算指纹，目录迁移本身不使缓存过期。"""
+def inputs_hash(directory, names, version):
+    """按文件名与内容计算指纹；names 为相对 directory 的路径。"""
     digest = hashlib.sha256()
     digest.update(f"gpgpu-build:{version}\0".encode())
-    for name in filenames:
-        # 环境脚本只移动位置，仍用原名称参与散列，保留已安装的固定内核。
-        directory = (GUEST_SCRIPTS if name in ENVIRONMENT_INPUTS or
-                     name == "guest-compile.sh" else SOURCE)
+    for name in names:
         digest.update(name.encode() + b"\0" + (directory / name).read_bytes())
     return digest.hexdigest()
 
 
+def environment_hash():
+    """客体初始化脚本的指纹，写入 environment.json 作为记录。"""
+    return inputs_hash(GUEST_SCRIPTS, ENVIRONMENT_INPUTS, ENVIRONMENT_VERSION)
+
+
 def build_inputs():
-    """列出驱动构建指纹的全部输入，路径相对于 linux/ 并排序。"""
-    names = {str(path.relative_to(SOURCE).as_posix()) if path.is_relative_to(SOURCE)
-             else "../" + str(path.relative_to(STACK).as_posix())
-             for pattern in BUILD_INPUT_GLOBS for path in SOURCE.glob(pattern)}
-    return tuple(sorted(names)) + ("guest-compile.sh",)
+    """驱动构建指纹的输入文件，路径相对 linux/ 并排序。"""
+    return tuple(sorted({os.path.relpath(path, SOURCE)
+                         for pattern in BUILD_INPUT_GLOBS
+                         for path in SOURCE.glob(pattern)}))
 
 
 def source_hash():
-    """按驱动源码、协议头与编译脚本计算当前构建指纹。"""
-    return inputs_hash(build_inputs(), BUILD_VERSION)
+    """按驱动源码、协议头与客体编译脚本计算当前构建指纹。"""
+    digest = hashlib.sha256()
+    digest.update(inputs_hash(SOURCE, build_inputs(), BUILD_VERSION).encode())
+    digest.update((GUEST_SCRIPTS / BUILD_SCRIPT).read_bytes())
+    return digest.hexdigest()
 
 
-def ensure_qemu(output, remote=False):
-    """检查当前配置是否包含所需目标与设备，并构建测试使用的 QEMU。"""
+def qemu_configured():
+    """已有构建目录是否同时包含 aarch64 Host 与带 vfio-user 的 riscv64 远端 CP。"""
+    if not (QEMU_DIRECTORY / "build.ninja").is_file():
+        return False
+    targets = (QEMU_DIRECTORY / "config-host.mak").read_text()
+    config_path = QEMU_DIRECTORY / "riscv64-softmmu-config-devices.h"
+    config = config_path.read_text() if config_path.is_file() else ""
+    return ("riscv64-softmmu" in targets and
+            "#define CONFIG_VFIO_USER_SERVER 1" in config and
+            "#define CONFIG_GPGPU_CP 1" in config)
+
+
+def ensure_qemu(output):
+    """1. 构建目录缺少所需目标时重新配置；2. 构建 Host 与远端 CP 两个 QEMU。"""
     QEMU_DIRECTORY.mkdir(parents=True, exist_ok=True)
     with (output / "qemu-build.log").open("w") as log:
-        configure = not (QEMU_DIRECTORY / "build.ninja").is_file()
-        if remote and not configure:
-            targets = (QEMU_DIRECTORY / "config-host.mak").read_text()
-            config_path = (QEMU_DIRECTORY /
-                           "riscv64-softmmu-config-devices.h")
-            config = config_path.read_text() if config_path.is_file() else ""
-            configure = ("riscv64-softmmu" not in targets or
-                         "#define CONFIG_VFIO_USER_SERVER 1" not in config or
-                         "#define CONFIG_GPGPU_CP 1" not in config)
-        if configure:
-            target_list = "aarch64-softmmu"
-            if remote:
-                target_list += ",riscv64-softmmu"
+        if not qemu_configured():
             subprocess.run([
-                str(ROOT / "configure"), f"--target-list={target_list}",
+                str(ROOT / "configure"), "--target-list=aarch64-softmmu,riscv64-softmmu",
                 "--disable-rust", "--disable-docs", "--disable-tools",
                 "--disable-guest-agent", "--enable-download",
-                "--extra-cflags=-O0 -g0",
-            ] + (["--enable-vfio-user-server"] if remote else []),
-                cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
-        binaries = ["qemu-system-aarch64"]
-        if remote:
-            binaries += ["qemu-system-riscv64"]
-        subprocess.run(["ninja", "-j4"] + binaries,
+                "--extra-cflags=-O0 -g0", "--enable-vfio-user-server",
+            ], cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
+        subprocess.run(["ninja", "-j4", "qemu-system-aarch64", "qemu-system-riscv64"],
                        cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
     subprocess.run([str(QEMU_BINARY), "-device", "gpgpu,help"],
                    stdout=subprocess.DEVNULL, check=True)
 
 
-def base_command(memory="512M", interactive=False, iommu="none"):
-    """组装 ARM64 virt 客体的公共参数，按需开启交互和 SMMUv3。"""
+def base_command(memory="512M", iommu="none"):
+    """组装 ARM64 virt 客体的公共参数：串口接到 stdio，按需开启 SMMUv3。"""
     machine = "virt,gic-version=3"
     if iommu == "smmuv3":
         machine += ",iommu=smmuv3,default-bus-bypass-iommu=off"
     command = [str(QEMU_BINARY), "-machine", machine,
                "-cpu", "cortex-a57", "-accel", "tcg",
                "-m", memory, "-smp", "2"]
-    if interactive:
-        return command + ["-nographic"]
     return command + ["-display", "none", "-serial", "stdio",
                       "-monitor", "none"]
 
@@ -298,7 +312,7 @@ def compile_module(output, fingerprint, environment):
         try:
             guest.wait(rb"^GPGPU_DEVELOPER_READY$")
             guest.send(
-                "sh /mnt/gpgpu-src/guest-compile.sh "
+                f"sh /mnt/gpgpu-src/{BUILD_SCRIPT} "
                 + shlex.quote(stage.name) + " "
                 "> /mnt/gpgpu-build/module-build.log 2>&1\n"
                 "printf 'GPGPU_MODULE_RC=%s\\n' \"$?\"\n"
@@ -349,13 +363,40 @@ def check_kernel_log(guest):
         raise RuntimeError("Guest kernel fault; inspect console log")
 
 
-def stack_test(output, device_qemu):
-    """在 A57、1 GiB、IOMMU=none 下运行 GPUVM 开和关的三个既有计算。"""
+def prepare_firmware(output):
+    """构建 RV64 CP 固件并复制到输出目录，客体从这里装入 /lib/firmware。"""
     subprocess.run(["make", "-C", str(STACK / "firmware")], check=True)
     shutil.copy2(ROOT / "build/gpgpu-firmware/gpgpu-cp.bin", output / "gpgpu-cp.bin")
+
+
+# 三个示例在两种模式下都必须给出的逐元素比较结果。
+EXPECTED_VALUES = [("17003", "17003"), ("437", "437"), ("513", "513")]
+
+
+def check_compute_log(log, mode):
+    """核对示例输出：数值比较、资源回收与设备报告的地址模式。"""
+    values = re.findall(r"^.*: (\d+)/(\d+) values PASS$", log, re.M)
+    if values != EXPECTED_VALUES:
+        raise RuntimeError("三个示例的数值比较结果不完整")
+    if not re.search(r"^GPGPU demos: 3/3 PASS$", log, re.M):
+        raise RuntimeError("示例未正常完成回收")
+    if f"GPGPU DRM ABI=2 GPUVM={mode}" not in log:
+        raise RuntimeError("设备返回的地址模式或接口版本与本次运行不符")
+    return values
+
+
+def stack_test(output, device_qemu):
+    """在 A57、1 GiB、IOMMU=none 下运行 GPUVM 开和关的三个计算示例。
+
+    1. 宿主机构建固件与 Kernel（客体没有 Python，Kernel 头文件经 9p 共享给客体）；
+    2. 每种模式各启动一对远端设备与客体，运行 run-demo.sh 并核对输出与内核日志；
+    3. 两种模式都通过后写出 core/summary.json。
+    """
+    prepare_firmware(output)
     stack_output = output / "stack"
     subprocess.run(["make", "-C", str(STACK), f"BUILD_DIR={stack_output}", "kernels"],
                    check=True)
+    summary = {}
     for enabled in (True, False):
         mode = "on" if enabled else "off"
         results = output / "core" / mode
@@ -370,7 +411,7 @@ def stack_test(output, device_qemu):
                 "mkdir -p /mnt/gpgpu-stack\n"
                 "mount -t 9p -o trans=virtio,version=9p2000.L,ro "
                 "gpgpu_stack /mnt/gpgpu-stack\n"
-                "sh /mnt/gpgpu-src/guest-test.sh "
+                "sh /mnt/gpgpu-src/run-demo.sh "
                 f"> /mnt/gpgpu-build/core/{mode}/compute.log 2>&1\n"
                 "printf 'GPGPU_STACK_RC=%s\\n' \"$?\"\n"
             )
@@ -379,13 +420,7 @@ def stack_test(output, device_qemu):
             print(f"GPUVM={mode}\n{log}", end="", flush=True)
             if result.group(1) != b"0":
                 raise RuntimeError(f"GPUVM={mode} 计算失败；查看 compute.log")
-            values = re.findall(r"^.*: (\d+)/(\d+) values PASS$", log, re.M)
-            if values != [("17003", "17003"), ("437", "437"), ("513", "513")]:
-                raise RuntimeError("三个示例的数值比较结果不完整")
-            if not re.search(r"^GPGPU demos: 3/3 PASS$", log, re.M):
-                raise RuntimeError("示例未正常完成回收")
-            if f"GPGPU DRM ABI=2 GPUVM={mode}" not in log:
-                raise RuntimeError("设备返回的地址模式或接口版本与本次运行不符")
+            values = check_compute_log(log, mode)
             check_kernel_log(guest)
             write_metadata(results / "result.json", {
                 "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -398,14 +433,32 @@ def stack_test(output, device_qemu):
                 "guest_exit_code": int(result.group(1)),
                 "computed_values": [int(passed) for passed, _ in values],
             })
+            summary[mode] = "pass"
         finally:
             guest.close()
+    write_metadata(output / "core" / "summary.json", {
+        "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "modes": summary,
+    })
+
+
+def run_interactive(output, device_qemu, iommu, gpuvm):
+    """启动远端设备与开发客体，串口直接交给当前终端。"""
+    remote = RemoteDevice(device_qemu, output / "interactive", gpuvm=gpuvm)
+    try:
+        remote.start()
+        command = [remote.device_option() if arg == "@GPGPU_DEVICE@" else arg
+                   for arg in developer_command(output, iommu, remote=True)]
+        subprocess.run(command, check=True)
+    finally:
+        remote.close()
 
 
 def main():
-    """保留构建和交互入口，核心验收只运行固定计算。"""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "module", "run", "stack-test"))
+    """解析子命令，持输出目录锁后按需重编模块，再执行验收或交互运行。"""
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", choices=("module", "run", "stack-test"))
     parser.add_argument("--output-dir", type=Path,
                         default=ROOT / "build/gpgpu-kernel-gpuvm")
     parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY)
@@ -427,7 +480,7 @@ def main():
         environment = environment_metadata(output)
         if not environment:
             raise RuntimeError("先通过 kernel-build.py 准备启用 DRM/GPU_BUDDY 的内核环境")
-        ensure_qemu(output, remote=True)
+        ensure_qemu(output)
         metadata = prepared_metadata(output)
         fingerprint = source_hash()
         if args.command == "module" or not metadata or metadata.get("source_hash") != fingerprint:
@@ -435,17 +488,8 @@ def main():
         if args.command == "stack-test":
             stack_test(output, device_qemu)
         elif args.command == "run":
-            subprocess.run(["make", "-C", str(STACK / "firmware")], check=True)
-            shutil.copy2(ROOT / "build/gpgpu-firmware/gpgpu-cp.bin", output / "gpgpu-cp.bin")
-            remote = RemoteDevice(device_qemu, output / "interactive", gpuvm=args.gpuvm == "on")
-            try:
-                remote.start()
-                command = developer_command(output, args.iommu, remote=True)
-                command = [remote.device_option() if arg == "@GPGPU_DEVICE@" else arg
-                           for arg in command]
-                subprocess.run(command, check=True)
-            finally:
-                remote.close()
+            prepare_firmware(output)
+            run_interactive(output, device_qemu, args.iommu, args.gpuvm == "on")
 
 
 if __name__ == "__main__":
