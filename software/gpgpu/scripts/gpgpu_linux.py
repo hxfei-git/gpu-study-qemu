@@ -14,6 +14,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import tempfile
 import time
