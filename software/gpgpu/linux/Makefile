@@ -2,7 +2,8 @@
 
 ifneq ($(KERNELRELEASE),)
 obj-m := gpgpu_pci.o
-gpgpu_pci-y := gpgpu_pci_main.o gpgpu_memory.o gpgpu_queue.o gpgpu_event.o gpgpu_gpuvm.o
+gpgpu_pci-y := gpgpu_main.o gpgpu_dev.o gpgpu_mgmt.o gpgpu_ih.o gpgpu_drm.o gpgpu_bo.o \
+	       gpgpu_vram.o gpgpu_vm.o gpgpu_queue.o gpgpu_event.o
 ccflags-y += -I$(src)/../include
 else
 KDIR ?= /lib/modules/$(shell uname -r)/build
