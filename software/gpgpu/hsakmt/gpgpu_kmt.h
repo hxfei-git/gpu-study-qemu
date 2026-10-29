@@ -5,8 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include "gpgpu_queue.h"
-#include "gpgpu_drm.h"
+#include "gpgpu/gpgpu_queue_abi.h"
+#include "gpgpu/gpgpu_vm_abi.h"
+#include "gpgpu/uapi/gpgpu_drm.h"
 
 typedef struct GpgpuKmtContext GpgpuKmtContext;
 /**

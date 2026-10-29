@@ -51,7 +51,7 @@ void gpgpu_reset_state(GPGPUState *s)
 }
 
 /* 全局错误由设备锁存，再交 IRQ 模块通知 Host。 */
-void gpgpu_set_error(GPGPUState *s, GPGPUError error)
+void gpgpu_set_error(GPGPUState *s, uint32_t error)
 {
 	s->error_status |= error;
 	s->global_status |= GPGPU_STATUS_ERROR;

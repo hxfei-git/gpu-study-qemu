@@ -24,15 +24,14 @@ static unsigned long cp_window(u32 slot, u32 domain, u32 vmid, u32 phase, u64 ad
 	cp_access.phase = phase;
 	cp_access.address = address;
 	cp_fence();
-	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_DOMAIN = domain;
-	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_ID = vmid;
-	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_SLOT = slot;
-	*(volatile u32 *)(unsigned long)GPGPU_CP_VM_PHASE = phase;
-	*(volatile u32 *)(unsigned long)GPGPU_CP_IOVA_BASE_HI = address >> 32;
-	*(volatile u32 *)(unsigned long)GPGPU_CP_IOVA_BASE_LO =
-		(u32)address & ~(GPGPU_CP_HOST_WINDOW_SIZE - 1);
+	cp_window_write(GPGPU_CP_WINDOW_DOMAIN, domain);
+	cp_window_write(GPGPU_CP_WINDOW_VMID, vmid);
+	cp_window_write(GPGPU_CP_WINDOW_SLOT, slot);
+	cp_window_write(GPGPU_CP_WINDOW_PHASE, phase);
+	cp_window_write(GPGPU_CP_WINDOW_BASE_HI, address >> 32);
+	cp_window_write(GPGPU_CP_WINDOW_BASE_LO, (u32)address & ~(GPGPU_CP_WINDOW_SIZE - 1));
 	cp_fence();
-	return GPGPU_CP_HOST_WINDOW_BASE + (address & 0xffff);
+	return GPGPU_CP_WINDOW_BASE + (address & (GPGPU_CP_WINDOW_SIZE - 1));
 }
 
 /*
@@ -111,8 +110,9 @@ u64 cp_trap(u64 cause, u64 epc, u64 address)
 {
 	cp_access.cause = cause;
 	cp_access.fault_address = address;
-	if ((cause == 5 || cause == 7) && address >= GPGPU_CP_HOST_WINDOW_BASE &&
-	    address < GPGPU_CP_HOST_WINDOW_BASE + GPGPU_CP_HOST_WINDOW_SIZE &&
+	if ((cause == RISCV_CAUSE_LOAD_ACCESS || cause == RISCV_CAUSE_STORE_ACCESS) &&
+	    address >= GPGPU_CP_WINDOW_BASE &&
+	    address < GPGPU_CP_WINDOW_BASE + GPGPU_CP_WINDOW_SIZE &&
 	    (epc == (u64)(unsigned long)cp_fault_load32 ||
 	     epc == (u64)(unsigned long)cp_fault_load64 ||
 	     epc == (u64)(unsigned long)cp_fault_store32 ||

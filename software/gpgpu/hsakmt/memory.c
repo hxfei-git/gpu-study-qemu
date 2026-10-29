@@ -183,7 +183,7 @@ GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset, Gp
 		return GPGPU_KMT_INVALID_PARAMETER;
 	}
 	request = (struct gpgpu_memory_copy) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.direction = direction,
 		.host_handle = host->handle,
 		.vram_handle = vram->handle,

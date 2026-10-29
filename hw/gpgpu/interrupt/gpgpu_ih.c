@@ -4,7 +4,6 @@
 #include "gpgpu_irq.h"
 #include "hw/gpgpu/memory/gpgpu_vram.h"
 #include "hw/gpgpu/memory/gpgpu_host.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 #include "qemu/atomic.h"
 #include "qemu/bitops.h"
 

@@ -64,7 +64,7 @@ void gpgpu_ih_drain_locked(struct gpgpu_qdev *dev)
 
 	if ((u32)(wptr - dev->ih_rptr) > GPGPU_IH_BYTES / sizeof(*dev->ih)) {
 		WRITE_ONCE(dev->fatal, true);
-		gpgpu_events_fault(dev, NULL, GPGPU_QUEUE_ERR_IH);
+		gpgpu_events_fault(dev, NULL, GPGPU_ERR_IH_FAULT);
 		return;
 	}
 	/*
@@ -131,10 +131,10 @@ void gpgpu_ih_work(struct work_struct *work)
 	if (dev->present) {
 		gpgpu_ih_drain_locked(dev);
 		if (dev->fatal)
-			gpgpu_events_fault(dev, NULL, GPGPU_QUEUE_ERR_IH);
+			gpgpu_events_fault(dev, NULL, GPGPU_ERR_IH_FAULT);
 		spin_lock_irqsave(&dev->irq_lock, flags);
-		writel(GPGPU_QUEUE_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
-		writel(GPGPU_Q_IRQ_ALL, dev->regs + GPGPU_REG_IRQ_ENABLE);
+		writel(GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
+		writel(GPGPU_IRQ_ALL, dev->regs + GPGPU_REG_IRQ_ENABLE);
 		spin_unlock_irqrestore(&dev->irq_lock, flags);
 	}
 	mutex_unlock(&dev->lock);
@@ -155,33 +155,33 @@ irqreturn_t gpgpu_qdev_irq(struct gpgpu_qdev *dev)
 		spin_unlock_irqrestore(&dev->irq_lock, flags);
 		return IRQ_NONE;
 	}
-	pending = readl(dev->regs + GPGPU_REG_IRQ_STATUS) & GPGPU_Q_IRQ_ALL;
+	pending = readl(dev->regs + GPGPU_REG_IRQ_STATUS) & GPGPU_IRQ_ALL;
 	if (!pending) {
 		spin_unlock_irqrestore(&dev->irq_lock, flags);
 		return IRQ_NONE;
 	}
 	if (pending & GPGPU_IRQ_ERROR) {
 		error = readl(dev->regs + GPGPU_REG_ERROR_STATUS);
-		if (error & (1U << 3)) {
+		if (error & GPGPU_ERR_DMA_FAULT) {
 			WRITE_ONCE(dev->dma_failed, true);
 			complete(&dev->dma_done);
 		}
-		if (error & (GPGPU_QUEUE_ERR_IH | GPGPU_QUEUE_ERR_FIRMWARE)) {
+		if (error & (GPGPU_ERR_IH_FAULT | GPGPU_ERR_FIRMWARE)) {
 			WRITE_ONCE(dev->fatal, true);
 			schedule_work(&dev->ih_work);
 		}
 	}
-	if (pending & GPGPU_IRQ_DMA)
+	if (pending & GPGPU_IRQ_DMA_DONE)
 		complete(&dev->dma_done);
-	if (pending & GPGPU_QUEUE_IRQ_IH) {
+	if (pending & GPGPU_IRQ_IH) {
 		/*
 		 * 工作线程消费后再 ACK 并恢复使能，
 		 * 避免未消费记录反复中断。
 		 */
-		writel(GPGPU_Q_IRQ_ALL & ~GPGPU_QUEUE_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ENABLE);
+		writel(GPGPU_IRQ_ALL & ~GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ENABLE);
 		schedule_work(&dev->ih_work);
 	}
-	writel(pending & ~GPGPU_QUEUE_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
+	writel(pending & ~GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
 	spin_unlock_irqrestore(&dev->irq_lock, flags);
 	return IRQ_HANDLED;
 }

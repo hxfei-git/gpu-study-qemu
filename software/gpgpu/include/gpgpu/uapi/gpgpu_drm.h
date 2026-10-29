@@ -1,4 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * GPGPU DRM 用户接口
+ *
+ * 用户态经 render node 调用这些 ioctl：先 INFO 查询地址模式，再 BO_CREATE 创建
+ * 固定存储的 GEM 对象并 MAP 绑定到 GPU 地址，然后 QUEUE_CREATE 建立 AQL 队列、
+ * EVENT_CREATE 建立完成事件。本文件只描述 ioctl 参数，不含设备寄存器。
+ */
 #ifndef GPGPU_DRM_H
 #define GPGPU_DRM_H
 #ifdef __KERNEL__
@@ -13,8 +20,12 @@ typedef uint32_t gpgpu_u32;
 typedef uint64_t gpgpu_u64;
 #endif
 
-#define GPGPU_QABI_VERSION 2U
+/* 每个 ioctl 参数首字段 version 必须填写的接口版本。 */
+#define GPGPU_DRM_VERSION 2U
+
+/* COPY 方向：Host 对象到 VRAM 对象。 */
 #define GPGPU_COPY_H2D 0U
+/* COPY 方向：VRAM 对象到 Host 对象。 */
 #define GPGPU_COPY_D2H 1U
 /* 内存种类：可映射的一致性 Host RAM。 */
 #define GPGPU_MEMORY_HOST 1U
@@ -35,7 +46,7 @@ typedef uint64_t gpgpu_u64;
 
 /**
  * struct gpgpu_memory_copy - 按内存对象与对象内偏移提交同步 DMA
- * @version: 输入队列 ABI 版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @direction: H2D 或 D2H 拷贝方向。
  * @host_handle: Host 内存对象句柄。
  * @vram_handle: VRAM 内存对象句柄。
@@ -55,7 +66,7 @@ struct gpgpu_memory_copy {
 
 /**
  * struct gpgpu_queue_create - 使用已有 Ring 和进度对象创建用户队列
- * @version: 输入队列 ABI 版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @ring_handle: 输入保存 AQL Ring 的 Host 内存句柄。
  * @progress_handle: 输入保存 R/W 的 Host 内存句柄。
  * @ring_size: 输入 Ring 字节容量，必须为 2 的幂。
@@ -85,7 +96,7 @@ struct gpgpu_queue_create {
 
 /**
  * struct gpgpu_queue_state - 队列查询或卸载请求及诊断结果
- * @version: 输入队列 ABI 版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @queue_id: 输入会话内队列编号。
  * @state: 输出 READY、UNLOADING 或 FAULTED 状态。
  * @error: 输出队列首次错误的 GpgpuQueueError 编码。
@@ -103,7 +114,7 @@ struct gpgpu_queue_state {
 
 /**
  * struct gpgpu_event_request - 事件创建、查询、等待及销毁共用的请求
- * @version: 输入队列 ABI 版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @event_id: 创建时输出事件编号，其余操作输入已有编号。
  * @queue_id: 创建时输入源队列编号；查询和等待时回报源队列。
  * @timeout_ms: 等待毫秒数；零只检查，UINT32_MAX 不设调用方期限。
@@ -121,10 +132,6 @@ struct gpgpu_event_request {
 	gpgpu_u64 mailbox_address;
 };
 
-#include "gpgpu_vm.h"
-
-/* 统一 DRM 命令空间；所有 version 均为此值。 */
-#define GPGPU_DRM_VERSION 2U
 /**
  * struct gpgpu_va_range - 可分配的 GPUVA 半开区间
  * @start: 起始字节地址，包含此值。

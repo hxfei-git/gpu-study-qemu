@@ -33,12 +33,10 @@ DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv64"
 RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt", "initramfs-module")
 BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
                  "kernel-packages")
-BUILD_INPUTS = ("gpgpu_pci_main.c", "gpgpu_memory.c", "gpgpu_queue.c",
-                "gpgpu_event.c", "gpgpu_queue_drv.h", "gpgpu_regs.h",
-                "Makefile", "guest-compile.sh",
-                "../include/gpgpu_queue.h", "../include/gpgpu_vm.h",
-                "../include/gpgpu_drm.h", "gpgpu_gpuvm.c")
-BUILD_VERSION = 4
+# 驱动构建指纹的输入：驱动源码、共享协议头和客体编译脚本。
+BUILD_INPUT_GLOBS = ("Makefile", "*.c", "*.h",
+                     "../include/gpgpu/*.h", "../include/gpgpu/uapi/*.h")
+BUILD_VERSION = 5
 ENVIRONMENT_INPUTS = ("guest-build.sh", "developer-init.sh",
                       "guest-dev-init.sh", "module-init.sh")
 ENVIRONMENT_FILES = ("vmlinuz-virt", "initramfs-module",
@@ -106,9 +104,17 @@ def inputs_hash(filenames, version):
     return digest.hexdigest()
 
 
+def build_inputs():
+    """列出驱动构建指纹的全部输入，路径相对于 linux/ 并排序。"""
+    names = {str(path.relative_to(SOURCE).as_posix()) if path.is_relative_to(SOURCE)
+             else "../" + str(path.relative_to(STACK).as_posix())
+             for pattern in BUILD_INPUT_GLOBS for path in SOURCE.glob(pattern)}
+    return tuple(sorted(names)) + ("guest-compile.sh",)
+
+
 def source_hash():
-    """按固定输入清单计算当前驱动源码与 ABI 的构建指纹。"""
-    return inputs_hash(BUILD_INPUTS, BUILD_VERSION)
+    """按驱动源码、协议头与编译脚本计算当前构建指纹。"""
+    return inputs_hash(build_inputs(), BUILD_VERSION)
 
 
 def ensure_qemu(output, remote=False):

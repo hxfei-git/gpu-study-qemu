@@ -5,7 +5,6 @@
 #include "gpgpu_compute_internal.h"
 #include "hw/gpgpu/memory/gpgpu_vm.h"
 #include "qemu/bswap.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 
 /* 代码范围由派发快照约束，翻译及物理访问由统一用户入口完成。 */
 bool gpgpu_memory_fetch(GPGPUExecContext *ctx, uint32_t address, uint32_t *instruction)

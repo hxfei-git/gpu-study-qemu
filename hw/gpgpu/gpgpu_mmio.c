@@ -15,7 +15,6 @@
 #include "memory/gpgpu_vram.h"
 #include "interrupt/gpgpu_irq.h"
 #include "interrupt/gpgpu_ih.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 #include "gpgpu_internal.h"
 
 /*

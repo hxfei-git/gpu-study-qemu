@@ -33,7 +33,7 @@ static void gpgpu_dma_complete(void *opaque)
  *
  * 按方向选择 Host 地址和 VRAM 偏移，搬运完成后延迟 1 ms 发布完成通知。
  */
-static void gpgpu_start_dma(GPGPUState *s, GPGPUDMAControl ctrl)
+static void gpgpu_start_dma(GPGPUState *s, uint32_t ctrl)
 {
 	uint64_t vram_addr;
 	uint64_t host_addr;

@@ -5,27 +5,19 @@
 
 #include "qom/object.h"
 #include "hw/pci/pci_ids.h"
-#include "gpgpu_regs.h"
+#include "gpgpu/gpgpu_protocol.h"
 
 /* QOM 注册名，供命令行 -device 与类型转换使用。 */
 #define TYPE_GPGPU "gpgpu"
 OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
 
-/* 教学设备的 PCI 厂商编号。 */
-#define GPGPU_VENDOR_ID 0x1234
-/* 教学设备的 PCI 设备编号。 */
-#define GPGPU_DEVICE_ID 0x1337
 /* PCI 修订版本号。 */
 #define GPGPU_REVISION 0x01
 /* PCI 设备类别，声明为 3D 控制器。 */
 #define GPGPU_CLASS_CODE PCI_CLASS_DISPLAY_3D
 
-/* BAR0 控制空间的字节容量，含 MSI/MSI-X 表。 */
-#define GPGPU_CTRL_BAR_SIZE (1 * 1024 * 1024)
 /* BAR2 默认显存字节容量。 */
 #define GPGPU_VRAM_BAR_SIZE (64 * 1024 * 1024)
-/* BAR4 Doorbell 空间的字节容量。 */
-#define GPGPU_DOORBELL_BAR_SIZE (64 * 1024)
 /* DEV_CAPS 默认报告的计算单元数。 */
 #define GPGPU_DEFAULT_NUM_CUS 4
 /* DEV_CAPS 默认报告的每计算单元 warp 数。 */
@@ -42,7 +34,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
  *
  * 先更新错误和全局状态，再请求错误中断。
  */
-void gpgpu_set_error(GPGPUState *s, GPGPUError error);
+void gpgpu_set_error(GPGPUState *s, uint32_t error);
 
 /**
  * gpgpu_reset_state() - 停止执行并复位设备寄存器

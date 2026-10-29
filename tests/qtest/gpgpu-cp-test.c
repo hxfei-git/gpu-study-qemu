@@ -110,7 +110,7 @@ static void cp_start(CPTest *s, bool gpuvm)
 
 	/* 3. 设备 BAR。 */
 	qpci_init_generic(&s->bus, s->host, NULL, false);
-	qpci_device_foreach(&s->bus.bus, GPGPU_TEST_VENDOR, GPGPU_TEST_DEVICE, save_device,
+	qpci_device_foreach(&s->bus.bus, GPGPU_VENDOR_ID, GPGPU_DEVICE_ID, save_device,
 			    &s->dev);
 	g_assert_nonnull(s->dev);
 	qpci_device_enable(s->dev);

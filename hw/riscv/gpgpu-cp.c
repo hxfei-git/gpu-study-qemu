@@ -17,7 +17,6 @@
 #include "hw/gpgpu/cp/gpgpu_cp_window.h"
 #include "hw/gpgpu/cp/gpgpu_hqd.h"
 #include "hw/gpgpu/memory/gpgpu_vram.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 #include "target/riscv/cpu.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -148,22 +147,22 @@ static void gpgpu_cp_machine_init(MachineState *machine)
                              gpgpu_vram_region(gpgpu), 0, gpgpu_vram_size(gpgpu));
     memory_region_add_subregion(&s->cp_memory, 0, &s->vram_alias);
     memory_region_init_io(&s->host_window, OBJECT(machine), &gpgpu_cp_host_ops,
-                          gpgpu, "gpgpu-cp-host-window", GPGPU_CP_HOST_WINDOW_SIZE);
-    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_HOST_WINDOW_BASE,
+                          gpgpu, "gpgpu-cp-host-window", GPGPU_CP_WINDOW_SIZE);
+    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_WINDOW_BASE,
                                 &s->host_window);
     memory_region_init_io(&s->host_window_regs, OBJECT(machine),
                           &gpgpu_cp_host_regs_ops, gpgpu,
-                          "gpgpu-cp-host-window-regs", 24);
-    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_IOVA_BASE_LO,
+                          "gpgpu-cp-host-window-regs", GPGPU_CP_WINDOW_REGS_SIZE);
+    memory_region_add_subregion(&s->cp_memory, GPGPU_CP_WINDOW_REGS,
                                 &s->host_window_regs);
 
     memory_region_init_io(&s->hqd_regs, OBJECT(machine), &gpgpu_cp_hqd_ops,
-                          gpgpu, "gpgpu-cp-hqd", 4 * GPGPU_HQD_STRIDE);
+                          gpgpu, "gpgpu-cp-hqd", GPGPU_HQD_SLOTS * GPGPU_HQD_STRIDE);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_HQD_BASE,
                                 &s->hqd_regs);
     memory_region_init_io(&s->dispatch_regs, OBJECT(machine),
                           &gpgpu_cp_regs_ops, gpgpu,
-                          "gpgpu-cp-registers", 0x1000);
+                          "gpgpu-cp-registers", GPGPU_CP_REG_SIZE);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_REG_BASE,
                                 &s->dispatch_regs);
 

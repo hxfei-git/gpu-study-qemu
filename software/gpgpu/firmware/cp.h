@@ -2,11 +2,15 @@
 #ifndef GPGPU_FIRMWARE_CP_H
 #define GPGPU_FIRMWARE_CP_H
 
-#include "gpgpu_queue.h"
-#include "../../../hw/gpgpu/gpgpu_regs.h"
+#include "gpgpu/gpgpu_protocol.h"
 
 typedef gpgpu_q_u32 u32;
 typedef gpgpu_q_u64 u64;
+
+/* mcause：load access fault。 */
+#define RISCV_CAUSE_LOAD_ACCESS 5
+/* mcause：store/AMO access fault。 */
+#define RISCV_CAUSE_STORE_ACCESS 7
 
 /**
  * struct CpSlot - 固件私有的 HQD 占用与管理结果记录
@@ -48,7 +52,7 @@ typedef struct CpAccess {
 	u64 mqd;
 } CpAccess;
 
-extern CpSlot cp_slots[GPGPU_QUEUE_SLOTS];
+extern CpSlot cp_slots[GPGPU_HQD_SLOTS];
 extern volatile CpAccess cp_access;
 extern volatile u32 cp_stopped;
 extern u32 cp_gpuvm;
@@ -81,6 +85,16 @@ static inline u32 cp_reg_read(u32 offset)
 static inline void cp_reg_write(u32 offset, u32 value)
 {
 	*(volatile u32 *)(unsigned long)(GPGPU_CP_REG_BASE + offset) = value;
+}
+
+/*
+ * cp_window_write() - 写一个访存窗口配置寄存器
+ *
+ * offset 为 GPGPU_CP_WINDOW_* 字段偏移；配置在下一次窗口访问前生效。
+ */
+static inline void cp_window_write(u32 offset, u32 value)
+{
+	*(volatile u32 *)(unsigned long)(GPGPU_CP_WINDOW_REGS + offset) = value;
 }
 
 /*

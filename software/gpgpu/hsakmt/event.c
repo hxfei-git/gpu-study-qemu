@@ -15,7 +15,7 @@ GpgpuKmtStatus gpgpuKmtCreateEvent(GpgpuKmtQueue *queue, GpgpuKmtEvent *event)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	memset(event, 0, sizeof(*event));
 	request = (struct gpgpu_event_request) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.queue_id = queue->id,
 	};
 	status = gpgpu_kmt_begin(queue->context);
@@ -52,7 +52,7 @@ GpgpuKmtStatus gpgpuKmtQueryEvent(GpgpuKmtEvent *event, struct gpgpu_event_reque
 	if (!event || !event->context || !state)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	*state = (struct gpgpu_event_request) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.event_id = event->id,
 	};
 	return gpgpu_kmt_ioctl(event->context, GPGPU_DRM_EVENT_QUERY, state);
@@ -70,7 +70,7 @@ GpgpuKmtStatus gpgpuKmtWaitEvent(GpgpuKmtEvent *event, uint32_t timeout_ms)
 	if (!event || !event->context)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	request = (struct gpgpu_event_request) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.event_id = event->id,
 		.timeout_ms = timeout_ms,
 	};
@@ -92,7 +92,7 @@ GpgpuKmtStatus gpgpuKmtDestroyEvent(GpgpuKmtEvent *event)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	context = event->context;
 	request = (struct gpgpu_event_request) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.event_id = event->id,
 	};
 	status = gpgpu_kmt_begin(context);
