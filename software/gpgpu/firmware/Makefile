@@ -9,7 +9,7 @@ CFLAGS := -march=rv64im_zicsr -mabi=lp64 -mcmodel=medany -O2 -g \
           -ffreestanding -fno-builtin -fno-pic -fno-stack-protector \
           -fno-common -msmall-data-limit=0 -mno-relax -Wall -Wextra -Werror \
           -I../include -std=c11
-OBJECTS := $(addprefix $(BUILD_DIR)/,start.o memory.o main.o management.o aql.o)
+OBJECTS := $(addprefix $(BUILD_DIR)/,start.o main.o ring.o mgmt.o aql.o ih.o mem.o)
 
 .PHONY: all clean
 all: $(BUILD_DIR)/gpgpu-cp.bin
