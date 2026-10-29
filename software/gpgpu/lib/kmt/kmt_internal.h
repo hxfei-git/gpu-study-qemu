@@ -27,6 +27,7 @@
  * @context: 所属连接。
  * @next: 连接 memory 链表的下一项。
  * @handle: GEM 句柄。
+ * @bound: 仍持有 GPU 绑定；释放时解绑成功后清除，失败重试不会重复解绑。
  * @queue_users: 把本对象用作 Ring 或进度的存活队列数；非零时不能释放。
  */
 typedef struct KmtMemory {
@@ -34,6 +35,7 @@ typedef struct KmtMemory {
 	GpgpuKmtContext *context;
 	struct KmtMemory *next;
 	uint32_t handle;
+	bool bound;
 	unsigned int queue_users;
 } KmtMemory;
 

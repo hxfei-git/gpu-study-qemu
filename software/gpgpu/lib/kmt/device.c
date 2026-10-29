@@ -245,6 +245,7 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 	c->path = NULL;
 	c->references = 0;
 	c->gpuvm = false;
+	c->uncertain = false;
 	status = GPGPU_KMT_SUCCESS;
 out:
 	pthread_mutex_unlock(&c->lock);

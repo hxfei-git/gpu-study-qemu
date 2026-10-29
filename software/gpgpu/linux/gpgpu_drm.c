@@ -60,10 +60,12 @@ static int gpgpu_open(struct drm_device *drm, struct drm_file *file)
 }
 
 /**
- * gpgpu_fpriv_destroy() - 回收会话全部对象并放下设备引用
+ * gpgpu_fpriv_destroy() - 回收会话全部对象
  * @fpriv: 会话；调用者持 dev->lock，并已确认设备不再访问其对象。
  *
  * 按事件、队列、地址空间、对象的顺序释放，最后归还 Doorbell 页。
+ * 会话持有的设备引用由调用者在释放 dev->lock 之后放下：它可能是最后
+ * 一个引用，持锁放下会在解锁时访问已释放的设备。
  */
 void gpgpu_fpriv_destroy(struct gpgpu_fpriv *fpriv)
 {
@@ -79,7 +81,6 @@ void gpgpu_fpriv_destroy(struct gpgpu_fpriv *fpriv)
 		clear_bit(fpriv->db_page, &dev->db_pages);
 	list_del(&fpriv->node);
 	kfree(fpriv);
-	gpgpu_device_put(dev);
 }
 
 /*
@@ -95,11 +96,14 @@ static void gpgpu_postclose(struct drm_device *drm, struct drm_file *file)
 	mutex_lock(&dev->lock);
 	fpriv->file = NULL;
 	retain = dev->dma_uncertain || gpgpu_queue_any_live(fpriv) || gpgpu_vm_cleanup(fpriv);
-	if (retain && !dev->stopped)
+	if (retain && !dev->stopped) {
 		fpriv->orphan = true;
-	else
-		gpgpu_fpriv_destroy(fpriv);
+		mutex_unlock(&dev->lock);
+		return;
+	}
+	gpgpu_fpriv_destroy(fpriv);
 	mutex_unlock(&dev->lock);
+	gpgpu_device_put(dev);
 }
 
 /* ---- ioctl ---- */

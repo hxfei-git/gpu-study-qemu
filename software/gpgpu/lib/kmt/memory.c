@@ -44,12 +44,12 @@ static uint64_t vm_choose_address(GpgpuKmtContext *c, uint64_t size, uint64_t al
 	return 0;
 }
 
-static void gem_close(GpgpuKmtContext *c, uint32_t handle)
+/* 关闭 GEM 句柄；调用者持 lock。 */
+static GpgpuKmtStatus gem_close(GpgpuKmtContext *c, uint32_t handle)
 {
 	struct gpgpu_gem_close args = { .handle = handle };
 
-	if (ioctl(c->fd, GPGPU_DRM_GEM_CLOSE, &args) < 0)
-		c->uncertain = true;
+	return kmt_ioctl(c, GPGPU_DRM_GEM_CLOSE, &args);
 }
 
 /* 绑定失败的错误中，这些表示驱动可能已写入部分页表，相关资源会被保留。 */
@@ -142,6 +142,7 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 	};
 	m->context = c;
 	m->handle = create.handle;
+	m->bound = true;
 	m->next = c->memory;
 	c->memory = m;
 	*memory = &m->pub;
@@ -150,7 +151,9 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 undo:
 	if (cpu)
 		munmap(cpu, create.mapped_size);
-	gem_close(c, create.handle);
+	/* 句柄关不掉时驱动仍保留对象，本连接不能再报告正常关闭。 */
+	if (gem_close(c, create.handle) != GPGPU_KMT_SUCCESS)
+		c->uncertain = true;
 out:
 	pthread_mutex_unlock(&c->lock);
 	kmt_leave(c);
@@ -164,7 +167,7 @@ free_m:
  *
  * 连接中有任何存活队列时地址空间冻结，拒绝释放。
  * 1. 解除 GPU 绑定；2. 解除 CPU 映射；3. 关闭句柄；4. 摘除并释放。
- * 第 1 步失败时对象保持不变，可以重试。
+ * 任一步失败都返回错误并保留对象，已完成的步骤记在对象上，可以重试。
  */
 GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 {
@@ -185,15 +188,27 @@ GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 	}
 
 	/* 1. GPU 绑定。 */
-	unmap.address = m->pub.gpu_address;
-	status = kmt_ioctl(c, GPGPU_DRM_UNMAP, &unmap);
+	if (m->bound) {
+		unmap.address = m->pub.gpu_address;
+		status = kmt_ioctl(c, GPGPU_DRM_UNMAP, &unmap);
+		if (status != GPGPU_KMT_SUCCESS)
+			goto out;
+		m->bound = false;
+	}
+
+	/* 2. CPU 映射。 */
+	if (m->pub.cpu) {
+		if (munmap(m->pub.cpu, m->pub.mapped_size)) {
+			status = kmt_status(errno);
+			goto out;
+		}
+		m->pub.cpu = NULL;
+	}
+
+	/* 3. 句柄。 */
+	status = gem_close(c, m->handle);
 	if (status != GPGPU_KMT_SUCCESS)
 		goto out;
-
-	/* 2. CPU 映射；3. 句柄。 */
-	if (m->pub.cpu)
-		munmap(m->pub.cpu, m->pub.mapped_size);
-	gem_close(c, m->handle);
 
 	/* 4. 摘除。 */
 	KMT_UNLINK(&c->memory, m);

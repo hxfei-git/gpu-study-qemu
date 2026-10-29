@@ -122,8 +122,7 @@ static bool bo_args_valid(const struct gpgpu_bo_create *args)
 {
 	return (args->kind == GPGPU_MEMORY_HOST || args->kind == GPGPU_MEMORY_VRAM) &&
 		args->size && args->size <= GPGPU_VRAM_USABLE_SIZE && args->alignment &&
-		is_power_of_2(args->alignment) && args->alignment <= GPGPU_QUEUE_RING_MAX &&
-		!args->reserved;
+		is_power_of_2(args->alignment) && args->alignment <= GPGPU_QUEUE_RING_MAX;
 }
 
 /* 分配存储：长度取页对齐与对齐要求中较大者，并向上取 2 的幂以满足对齐。 */
@@ -158,11 +157,11 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	u32 handle;
 	int ret;
 
-	/* 1. 参数。 */
+	/* 1. 状态，再参数。 */
+	if (args->reserved || fpriv->vm.failed || gpgpu_queue_any_live(fpriv))
+		return -EBUSY;
 	if (!bo_args_valid(args))
 		return -EINVAL;
-	if (fpriv->vm.failed || gpgpu_queue_any_live(fpriv))
-		return -EBUSY;
 
 	/* 2. 存储与 GEM。 */
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
