@@ -505,7 +505,7 @@ Linux 驱动将 ``dma_alloc_coherent()`` 返回的 DMA 地址写入系统内存�
     BAR0 系统 DMA 地址 → PCI 地址空间 → SMMUv3 → 客体 RAM 暂存区
     BAR0 显存偏移      → GPGPU VRAM
 
-``hw/gpgpu/memory/gpgpu_dma.c`` 通过同目录的 ``gpgpu_host.c`` 访问 Host，
+``hw/gpgpu/mem/dma.c`` 通过同目录的 ``phys.c`` 访问 Host，
 由既有 PCI/vfio-user 路径处理 DMA，并检查 ``MemTxResult``。
 未映射访问使 ``DMA_STATUS`` 为 ERROR，置位
 ``ERROR_STATUS.DMA_FAULT`` 并报告错误中断，不发送 DMA 完成通知。
@@ -868,24 +868,25 @@ QEMU Device Implementation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``hw/gpgpu/gpgpu.c`` 注册并组装单个 PCI 设备，编排初始化、复位和清理。
-``gpgpu_mmio.c`` 将寄存器访问转交所属模块；``cp/`` 管理 CP 控制、访存窗口、
-HQD 和 Doorbell，``memory/`` 管理 VRAM、GPUVM、描述符 DMA 及 Host 访问，
-``interrupt/`` 管理 IH 记录发布和 PCI 中断。
+``bar0.c`` 把 BAR0 的每个寄存器组挂成独立子区域并统一检查访问宽度；
+``cp/`` 管理 CP 控制、访存窗口、HQD 和 Doorbell，``mem/`` 管理 VRAM、
+GPU 物理地址路由、GPUVM 与描述符 DMA，``irq/`` 管理 IH 记录发布和 PCI 中断。
 
-``gpgpu.h`` 声明设备类型和设备级接口，完整 ``GPGPUState`` 仅在
-``gpgpu_internal.h`` 中组合。各模块在自己的头文件中声明操作和查询接口；
-RISC-V 板级代码通过这些接口取得共享 VRAM、连接 CP 并处理 CPU 复位。
+``gpgpu.h`` 声明设备类型和设备级接口，完整 ``GPGPUState`` 在
+``gpgpu_state.h`` 中组合。各模块只访问自己的子状态，跨模块通过对方头文件
+中的函数；RISC-V 板级代码通过这些接口取得共享 VRAM、连接 CP 并处理 CPU 复位。
+寄存器与内存对象布局集中在 ``software/gpgpu/include/gpgpu/``。
 
 Compute Unit Simulation
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-计算实现在 ``hw/gpgpu/compute/``。Dispatch 保存派发参数、持有任务句柄并发布
-执行结果；Core 推进工作组、warp 和累计预算；指令模块执行一个 lane 的一条
-RV32 指令，再由计算访存模块处理取指、数据读写、只读参数窗口及线程控制窗口。
+计算实现在 ``hw/gpgpu/compute/``。``dispatch.c`` 保存派发参数、持有任务并
+发布执行结果；``scheduler.c`` 推进工作组与 warp 并检查执行预算；``rv32.c``
+解码并执行一个 lane 的一条 RV32 指令；``lane_mem.c`` 处理取指与数据读写，
+参数块按普通内存经 ``a0`` 中的地址读取。
 
-执行上下文区分同步、物理队列和 GPUVM 队列三种模式。每个 lane 保存自己的
-寄存器和 PC；同步路径一次执行完整网格，队列路径由定时器分段推进。
-当前没有按 CU 分配任务的调度器、并行执行模式或组内共享内存与屏障。
+每个 lane 保存自己的寄存器和 PC，任务由定时器分段推进。当前没有按 CU 分配
+任务的调度器、并行执行模式或组内共享内存与屏障。
 
 Future Extensions
 -----------------

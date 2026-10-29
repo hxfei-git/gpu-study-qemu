@@ -20,7 +20,7 @@ Full tutorial site: <https://qemu.gevico.online/>
 |-----------|---------------|---------------|---------|
 | **CPU** | TCG testcase | `tests/gevico/tcg/` | 10 tests x 10 pts = 100 |
 | **SoC** | QTest | `tests/gevico/qtest/` | 10 tests x 10 pts = 100 |
-| **GPGPU** | QTest (QOS) | `tests/qtest/gpgpu-test.c` | 17 tests -> 100 pts |
+| **GPGPU** | QTest + Linux 客体 | `tests/qtest/gpgpu-{regs,cp}-test.c`、`test-gpgpu-stack` | 11 项 QTest + 3 个计算示例 |
 | **Rust** | QTest + unit | `tests/gevico/qtest/` + `rust/hw/i2c/` | 10 tests x 10 pts = 100 |
 
 ## Quick Start
@@ -109,8 +109,9 @@ Implement peripheral device models (GPIO, PWM, WDT, SPI, Flash) for the G233 SoC
 
 - 设备与软件：[软件栈说明](software/gpgpu/README.md)。
 - 计算示例：向量加法、矩阵乘法和 ReLU，保留原规模及逐元素比较。
-- 唯一验证入口：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
-- 原 GPGPU 专用 QTest 与评分任务已删除，历史结果保留在软件栈说明中。
+- 端到端验证：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
+- 设备与固件回归：`make -f Makefile.camp test-gpgpu-qtest`，寄存器级 6 项与 RV64 CP 队列 5 项，不需要 Linux 客体。
+- 协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](software/gpgpu/PROTOCOL_V3.md)。
 
 ### Rust Experiment (QTest + Unit)
 

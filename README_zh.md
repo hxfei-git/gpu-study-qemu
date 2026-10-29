@@ -20,7 +20,7 @@
 |------|---------|---------|------|
 | **CPU** | TCG 测题 | `tests/gevico/tcg/` | 10 题 x 10 分 = 100 分 |
 | **SoC** | QTest | `tests/gevico/qtest/` | 10 题 x 10 分 = 100 分 |
-| **GPGPU** | QTest (QOS) | `tests/qtest/gpgpu-test.c` | 17 题 -> 100 分 |
+| **GPGPU** | QTest + Linux 客体 | `tests/qtest/gpgpu-{regs,cp}-test.c`、`test-gpgpu-stack` | 11 项 QTest + 3 个计算示例 |
 | **Rust** | QTest + 单元测试 | `tests/gevico/qtest/` + `rust/hw/i2c/` | 10 题 x 10 分 = 100 分 |
 
 ## 快速开始
@@ -109,8 +109,9 @@ git push origin main
 
 - 设备与软件：[软件栈说明](software/gpgpu/README.md)。
 - 计算示例：向量加法、矩阵乘法和 ReLU，保留原规模及逐元素比较。
-- 唯一验证入口：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
-- 原 GPGPU 专用 QTest 与评分任务已删除，历史结果保留在软件栈说明中。
+- 端到端验证：`make -f Makefile.camp test-gpgpu-stack`，固定 A57、1 GiB、IOMMU=none，依次运行 GPUVM 开和关。
+- 设备与固件回归：`make -f Makefile.camp test-gpgpu-qtest`，寄存器级 6 项与 RV64 CP 队列 5 项，不需要 Linux 客体。
+- 协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](software/gpgpu/PROTOCOL_V3.md)。
 
 ### Rust 实验（QTest + 单元测试）
 
