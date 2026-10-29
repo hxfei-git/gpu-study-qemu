@@ -18,20 +18,27 @@ GpgpuKmtStatus gpgpuKmtCreateEvent(GpgpuKmtQueue *q, GpgpuKmtEvent **event)
 	e = calloc(1, sizeof(*e));
 	if (!e)
 		return GPGPU_KMT_NO_MEMORY;
-	args = (struct gpgpu_event_request) { .version = GPGPU_DRM_VERSION, .queue_id = q->id };
-	status = kmt_call(c, GPGPU_DRM_EVENT_CREATE, &args);
+	status = kmt_enter(c);
 	if (status != GPGPU_KMT_SUCCESS) {
 		free(e);
 		return status;
 	}
-	e->pub = (GpgpuKmtEvent) { .id = args.event_id, .mailbox_address = args.mailbox_address };
-	e->context = c;
-	pthread_mutex_lock(&c->lock);
-	e->next = c->events;
-	c->events = e;
-	pthread_mutex_unlock(&c->lock);
-	*event = &e->pub;
-	return GPGPU_KMT_SUCCESS;
+	args = (struct gpgpu_event_request) { .version = GPGPU_DRM_VERSION, .queue_id = q->id };
+	status = kmt_ioctl(c, GPGPU_DRM_EVENT_CREATE, &args);
+	if (status == GPGPU_KMT_SUCCESS) {
+		e->pub = (GpgpuKmtEvent) { .id = args.event_id,
+					   .mailbox_address = args.mailbox_address };
+		e->context = c;
+		pthread_mutex_lock(&c->lock);
+		e->next = c->events;
+		c->events = e;
+		pthread_mutex_unlock(&c->lock);
+		*event = &e->pub;
+		e = NULL;
+	}
+	kmt_leave(c);
+	free(e);
+	return status;
 }
 
 GpgpuKmtStatus gpgpuKmtQueryEvent(GpgpuKmtEvent *event, struct gpgpu_event_request *state)
@@ -71,13 +78,17 @@ GpgpuKmtStatus gpgpuKmtDestroyEvent(GpgpuKmtEvent *event)
 	if (!e)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	c = e->context;
-	args = (struct gpgpu_event_request) { .version = GPGPU_DRM_VERSION, .event_id = e->pub.id };
-	status = kmt_call(c, GPGPU_DRM_EVENT_DESTROY, &args);
+	status = kmt_enter(c);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
-	pthread_mutex_lock(&c->lock);
-	KMT_UNLINK(&c->events, e);
-	pthread_mutex_unlock(&c->lock);
-	free(e);
-	return GPGPU_KMT_SUCCESS;
+	args = (struct gpgpu_event_request) { .version = GPGPU_DRM_VERSION, .event_id = e->pub.id };
+	status = kmt_ioctl(c, GPGPU_DRM_EVENT_DESTROY, &args);
+	if (status == GPGPU_KMT_SUCCESS) {
+		pthread_mutex_lock(&c->lock);
+		KMT_UNLINK(&c->events, e);
+		pthread_mutex_unlock(&c->lock);
+		free(e);
+	}
+	kmt_leave(c);
+	return status;
 }

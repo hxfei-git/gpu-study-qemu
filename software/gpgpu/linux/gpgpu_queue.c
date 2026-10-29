@@ -83,8 +83,8 @@ static bool ranges_overlap(u64 a, u64 a_size, u64 b, u64 b_size)
 static bool queue_args_valid(struct gpgpu_bo *ring, struct gpgpu_bo *progress,
 			     const struct gpgpu_queue_create *args)
 {
-	if (args->reserved || !ring || !progress || !ring->bound || !progress->bound ||
-	    ring->kind != GPGPU_MEMORY_HOST || progress->kind != GPGPU_MEMORY_HOST)
+	if (args->reserved || ring->kind != GPGPU_MEMORY_HOST ||
+	    progress->kind != GPGPU_MEMORY_HOST)
 		return false;
 	if (!is_power_of_2(args->ring_size) || args->ring_size < GPGPU_QUEUE_RING_MIN ||
 	    args->ring_size > GPGPU_QUEUE_RING_MAX || (args->ring_offset & 63) ||
@@ -188,9 +188,10 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	bool published;
 	int ret;
 
-	/* 1. 对象与进度。 */
+	/* 1. 对象与进度：对象不存在或未绑定视为暂不可用（-EBUSY），格式错误为 -EINVAL。 */
 	queue_collect(fpriv);
-	if (fpriv->vm.failed || !fpriv->vm.vmid || gpgpu_queue_any_live(fpriv))
+	if (fpriv->vm.failed || !fpriv->vm.vmid || !ring || !progress || !ring->bound ||
+	    !progress->bound || gpgpu_queue_any_live(fpriv))
 		return -EBUSY;
 	if (!queue_args_valid(ring, progress, args) || !fpriv->next_queue)
 		return -EINVAL;

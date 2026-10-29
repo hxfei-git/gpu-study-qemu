@@ -145,14 +145,13 @@ static bool signal_done(GpgpuSignal *signal)
  * 2. 之后阻塞等待事件，按剩余时间换算毫秒；
  * 3. 每次唤醒或事件超时都复查 Signal：Signal 先于 IH 发布，事件超时时
  *    Signal 可能已经完成。
+ * 调用期间登记为进行中的库调用，最后一次 Close 不会在轮询途中解除 Signal 的映射。
  */
-GpgpuKmtStatus gpgpuKmtWaitSignal(GpgpuSignal *signal, GpgpuKmtEvent *event, uint32_t timeout_ms)
+static GpgpuKmtStatus wait_signal(GpgpuSignal *signal, GpgpuKmtEvent *event, uint32_t timeout_ms)
 {
 	uint64_t start = now_ns(), deadline = deadline_ns(timeout_ms);
 	GpgpuKmtStatus status;
 
-	if (!signal || ((uintptr_t)signal & 7) || !event)
-		return GPGPU_KMT_INVALID_PARAMETER;
 	for (;;) {
 		uint64_t now;
 		uint32_t remaining_ms;
@@ -180,14 +179,27 @@ GpgpuKmtStatus gpgpuKmtWaitSignal(GpgpuSignal *signal, GpgpuKmtEvent *event, uin
 	}
 }
 
+GpgpuKmtStatus gpgpuKmtWaitSignal(GpgpuSignal *signal, GpgpuKmtEvent *event, uint32_t timeout_ms)
+{
+	KmtEvent *e = kmt_event(event);
+	GpgpuKmtStatus status;
+
+	if (!signal || ((uintptr_t)signal & 7) || !e)
+		return GPGPU_KMT_INVALID_PARAMETER;
+	status = kmt_enter(e->context);
+	if (status != GPGPU_KMT_SUCCESS)
+		return status;
+	status = wait_signal(signal, event, timeout_ms);
+	kmt_leave(e->context);
+	return status;
+}
+
 /* 轮询 R == W；队列出错时返回 WAIT_FAILURE。调用者已停止提交。 */
-GpgpuKmtStatus gpgpuKmtDrainQueue(GpgpuKmtQueue *q, uint32_t timeout_ms)
+static GpgpuKmtStatus drain_queue(GpgpuKmtQueue *q, uint32_t timeout_ms)
 {
 	uint64_t deadline = deadline_ns(timeout_ms);
 	GpgpuKmtStatus status;
 
-	if (!q)
-		return GPGPU_KMT_INVALID_PARAMETER;
 	do {
 		if (__atomic_load_n(q->rptr, __ATOMIC_ACQUIRE) ==
 		    __atomic_load_n(q->wptr, __ATOMIC_ACQUIRE)) {
@@ -200,4 +212,18 @@ GpgpuKmtStatus gpgpuKmtDrainQueue(GpgpuKmtQueue *q, uint32_t timeout_ms)
 		sched_yield();
 	} while (now_ns() < deadline);
 	return GPGPU_KMT_WAIT_TIMEOUT;
+}
+
+GpgpuKmtStatus gpgpuKmtDrainQueue(GpgpuKmtQueue *q, uint32_t timeout_ms)
+{
+	GpgpuKmtStatus status;
+
+	if (!q)
+		return GPGPU_KMT_INVALID_PARAMETER;
+	status = kmt_enter(q->context);
+	if (status != GPGPU_KMT_SUCCESS)
+		return status;
+	status = drain_queue(q, timeout_ms);
+	kmt_leave(q->context);
+	return status;
 }

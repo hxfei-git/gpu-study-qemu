@@ -337,9 +337,13 @@ void gpgpu_device_stop(struct gpgpu_device *dev)
 	mutex_lock(&dev->lock);
 	dev->stopped = stopped;
 	if (stopped) {
-		list_for_each_entry_safe(fpriv, next, &dev->fprivs, node)
-			if (fpriv->orphan)
-				gpgpu_fpriv_destroy(fpriv);
+		/* probe 仍持有一个引用，这里放下会话引用不会释放设备。 */
+		list_for_each_entry_safe(fpriv, next, &dev->fprivs, node) {
+			if (!fpriv->orphan)
+				continue;
+			gpgpu_fpriv_destroy(fpriv);
+			gpgpu_device_put(dev);
+		}
 	} else {
 		dev->dma_uncertain = true;
 		gpgpu_device_get(dev);
