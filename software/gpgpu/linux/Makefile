@@ -14,7 +14,7 @@ PYTHON ?= python3
 IOMMU ?= none
 GPUVM ?= on
 DEVICE_QEMU ?= $(MODULE_DIR)/../../../build/arm64-qemu/qemu-system-riscv64
-.PHONY: all clean kernel prepare module run
+.PHONY: all clean kernel module run
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(MODULE_DIR)" MO="$(BUILD_DIR)" modules
@@ -25,8 +25,8 @@ clean:
 kernel:
 	$(PYTHON) "$(SCRIPTS_DIR)/kernel-build.py"
 
-prepare module:
-	$(PYTHON) "$(SCRIPTS_DIR)/gpgpu_linux.py" $@ --output-dir "$(BUILD_DIR)"
+module:
+	$(PYTHON) "$(SCRIPTS_DIR)/gpgpu_linux.py" module --output-dir "$(BUILD_DIR)"
 
 run:
 	$(PYTHON) "$(SCRIPTS_DIR)/gpgpu_linux.py" run --output-dir "$(BUILD_DIR)" \

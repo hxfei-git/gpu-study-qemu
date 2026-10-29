@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""启动远端 GPGPU，并在 Host 退出或超时后清理两个进程。"""
+"""远端 GPGPU 设备进程：qemu-system-riscv64 -machine gpgpu-cp 加 vfio-user 服务端。
+
+作为模块被 gpgpu_linux.py 使用；也可单独运行，启动远端设备后再执行给定的
+Host 命令（其中 @GPGPU_DEVICE@ 替换为 vfio-user-pci 设备参数）。
+"""
 
 import argparse
 import json
@@ -13,6 +17,8 @@ import time
 
 
 class RemoteDevice:
+    """管理一个远端设备进程及其 unix socket。"""
+
     def __init__(self, binary, log_directory, startup_timeout=15, gpuvm=True):
         self.gpuvm = gpuvm
         self.binary = Path(binary)
@@ -23,6 +29,7 @@ class RemoteDevice:
         self.directory = None
 
     def start(self):
+        """启动进程并等 socket 出现；超时或进程退出时清理并抛出异常。"""
         self.log_directory.mkdir(parents=True, exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(prefix="gpgpu-remote-")
         self.socket = str(Path(self.directory.name) / "gpu.sock")
@@ -58,6 +65,7 @@ class RemoteDevice:
             raise
 
     def device_option(self):
+        """Host QEMU 的 -device 参数（JSON）。"""
         return json.dumps({
             "driver": "vfio-user-pci", "bus": "pcie.0",
             "socket": {"type": "unix", "path": self.socket},
@@ -65,6 +73,7 @@ class RemoteDevice:
         })
 
     def close(self):
+        """终止进程（必要时强制），关闭日志并删除临时目录。"""
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -79,6 +88,7 @@ class RemoteDevice:
 
 
 def main():
+    """独立运行：启动远端设备，执行 Host 命令并等待其退出或超时。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device-qemu", type=Path, required=True)
     parser.add_argument("--log-dir", type=Path,

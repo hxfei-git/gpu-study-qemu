@@ -1,6 +1,8 @@
 #!/usr/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# 开发客体 initramfs 的 init：挂载 ext4 开发盘并切换根目录，
+# 再由盘上的 gpgpu-dev-init（即 guest-dev-init.sh）完成后续初始化。
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 /usr/bin/busybox --install -s /usr/bin

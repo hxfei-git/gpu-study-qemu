@@ -1,6 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# 在开发客体中编译驱动模块：参数为 /mnt/gpgpu-build 下的暂存目录名，
+# 产物 gpgpu_pci.ko 写到该目录，由宿主机校验后替换正式模块。
 set -eu
 
 stage_name=${1:?Expected a staging directory name}

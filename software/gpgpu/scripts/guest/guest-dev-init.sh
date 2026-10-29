@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# 开发盘上的 init：挂载 9p 共享目录，打印就绪标记，在串口上提供 shell。
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 set -eu
 
