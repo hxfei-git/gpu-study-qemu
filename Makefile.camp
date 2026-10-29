@@ -14,6 +14,8 @@ MAKEFLAGS += -rR
 # Paths
 SRC_DIR   := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR := $(SRC_DIR)/build
+# GPGPU 测试使用的 aarch64 Host 与 riscv64 远端 CP 构建目录。
+GPGPU_BUILD_DIR ?= $(BUILD_DIR)/arm64-qemu
 
 # RISC-V cross compiler (for TCG testcases)
 CROSS_PREFIX ?= riscv64-unknown-elf-
@@ -53,6 +55,7 @@ help:
 	@echo "  test               Run all experiment tests"
 	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
 	@echo "  test-soc           Run SoC experiment tests (QTest)"
+	@echo "  test-gpgpu-qtest   运行 GPGPU 寄存器与 RV64 CP 队列 QTest"
 	@echo "  test-gpgpu-stack   运行 GPUVM 开／关下的三个计算示例"
 	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
 	@echo "  test-rust-unit     Run Rust native unit tests only"
@@ -128,6 +131,27 @@ test-soc: build
 	echo "$$passed" > $(BUILD_DIR)/soc-result.log; \
 	echo "--- SoC experiment: $$passed/$$total tests passed ---"; \
 	[ "$$passed" -eq "$$total" ]
+
+# GPGPU QTest：寄存器级用例 6 项，双进程 CP 队列用例 5 项。
+# TAP 输出须全部为 ok 且数量一致；评分脚本可能在有失败项时仍返回成功。
+GPGPU_QTEST_LOG := $(BUILD_DIR)/gpgpu-qtest.log
+
+.PHONY: test-gpgpu-qtest
+test-gpgpu-qtest:
+	$(MAKE) -C software/gpgpu/firmware
+	ninja -C "$(GPGPU_BUILD_DIR)" -j$(JOBS) qemu-system-aarch64 qemu-system-riscv64 \
+		tests/qtest/gpgpu-regs-test tests/qtest/gpgpu-cp-test
+	{ QTEST_QEMU_BINARY="$(GPGPU_BUILD_DIR)/qemu-system-aarch64" \
+		"$(GPGPU_BUILD_DIR)/tests/qtest/gpgpu-regs-test" --tap; \
+	  QTEST_QEMU_BINARY="$(GPGPU_BUILD_DIR)/qemu-system-aarch64" \
+		QTEST_GPGPU_REMOTE_BINARY="$(GPGPU_BUILD_DIR)/qemu-system-riscv64" \
+		QTEST_GPGPU_REMOTE_LOG_DIR="$(BUILD_DIR)/gpgpu-qtest-logs" \
+		QTEST_GPGPU_FIRMWARE="$(BUILD_DIR)/gpgpu-firmware/gpgpu-cp.bin" \
+		"$(GPGPU_BUILD_DIR)/tests/qtest/gpgpu-cp-test" --tap; } \
+		2>&1 | tee "$(GPGPU_QTEST_LOG)"
+	@test "$$(grep -c '^ok ' "$(GPGPU_QTEST_LOG)")" = 11
+	@! grep -Eq '^not ok |# SKIP' "$(GPGPU_QTEST_LOG)"
+	@echo "--- GPGPU QTest: 11/11 passed ---"
 
 # 核心计算固定使用 A57、1 GiB、IOMMU=none，分别运行 GPUVM 开和关。
 .PHONY: test-gpgpu-stack
