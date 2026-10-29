@@ -34,6 +34,8 @@
 | HSA | Heterogeneous System Architecture | 异构系统架构 |
 | ROCr | ROCm Runtime | ROCm 的异构计算运行时 |
 | HSAKMT | HSA Kernel Mode Thunk | HSA 内核接口封装层；此处仅借鉴接口风格 |
+| KMT | Kernel Mode Thunk | 本仓库 `lib/kmt/` 薄层的简称 |
+| QOM | QEMU Object Model | QEMU 对象模型 |
 | AQL | Architected Queuing Language | HSA 队列包格式 |
 | MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
 | KIQ / HIQ | Kernel Interface Queue / HSA Interface Queue | 内核接口／HSA 接口管理队列 |
@@ -51,6 +53,38 @@
 | VMA | Virtual Memory Area | CPU 进程的虚拟内存映射区域 |
 | CSR | Control and Status Register | 控制与状态寄存器；本实验用于读取启动信息 |
 | SGPR / VGPR | Scalar / Vector General-Purpose Register | 标量／向量通用寄存器；本版仅保存独立启动状态 |
+
+## 0. 代码结构与分层
+
+一次计算从应用一路走到 RV32 线程，依次经过五层代码。每一层只调用下一层公开的接口，所有层共用 `include/gpgpu/` 中的协议头：
+
+```text
+demos/gpgpu-demo.c          准备数据、调用运行时、比较结果
+  │ gpgpu_rt_*()
+lib/rt/                     装载 Kernel、组 AQL 包、准备 Signal、等待完成
+  │ gpgpuKmt*()
+lib/kmt/                    HSAKMT 风格薄层：一个函数基本对应一个 ioctl
+  │ ioctl（include/gpgpu/uapi/gpgpu_drm.h）
+linux/                      DRM 驱动：GEM 对象、页表、管理队列、IH、事件
+  │ BAR0 寄存器、内存中的 MQD/Ring/Signal（include/gpgpu/*.h）
+hw/gpgpu/ + firmware/       QEMU 设备模型与 RV64 CP 固件
+```
+
+协议头按内容拆分：`gpgpu_regs.h` 是 BAR0 寄存器，`gpgpu_cp_map.h` 是 CP 私有地址空间，`gpgpu_queue_abi.h` 是 MQD、管理命令、AQL 包、Kernel 描述对象与 Signal，`gpgpu_ih_abi.h` 是 IH 记录，`gpgpu_vm_abi.h` 是页表项与 GPUVA 布局，`gpgpu_version.h` 是协议版本，`uapi/gpgpu_drm.h` 只描述 ioctl。用户态只包含后三者中的 `uapi/gpgpu_drm.h`、`gpgpu_queue_abi.h` 与 `gpgpu_vm_abi.h`，看不到寄存器。
+
+设备模型 `hw/gpgpu/` 按硬件模块分目录，每个模块只访问自己的状态，跨模块通过对方头文件中的函数：
+
+- `gpgpu.c` 负责 QOM/PCI 组装、全局寄存器和复位顺序；`bar0.c` 把 BAR0 每个 0x100 字节的寄存器组挂成独立子区域，统一检查访问宽度，并提供 CP 本地寄存器窗口。
+- `cp/`：`cp_ctrl` 管理原生 CP 的复位与启动，`cp_window` 是 CP 访问 GPU 地址的 64 KiB 窗口，另有 `hqd` 与 `doorbell`。
+- `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv32` 是解释器，`lane_mem` 负责取指与 LW/SW。
+- `mem/`：`vram`、`phys`（GPU 物理地址到 VRAM 或 Outbound 的路由）、`gpuvm`（用户地址翻译与故障记录）、`dma`。
+- `irq/`：`irq` 是中断锁存与 PCI 通知，`ih` 是通知记录 Ring。
+
+CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` 负责取包与回收，`mgmt.c` 处理管理命令，`aql.c` 处理派发包，`ih.c` 负责通知与错误，`mem.c` 经访存窗口读写 GPU 地址并恢复访存异常。
+
+Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
+
+协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](PROTOCOL_V3.md)。
 
 ## 1. 应用提交与统一访存
 
@@ -76,7 +110,7 @@ CP 用户访问 / RV32 取指与数据访问
 
 **[DESIGN]** GPU 物理空间连续覆盖 32 位地址：`[0, vram_size)` 属于 VRAM，`[vram_size, 0x1_0000_0000)` 属于 Outbound。以 64 MiB VRAM 为例，Outbound 从 `0x0400_0000` 开始，长度为 `0xfc00_0000`。Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0x4500_0000`；IOVA 0 对应 `0x0400_0000`，允许正常使用。
 
-驱动在启动 CP 前写入 BAR0 `0x0b00` 的窗口配置并读取确认状态。窗口由整个设备共用，队列运行期间不重配。DMA 分配统一采用 31 位 mask，保留原始 DMA 地址供 DMA API 释放和映射，转换后的 GPU 物理地址写入设备协议。Host BO 仍逐对象使用 `dma_alloc_coherent()`。
+Outbound 布局由设备固定，BAR0 `0x0b00` 起的布局寄存器只读；驱动在启动 CP 前读回核对，再写 `OUTBOUND_CONTROL` 打开窗口并读取确认状态。窗口由整个设备共用，队列运行期间不重配。DMA 分配统一采用 31 位 mask，保留原始 DMA 地址供 DMA API 释放和映射，转换后的 GPU 物理地址写入设备协议。Host BO 仍逐对象使用 `dma_alloc_coherent()`。
 
 Outbound 只决定访问路由。Host 存储或 IOMMU 映射不存在时访问仍会失败。SMMUv3 功能保留；开启后，PCIe DMA 再由系统 IOMMU 将 IOVA 翻译成 Host 物理地址。
 
@@ -119,15 +153,15 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 `csrr` 汇编为 `CSRRS rd, csr, x0`。执行器仅接受此只读形式；`rd=x0` 也先检查 CSR 是否有效。未知 CSR、写入及其他未支持形式均返回指令错误。汇编器接受数字与 `.equ` 常量，并检查 CSR 编号范围。
 
-`a0` 直接保存 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数读取按普通内存处理。16 字节 Kernel 描述符在偏移 `0x0c` 保存 `kernel_abi_version=2`，旧值 0 和其他版本被拒绝；AQL 包仍为 64 字节。设备／固件队列协议、DRM 和 GPUVM 编码均为版本 2，组件必须一起更新。
+`a0` 直接保存 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数读取按普通内存处理。16 字节 Kernel 描述符在偏移 `0x0c` 保存 `kernel_abi_version=3`，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 3，组件必须一起更新。
 
 ## 4. 公共库与三个计算示例
 
-`GpgpuKmtMemory` 提供 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，应用不再选择 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemoryEx()` 先创建整对象再绑定；代码指定读与执行权限，普通数据指定读写权限。参数中写入 32 位地址前须检查范围。
+`GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。参数中写入 32 位地址前须检查范围，运行时用 `gpgpu_rt_arg_address()` 完成这一检查。
 
-库中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` 和 `gpgpuKmtDrainQueue()` 分别负责槽位预留、Header 与 Doorbell 发布、Signal 与事件等待、排空。默认等待先主动检查约 200 μs，再进入事件等待，唤醒后复查 Signal。
+KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` 和 `gpgpuKmtDrainQueue()` 分别负责槽位预留、Header 与 Doorbell 发布、Signal 与事件等待、排空。运行时 `gpgpu_rt_dispatch()` 按顺序调用它们完成一次派发。默认等待先主动检查约 200 μs，再进入事件等待，唤醒后复查 Signal。
 
-`gpgpu-demo` 链接 `libgpgpu-kmt.a`，固定将代码、描述符和计算数组放在 VRAM；参数、Ring、进度和 Signal 放在 Host BO，经 Outbound 访问。用于 COPY 的 Host BO 也在 Queue 创建前准备。三个例子保持原输入和比较规则：
+`gpgpu-demo` 链接 `libgpgpu.a`，经运行时把代码、描述符和计算数组放在 VRAM；参数、Ring、进度和 Signal 放在 Host BO，经 Outbound 访问。用于 COPY 的 Host BO 也在 Queue 创建前准备。三个例子保持原输入和比较规则：
 
 - 向量加法比较 17,003 个结果，Grid 为 266×1×1，Block 为 64×1×1。
 - 矩阵乘法计算 19×17 · 17×23，比较 437 个结果，Grid 为 3×3×1，Block 为 8×8×1。
@@ -150,7 +184,18 @@ python3 software/gpgpu/scripts/kernel-build.py --help
 make -f Makefile.camp test-gpgpu-stack
 ```
 
-核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。两种状态的日志分别保存在 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`：`compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列。没有新增 CSR、Outbound 或生命周期专项验收，也不运行旧 QTest、旧 Runtime 或历史组合回归。
+核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。两种状态的日志分别保存在 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`：`compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列；两种状态都通过后另写 `core/summary.json`。
+
+设备与固件另有一组不需要 Linux 客体的回归：
+
+```sh
+# 寄存器级 6 项（进程内设备）与 RV64 CP 队列 5 项（双进程），按 TAP 核对 11/11
+make -f Makefile.camp test-gpgpu-qtest
+# RV32 教学汇编器的编码回归
+make -C software/gpgpu check
+```
+
+以下为协议版本 2 时的运行记录；版本 3 重构后尚未在本文记录新的运行结果。
 
 2026-10-28 已完成版本 2 的全栈构建与核心计算。GPUVM 开启和关闭均通过向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513；每种状态比较 17,953 个结果，客体退出码均为 0。两次运行的驱动与示例散列一致，客体日志未出现内核异常。
 

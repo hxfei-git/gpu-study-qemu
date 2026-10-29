@@ -8,7 +8,7 @@ QEMU Camp 2026 包含 RISC-V CPU、SoC、GPGPU 和 Rust 实验。
 GPGPU 实现在 `hw/gpgpu/`，Rust 设备实现在 `rust/hw/`。
 
 实验测试位于 `tests/gevico/tcg/` 和 `tests/gevico/qtest/`；
-GPGPU 测试位于 `tests/qtest/gpgpu-test.c`。
+GPGPU 测试位于 `tests/qtest/gpgpu-regs-test.c` 与 `tests/qtest/gpgpu-cp-test.c`。
 其他测试位于 `tests/unit/` 和 `tests/functional/`。
 构建与内部实现说明见 `README.md`、`README_zh.md` 和 `docs/devel/`。
 固件位于 `pc-bios/`，构建产物统一放在 `build/`。
@@ -22,7 +22,7 @@ RISC-V 裸机编译器 `riscv64-unknown-elf-gcc`、Rust 和 `bindgen-cli`。
 - `make -f Makefile.camp build JOBS=4`：使用四个并行任务编译。
 - `make -f Makefile.camp test-cpu`：通过 TCG 运行指令测试。
 - `make -f Makefile.camp test-soc`：运行 G233 外设 QTest。
-- `make -f Makefile.camp test-gpgpu`：运行 GPGPU QOS 子测试。
+- `make -f Makefile.camp test-gpgpu-qtest`：运行 GPGPU 寄存器与 CP 队列 QTest。
 - `make -f Makefile.camp test-rust`：运行 Rust 单元和设备测试。
 - `make -f Makefile.camp test`：运行全部实验测试。
 - `build/qemu-system-riscv64 -machine help`：列出可用机器类型。
@@ -112,7 +112,7 @@ HQD、8 字节 Doorbell、IH、分段执行器及状态确认均已接入。
 设备卸载 1/1，以及单／双进程与 `none/smmuv3` 四种同步组合回归。
 每种同步组合包含装卸载 5/5、三个示例的 17,953 个输出值、运行时检查
 68/68 和卸载重载 2/2。日志位置与复现入口见
-[软件栈说明](software/gpgpu/README.md#第二阶段本轮验证状态)。
+[软件栈说明](software/gpgpu/README.md#62-第二阶段验证状态历史)。
 
 同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
 MQD 及相关引用。本轮已修复，并通过三个独立注入场景核对异常保留和设备停止后
@@ -123,10 +123,12 @@ MQD 及相关引用。本轮已修复，并通过三个独立注入场景核对�
 `hxfei-qemu` 保留早期开发历史。软件栈位于 `software/gpgpu/`；
 修改接口前阅读其中的 `README.md` 和 `WORK_ITEMS.md`。
 设备、固件、驱动与用户库共用的协议头集中在 `include/gpgpu/`：寄存器为
-`gpgpu_regs.h`，内存对象为 `gpgpu_queue_abi.h`，DRM 接口为 `uapi/gpgpu_drm.h`。
-HSAKMT 风格库位于 `hsakmt/`。模块参数 `queue_mode=0/1/2` 选择互斥的
-同步、物理队列和 GPUVM 模式；前两种保留 `/dev/gpgpu0`，第三种使用 DRM render
-node，设备须以 `-global gpgpu.gpuvm=on` 启动。
+`gpgpu_regs.h`，内存对象为 `gpgpu_queue_abi.h`，DRM 接口为 `uapi/gpgpu_drm.h`；
+协议当前为版本 3，与版本 2 的差异见 `software/gpgpu/PROTOCOL_V3.md`。
+用户库位于 `lib/`：`lib/kmt/` 是 HSAKMT 风格薄层，`lib/rt/` 是装载 Kernel、
+组包并等待的小运行时。驱动只提供 DRM render node，GPUVM 开关由设备属性
+`-global gpgpu.gpuvm=on|off` 决定；旧的 `queue_mode` 参数与 `/dev/gpgpu0`
+已删除。各层代码结构见软件栈 README 第 0 节。
 
 第三阶段已实现 DRM/GEM 固定存储、32 位 GPUVA、三级 4 KiB 页表、两个用户
 VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
@@ -139,10 +141,10 @@ VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
 未知结果保留 3/3，内核无告警。旧队列和四种同步组合也已回归。
 固定实现提交、复现命令和实际日志见[软件栈说明](software/gpgpu/README.md#stage-three-validation)。
 
-运行 `make -f Makefile.camp test-gpgpu-stack` 验证原 ARM64 Linux 软件栈，
-运行 `make -f Makefile.camp test-gpgpu-cp JOBS=4` 验证 CP；
-队列测试与 Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
-运行 `make -C software/gpgpu check-assembler` 验证 RV32 汇编前端。
+运行 `make -f Makefile.camp test-gpgpu-stack` 验证 ARM64 Linux 软件栈，
+运行 `make -f Makefile.camp test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列
+（11 项），运行 `make -C software/gpgpu check` 验证 RV32 汇编器；
+Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
 核对测试数量与日志，不能仅凭评分脚本退出状态判断全部通过。
 
 2026-10-07 的 17,953 个示例输出值、68 项运行时检查及两种架构各 21 项
