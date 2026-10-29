@@ -16,10 +16,10 @@
  *
  * 锁存位决定 INTx 电平，新增或重新使能的事件触发 MSI/MSI-X 消息。
  */
-static void gpgpu_update_irq(GPGPUState *s, GPGPUIrq events)
+static void gpgpu_update_irq(GPGPUState *s, uint32_t events)
 {
 	PCIDevice *pdev = PCI_DEVICE(s);
-	GPGPUIrq pending = s->irq.status & s->irq.enable;
+	uint32_t pending = s->irq.status & s->irq.enable;
 
 	events &= pending;
 	pci_set_irq(pdev, pending && !msix_enabled(pdev) && !msi_enabled(pdev));
@@ -40,7 +40,7 @@ static void gpgpu_update_irq(GPGPUState *s, GPGPUIrq events)
  *
  * 先保存 IRQ_STATUS，再根据使能掩码发送通知。
  */
-void gpgpu_raise_irq(GPGPUState *s, GPGPUIrq events)
+void gpgpu_raise_irq(GPGPUState *s, uint32_t events)
 {
 	s->irq.status |= events;
 	gpgpu_update_irq(s, events);
@@ -72,9 +72,9 @@ void gpgpu_irq_write(GPGPUState *s, hwaddr addr, uint32_t val)
 {
 	switch (addr) {
 	case GPGPU_REG_IRQ_ENABLE: {
-		GPGPUIrq old = s->irq.enable;
+		uint32_t old = s->irq.enable;
 
-		s->irq.enable = val & (GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR | GPGPU_IRQ_IH);
+		s->irq.enable = val & GPGPU_IRQ_ALL;
 		if ((s->irq.enable & GPGPU_IRQ_IH) && gpgpu_ih_pending(s))
 			s->irq.status |= GPGPU_IRQ_IH;
 		gpgpu_update_irq(s, s->irq.enable & ~old);

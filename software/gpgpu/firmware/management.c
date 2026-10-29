@@ -28,7 +28,7 @@ static int cp_mqd_valid(const GpgpuMqd *mqd, u32 kind)
 		!(capacity & (capacity - 1)) && cp_range(mqd->ring_base, capacity, 64) &&
 		cp_range(mqd->rptr_report_addr, 4, 8) && cp_range(mqd->wptr_poll_addr, 4, 8) &&
 		!(db & ~(GPGPU_DOORBELL_ENABLE | GPGPU_DOORBELL_OFFSET_MASK)) && !(offset & 7) &&
-		offset <= GPGPU_QUEUE_DOORBELL_SIZE - 8 &&
+		offset <= GPGPU_DOORBELL_BAR_SIZE - 8 &&
 		mqd->aql_control == (kind == GPGPU_QUEUE_USER_AQL) && !(mqd->saved_rptr >> 32) &&
 		!mqd->saved_error && !mqd->reserved[0] && !mqd->reserved[1] && !mqd->reserved[2];
 }
@@ -66,7 +66,7 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 	GpgpuMqd mqd;
 	u32 slot, begin, end, wptr;
 
-	for (slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++)
+	for (slot = 0; slot < GPGPU_HQD_SLOTS; slot++)
 		if (cp_slots[slot].occupied && cp_slots[slot].mqd == packet->address)
 			return GPGPU_MANAGEMENT_DUPLICATE;
 	begin = packet->queue_kind == GPGPU_QUEUE_HIQ ? 1 : 2;
@@ -80,7 +80,7 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 	cp_access.source = source;
 	cp_access.kind = packet->queue_kind;
 	cp_access.mqd = packet->address;
-	if (!cp_read_object(slot, GPGPU_VM_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_DESCRIPTOR,
+	if (!cp_read_object(slot, GPGPU_CP_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_DESCRIPTOR,
 			    packet->address, &mqd, sizeof(mqd))) {
 		cp_slots[slot].occupied = 0;
 		cp_slots[slot].mqd = 0;
@@ -92,8 +92,8 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 		return GPGPU_MANAGEMENT_INVALID;
 	}
 	if (!cp_read32(slot,
-		       packet->queue_kind == GPGPU_QUEUE_USER_AQL ? GPGPU_VM_DOMAIN_USER :
-								    GPGPU_VM_DOMAIN_MANAGEMENT,
+		       packet->queue_kind == GPGPU_QUEUE_USER_AQL ? GPGPU_CP_DOMAIN_USER :
+								    GPGPU_CP_DOMAIN_MANAGEMENT,
 		       mqd.vmid, GPGPU_QUEUE_ERROR_RING, mqd.wptr_poll_addr, &wptr)) {
 		cp_slots[slot].occupied = 0;
 		cp_slots[slot].mqd = 0;
@@ -114,8 +114,8 @@ static u32 cp_map(u32 source, const GpgpuManagementPacket *packet)
 	cp_hqd_write(slot, GPGPU_HQD_DOORBELL, mqd.doorbell_control);
 	cp_slots[slot].vmid = mqd.vmid;
 	cp_slots[slot].domain = packet->queue_kind == GPGPU_QUEUE_USER_AQL ?
-		GPGPU_VM_DOMAIN_USER :
-		GPGPU_VM_DOMAIN_MANAGEMENT;
+		GPGPU_CP_DOMAIN_USER :
+		GPGPU_CP_DOMAIN_MANAGEMENT;
 	cp_hqd_write(slot, GPGPU_HQD_VMID, mqd.vmid);
 	cp_hqd_write(slot, GPGPU_HQD_AQL, mqd.aql_control);
 	cp_hqd_write(slot, GPGPU_HQD_RPTR, (u32)mqd.saved_rptr);
@@ -168,10 +168,10 @@ static u32 cp_unmap(const GpgpuManagementPacket *packet)
 	 * 本固件等待整个 Dispatch 终态后才调度管理，故没有遗留计算访问。
 	 */
 	cp_fence();
-	if (!cp_write64(slot, GPGPU_VM_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_SAVE,
-			packet->address + 0x28, rptr) ||
-	    !cp_write32(slot, GPGPU_VM_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_SAVE,
-			packet->address + 0x30, error)) {
+	if (!cp_write64(slot, GPGPU_CP_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_SAVE,
+			packet->address + __builtin_offsetof(GpgpuMqd, saved_rptr), rptr) ||
+	    !cp_write32(slot, GPGPU_CP_DOMAIN_MANAGEMENT, 0, GPGPU_QUEUE_ERROR_SAVE,
+			packet->address + __builtin_offsetof(GpgpuMqd, saved_error), error)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SAVE);
 		return GPGPU_MANAGEMENT_MQD_FAULT;
 	}

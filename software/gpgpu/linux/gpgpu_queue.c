@@ -9,10 +9,6 @@
 #include <linux/slab.h>
 #include "gpgpu_queue_drv.h"
 
-/* BAR0 原生 CP 控制寄存器偏移。 */
-#define CP_CTRL 0x0500
-/* BAR0 原生 CP 复位入口寄存器偏移。 */
-#define CP_RESET_VECTOR 0x0504
 /* 管理 Ring 加一页 R/W 存储的总字节数。 */
 #define MANAGEMENT_STORAGE (GPGPU_MGMT_BYTES + PAGE_SIZE)
 
@@ -250,9 +246,9 @@ struct gpgpu_qdev *gpgpu_qdev_create(struct pci_dev *pdev, void __iomem *regs,
 {
 	struct gpgpu_qdev *dev;
 	int ret;
-	if (!dev_is_dma_coherent(&pdev->dev) || readl(regs + CP_CTRL) != 3 ||
+	if (!dev_is_dma_coherent(&pdev->dev) || readl(regs + GPGPU_REG_CP_CTRL) != (GPGPU_CP_PRESENT | GPGPU_CP_RESET_HOLD) ||
 	    readl(regs + GPGPU_REG_VRAM_SIZE_LO) != GPGPU_FIRMWARE_STACK_TOP ||
-	    PAGE_SIZE > GPGPU_QUEUE_DOORBELL_SIZE / 3)
+	    PAGE_SIZE > GPGPU_DOORBELL_BAR_SIZE / 3)
 		return ERR_PTR(-EOPNOTSUPP);
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
@@ -327,11 +323,11 @@ int gpgpu_qdev_start(struct gpgpu_qdev *dev)
 		release_firmware(fw);
 		return -EINVAL;
 	}
-	writel(1, dev->regs + CP_CTRL);
-	readl(dev->regs + CP_CTRL);
+	writel(GPGPU_CP_RESET_HOLD, dev->regs + GPGPU_REG_CP_CTRL);
+	readl(dev->regs + GPGPU_REG_CP_CTRL);
 	memcpy_toio(dev->vram + GPGPU_FIRMWARE_BASE, fw->data, fw->size);
 	release_firmware(fw);
-	writel(GPGPU_FIRMWARE_BASE, dev->regs + CP_RESET_VECTOR);
+	writel(GPGPU_FIRMWARE_BASE, dev->regs + GPGPU_REG_CP_RESET_VECTOR);
 	/* 窗口在激活任何 HQD 前配置，两种访存模式共用同一物理布局。 */
 	writel(dev->vram_size, dev->regs + GPGPU_REG_OUTBOUND_GPU_BASE);
 	gpgpu_qwrite64(dev, GPGPU_REG_OUTBOUND_SIZE_LO, (1ULL << 32) - dev->vram_size);
@@ -362,11 +358,11 @@ int gpgpu_qdev_start(struct gpgpu_qdev *dev)
 	HQD_WRITE(GPGPU_HQD_ACTIVE, 1);
 	readl(dev->regs + GPGPU_REG_HQD_WINDOW + GPGPU_HQD_ACTIVE);
 #undef HQD_WRITE
-	writel(GPGPU_Q_IRQ_ALL, dev->regs + GPGPU_REG_IRQ_ENABLE);
+	writel(GPGPU_IRQ_ALL, dev->regs + GPGPU_REG_IRQ_ENABLE);
 	/* 固件、IH 和 KIQ 配置必须先于解除 CP 复位完成。 */
 	wmb();
 	dev->started = true;
-	writel(0, dev->regs + CP_CTRL);
+	writel(0, dev->regs + GPGPU_REG_CP_CTRL);
 	mutex_lock(&dev->lock);
 	ret = management_submit(dev, 0, GPGPU_MAP_QUEUES, GPGPU_QUEUE_HIQ,
 				dev->management[1].mqd_address, &status, &published);
@@ -393,19 +389,19 @@ void gpgpu_qdev_stop(struct gpgpu_qdev *dev)
 
 	mutex_lock(&dev->lock);
 	WRITE_ONCE(dev->present, false);
-	gpgpu_events_fault(dev, NULL, GPGPU_QUEUE_ERR_FIRMWARE);
+	gpgpu_events_fault(dev, NULL, GPGPU_ERR_FIRMWARE);
 	mutex_unlock(&dev->lock);
 	mutex_lock(&dev->management_lock);
 	mutex_lock(&dev->dma_lock);
 	writel(0, dev->regs + GPGPU_REG_IRQ_ENABLE);
 	/* 先停止 CP 发出新请求，再等待跨进程物理访问结束并确认整体复位。 */
-	writel(1, dev->regs + CP_CTRL);
-	readl(dev->regs + CP_CTRL);
+	writel(GPGPU_CP_RESET_HOLD, dev->regs + GPGPU_REG_CP_CTRL);
+	readl(dev->regs + GPGPU_REG_CP_CTRL);
 	deadline = jiffies + msecs_to_jiffies(GPGPU_Q_TIMEOUT_MS);
 	do {
 		if (!(readl(dev->regs + GPGPU_REG_OUTBOUND_STATUS) & GPGPU_OUTBOUND_BUSY)) {
 			writel(GPGPU_CTRL_RESET, dev->regs + GPGPU_REG_GLOBAL_CTRL);
-			stopped = (readl(dev->regs + CP_CTRL) & 1) &&
+			stopped = (readl(dev->regs + GPGPU_REG_CP_CTRL) & GPGPU_CP_RESET_HOLD) &&
 				!readl(dev->regs + GPGPU_REG_GLOBAL_CTRL) &&
 				!readl(dev->regs + GPGPU_REG_OUTBOUND_CONTROL) &&
 				!(readl(dev->regs + GPGPU_REG_OUTBOUND_STATUS) & GPGPU_OUTBOUND_BUSY);
@@ -621,9 +617,9 @@ int gpgpu_queue_create(struct gpgpu_qclient *c, struct gpgpu_queue_create *r)
 		return -ENOSPC;
 	if (!c->db_page) {
 		unsigned int page =
-			find_first_zero_bit(&dev->db_pages, GPGPU_QUEUE_DOORBELL_SIZE / PAGE_SIZE);
+			find_first_zero_bit(&dev->db_pages, GPGPU_DOORBELL_BAR_SIZE / PAGE_SIZE);
 
-		if (page >= GPGPU_QUEUE_DOORBELL_SIZE / PAGE_SIZE)
+		if (page >= GPGPU_DOORBELL_BAR_SIZE / PAGE_SIZE)
 			return -ENOSPC;
 		set_bit(page, &dev->db_pages);
 		c->db_page = page;

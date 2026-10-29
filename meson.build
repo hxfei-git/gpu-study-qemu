@@ -769,6 +769,9 @@ add_project_arguments('-iquote', '.',
                       '-iquote', meson.current_source_dir(),
                       '-iquote', meson.current_source_dir() / 'include',
                       language: all_languages)
+# GPGPU 设备、固件、驱动与用户库共用的协议头，以 "gpgpu/..." 形式包含。
+add_project_arguments('-iquote', meson.current_source_dir() / 'software/gpgpu/include',
+                      language: all_languages)
 
 # If a host-specific include directory exists, list that first...
 host_include = meson.current_source_dir() / 'host/include/'

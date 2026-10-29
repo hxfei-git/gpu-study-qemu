@@ -36,7 +36,7 @@ static void regs_start(RegsTest *t, bool gpuvm)
 	t->qts = qtest_initf("-machine virt -cpu cortex-a57 -m 512M -nodefaults "
 			     "-device gpgpu,gpuvm=%s", gpuvm ? "on" : "off");
 	qpci_init_generic(&t->bus, t->qts, NULL, false);
-	qpci_device_foreach(&t->bus.bus, GPGPU_TEST_VENDOR, GPGPU_TEST_DEVICE, save_device,
+	qpci_device_foreach(&t->bus.bus, GPGPU_VENDOR_ID, GPGPU_DEVICE_ID, save_device,
 			    &t->dev);
 	g_assert_nonnull(t->dev);
 	qpci_device_enable(t->dev);
@@ -113,7 +113,7 @@ static void test_access_rules(void)
 
 	/* 3. 非法选槽保留原选择。 */
 	wr(&t, GPGPU_REG_HQD_SELECT, 2);
-	wr(&t, GPGPU_REG_HQD_SELECT, GPGPU_QUEUE_SLOTS);
+	wr(&t, GPGPU_REG_HQD_SELECT, GPGPU_HQD_SLOTS);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_HQD_SELECT), ==, 2);
 

@@ -7,15 +7,6 @@
 #include "exec/hwaddr.h"
 #include "qemu/typedefs.h"
 
-/* 设备暴露的 MSI-X 向量总数。 */
-#define GPGPU_MSIX_VECTORS 4
-/* 向量 0 保留，计算完成统一经 IH 向量通知。 */
-/* DMA 完成使用的 MSI-X 向量号。 */
-#define GPGPU_MSIX_VEC_DMA 1
-/* 设备错误使用的 MSI-X 向量号。 */
-#define GPGPU_MSIX_VEC_ERROR 2
-/* IH Ring 非空通知使用的 MSI-X 向量号。 */
-#define GPGPU_MSIX_VEC_IH 3
 
 /**
  * gpgpu_irq_read() - 读取中断掩码或锁存状态
@@ -39,7 +30,7 @@ void gpgpu_irq_write(GPGPUState *s, hwaddr addr, uint32_t val);
  * @s: 设备实例；调用期间须保持设备存活。
  * @events: 可组合的设备事件位。
  */
-void gpgpu_raise_irq(GPGPUState *s, GPGPUIrq events);
+void gpgpu_raise_irq(GPGPUState *s, uint32_t events);
 
 /**
  * gpgpu_irq_init() - 建立 PCI 中断能力
@@ -74,8 +65,8 @@ void gpgpu_irq_clear(GPGPUState *s);
  * @status: 待确认的设备事件位。
  */
 typedef struct GPGPUIRQState {
-	GPGPUIrq enable;
-	GPGPUIrq status;
+	uint32_t enable;
+	uint32_t status;
 } GPGPUIRQState;
 
 #endif /* HW_INTERRUPT_GPGPU_IRQ_H */

@@ -12,9 +12,8 @@
 #include <linux/pci.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
-#include "gpgpu_regs.h"
-#include "gpgpu_queue.h"
-#include "gpgpu_drm.h"
+#include "gpgpu/gpgpu_protocol.h"
+#include "gpgpu/uapi/gpgpu_drm.h"
 #if IS_REACHABLE(CONFIG_DRM)
 #include <drm/drm_gem.h>
 #endif
@@ -25,8 +24,6 @@ struct drm_file;
 #define GPGPU_Q_TIMEOUT_MS 5000U
 /* GPUVM 的 Doorbell 令牌低于 GEM 的 4 GiB 偏移起点。 */
 #define GPGPU_VM_DB_MMAP_PAGE 0x10000UL
-/* 队列模式使用的四类中断位掩码。 */
-#define GPGPU_Q_IRQ_ALL 15U
 /* 驱动分配的 IH Ring 字节容量。 */
 #define GPGPU_IH_BYTES 4096U
 /* 每条管理 Ring 的字节容量，不含附加进度页。 */

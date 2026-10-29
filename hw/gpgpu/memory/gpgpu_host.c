@@ -6,7 +6,6 @@
 #include "hw/remote/vfio-user-obj.h"
 #include "hw/pci/pci_device.h"
 #include "qemu/bitops.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 
 bool gpgpu_phys_contains(GPGPUState *s, uint64_t address, uint64_t length)
 {
@@ -56,7 +55,7 @@ static bool outbound_busy(GPGPUState *s)
 	    s->dispatch.status == GPGPU_DISPATCH_BUSY || s->dma.status == GPGPU_DMA_BUSY ||
 	    (s->ih.status & GPGPU_IH_BUSY))
 		return true;
-	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++)
+	for (unsigned int slot = 0; slot < GPGPU_HQD_SLOTS; slot++)
 		if (gpgpu_hqd_active(s, slot))
 			return true;
 	return false;

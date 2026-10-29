@@ -19,7 +19,7 @@ $(BUILD_DIR):
 	mkdir -p $@
 $(BUILD_DIR)/%.h $(BUILD_DIR)/%.bin &: kernels/%.S kernels/gpgpu_kernel.inc kernels/assemble.py | $(BUILD_DIR)
 	$(PYTHON) kernels/assemble.py $< --bin $(BUILD_DIR)/$*.bin --header $(BUILD_DIR)/$*.h --symbol $*_code
-$(BUILD_DIR)/kmt-%.o: hsakmt/%.c hsakmt/gpgpu_kmt.h hsakmt/internal.h include/gpgpu_queue.h include/gpgpu_vm.h include/gpgpu_drm.h | $(BUILD_DIR)
+$(BUILD_DIR)/kmt-%.o: hsakmt/%.c hsakmt/gpgpu_kmt.h hsakmt/internal.h $(wildcard include/gpgpu/*.h include/gpgpu/uapi/*.h) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 $(BUILD_DIR)/libgpgpu-kmt.a: $(KMT_OBJECTS)
 	$(AR) rcs $@ $^

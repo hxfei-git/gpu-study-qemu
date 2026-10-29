@@ -4,7 +4,6 @@
 #include "gpgpu_vram.h"
 #include "gpgpu_host.h"
 #include "hw/gpgpu/cp/gpgpu_hqd.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 
 #include "hw/gpgpu/gpgpu_internal.h"
 
@@ -12,7 +11,7 @@
 bool gpgpu_vm_fail(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t address, uint32_t access,
 		   uint32_t phase, uint32_t reason)
 {
-	if (slot < GPGPU_QUEUE_SLOTS && !s->vm.fault[slot].reason) {
+	if (slot < GPGPU_HQD_SLOTS && !s->vm.fault[slot].reason) {
 		s->vm.fault[slot] = (GPGPUVMFault) {
 			.address = address,
 			.reason = reason,
@@ -241,7 +240,7 @@ void gpgpu_vm_write(GPGPUState *s, hwaddr addr, uint32_t value)
 		}
 		goto invalid;
 	}
-	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++) {
+	for (unsigned int slot = 0; slot < GPGPU_HQD_SLOTS; slot++) {
 		if (addr == GPGPU_REG_VM_FAULT(slot) + GPGPU_VM_FAULT_CLEAR && value == 1 &&
 		    !gpgpu_hqd_active(s, slot)) {
 			memset(&s->vm.fault[slot], 0, sizeof(s->vm.fault[slot]));

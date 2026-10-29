@@ -3,7 +3,6 @@
 #include "gpgpu_hqd.h"
 #include "gpgpu_cp.h"
 #include "hw/gpgpu/memory/gpgpu_vm.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 #include "hw/gpgpu/gpgpu_internal.h"
 
 /*
@@ -79,7 +78,7 @@ static bool hqd_complete(uint32_t *hqd)
  */
 uint32_t gpgpu_hqd_read(GPGPUState *s, unsigned int slot, hwaddr addr, unsigned int size)
 {
-	if (slot >= GPGPU_QUEUE_SLOTS || size != 4 || (addr & 3)) {
+	if (slot >= GPGPU_HQD_SLOTS || size != 4 || (addr & 3)) {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return 0;
 	}
@@ -97,7 +96,7 @@ void gpgpu_hqd_write(GPGPUState *s, unsigned int slot, hwaddr addr, uint32_t val
 	uint32_t *hqd, old;
 	bool valid = true;
 
-	if (slot >= GPGPU_QUEUE_SLOTS || size != 4 || (addr & 3) || !hqd_field(addr))
+	if (slot >= GPGPU_HQD_SLOTS || size != 4 || (addr & 3) || !hqd_field(addr))
 		goto invalid;
 	hqd = s->hqd.slots[slot];
 	old = hqd[addr / 4];
@@ -201,7 +200,7 @@ unsigned int gpgpu_hqd_selected(GPGPUState *s)
 
 void gpgpu_hqd_select(GPGPUState *s, uint32_t slot)
 {
-	if (slot < GPGPU_QUEUE_SLOTS)
+	if (slot < GPGPU_HQD_SLOTS)
 		s->hqd.select = slot;
 	else
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
@@ -209,7 +208,7 @@ void gpgpu_hqd_select(GPGPUState *s, uint32_t slot)
 
 bool gpgpu_hqd_active(GPGPUState *s, unsigned int slot)
 {
-	return slot < GPGPU_QUEUE_SLOTS && s->hqd.slots[slot][GPGPU_HQD_ACTIVE / 4];
+	return slot < GPGPU_HQD_SLOTS && s->hqd.slots[slot][GPGPU_HQD_ACTIVE / 4];
 }
 
 bool gpgpu_hqd_binding_valid(GPGPUState *s, unsigned int slot, unsigned int vmid)
@@ -220,7 +219,7 @@ bool gpgpu_hqd_binding_valid(GPGPUState *s, unsigned int slot, unsigned int vmid
 
 bool gpgpu_hqd_vmid_active(GPGPUState *s, unsigned int vmid)
 {
-	for (unsigned int slot = 2; slot < GPGPU_QUEUE_SLOTS; slot++)
+	for (unsigned int slot = 2; slot < GPGPU_HQD_SLOTS; slot++)
 		if (gpgpu_hqd_binding_valid(s, slot, vmid))
 			return true;
 	return false;
@@ -228,7 +227,7 @@ bool gpgpu_hqd_vmid_active(GPGPUState *s, unsigned int vmid)
 
 void gpgpu_hqd_notify(GPGPUState *s, hwaddr offset)
 {
-	for (unsigned int slot = 0; slot < GPGPU_QUEUE_SLOTS; slot++) {
+	for (unsigned int slot = 0; slot < GPGPU_HQD_SLOTS; slot++) {
 		uint32_t control = s->hqd.slots[slot][GPGPU_HQD_DOORBELL / 4];
 
 		if (gpgpu_hqd_active(s, slot) && (control & GPGPU_DOORBELL_ENABLE) &&

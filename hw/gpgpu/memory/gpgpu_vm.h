@@ -5,7 +5,7 @@
 
 #include "hw/gpgpu/gpgpu.h"
 #include "exec/hwaddr.h"
-#include "software/gpgpu/include/gpgpu_vm.h"
+#include "gpgpu/gpgpu_protocol.h"
 
 /**
  * struct GPGPUVMContext - GPUVM 管理的一份地址空间上下文

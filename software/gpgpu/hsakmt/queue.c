@@ -29,7 +29,7 @@ GpgpuKmtStatus gpgpuKmtCreateQueue(GpgpuKmtContext *context, GpgpuKmtMemory *rin
 	}
 	memset(queue, 0, sizeof(*queue));
 	request = (struct gpgpu_queue_create) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.ring_handle = ring->handle,
 		.progress_handle = progress->handle,
 		.ring_offset = ring_offset,
@@ -106,7 +106,7 @@ GpgpuKmtStatus gpgpuKmtQueryQueue(GpgpuKmtQueue *queue, struct gpgpu_queue_state
 	if (!queue || !queue->context || !state)
 		return GPGPU_KMT_INVALID_PARAMETER;
 	*state = (struct gpgpu_queue_state) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.queue_id = queue->id,
 	};
 	return gpgpu_kmt_ioctl(queue->context, GPGPU_DRM_QUEUE_QUERY, state);
@@ -130,7 +130,7 @@ GpgpuKmtStatus gpgpuKmtDestroyQueue(GpgpuKmtQueue *queue)
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 	request = (struct gpgpu_queue_state) {
-		.version = GPGPU_QABI_VERSION,
+		.version = GPGPU_DRM_VERSION,
 		.queue_id = queue->id,
 	};
 	if (gpgpu_kmt_raw_ioctl(context, GPGPU_DRM_QUEUE_DESTROY, &request) < 0) {

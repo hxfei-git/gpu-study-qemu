@@ -217,8 +217,8 @@ int gpgpu_memory_copy(struct gpgpu_qclient *client, struct gpgpu_memory_copy *r)
 	}
 	spin_lock_irqsave(&dev->irq_lock, flags);
 	/* 不清 IH、队列错误或其他请求状态。 */
-	writel(GPGPU_IRQ_DMA, dev->regs + GPGPU_REG_IRQ_ACK);
-	writel(1U << 3, dev->regs + GPGPU_REG_ERROR_STATUS);
+	writel(GPGPU_IRQ_DMA_DONE, dev->regs + GPGPU_REG_IRQ_ACK);
+	writel(GPGPU_ERR_DMA_FAULT, dev->regs + GPGPU_REG_ERROR_STATUS);
 	dev->dma_failed = false;
 	reinit_completion(&dev->dma_done);
 	spin_unlock_irqrestore(&dev->irq_lock, flags);
@@ -228,7 +228,7 @@ int gpgpu_memory_copy(struct gpgpu_qclient *client, struct gpgpu_memory_copy *r)
 	gpgpu_qwrite64(dev, GPGPU_REG_DMA_DST_LO,
 		       d2h ? h->physical_address + r->host_offset : v->offset + r->vram_offset);
 	writel(r->size, dev->regs + GPGPU_REG_DMA_SIZE);
-	writel(GPGPU_DMA_START | GPGPU_DMA_IRQ | (d2h ? GPGPU_DMA_D2H : 0),
+	writel(GPGPU_DMA_START | GPGPU_DMA_IRQ_ENABLE | (d2h ? GPGPU_DMA_DIR_FROM_VRAM : 0),
 	       dev->regs + GPGPU_REG_DMA_CTRL);
 	ret = wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(GPGPU_Q_TIMEOUT_MS)) ?
 		0 :

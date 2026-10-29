@@ -7,8 +7,6 @@
 #include "qemu/osdep.h"
 #include "gpgpu_dispatch.h"
 #include "hw/gpgpu/gpgpu.h"
-#include "hw/gpgpu/gpgpu_regs.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
 #include "qemu/bitops.h"
 #include "qemu/atomic.h"
 #include "qemu/timer.h"
@@ -141,7 +139,7 @@ static bool dispatch_validate(GPGPUState *s, const GPGPUKernelParams *p)
 	    (p->args_size & 3) || p->kernel_args >= GPGPU_VM_ADDRESS_LIMIT ||
 	    p->args_size > GPGPU_VM_ADDRESS_LIMIT - p->kernel_args)
 		return false;
-	if (p->source_slot < 2 || p->source_slot >= GPGPU_QUEUE_SLOTS ||
+	if (p->source_slot < 2 || p->source_slot >= GPGPU_HQD_SLOTS ||
 	    !gpgpu_hqd_binding_valid(s, p->source_slot, p->vmid))
 		return false;
 	if (s->gpuvm && !gpgpu_vm_enabled(s, p->vmid))

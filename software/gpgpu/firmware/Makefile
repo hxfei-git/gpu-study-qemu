@@ -16,7 +16,7 @@ all: $(BUILD_DIR)/gpgpu-cp.bin
 
 $(BUILD_DIR):
 	mkdir -p $@
-$(BUILD_DIR)/%.o: %.c cp.h ../include/gpgpu_queue.h ../include/gpgpu_vm.h $(ROOT)/hw/gpgpu/gpgpu_regs.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.c cp.h $(wildcard ../include/gpgpu/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD_DIR)/start.o: start.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@

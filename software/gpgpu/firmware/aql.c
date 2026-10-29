@@ -48,7 +48,7 @@ static int cp_descriptor(u32 slot, const GpgpuAqlPacket *packet, GpgpuKernelDesc
 	u64 limit = GPGPU_VM_ADDRESS_LIMIT;
 
 	if (!cp_range(packet->kernel_object, sizeof(*desc), 8) ||
-	    !cp_read_object(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid,
+	    !cp_read_object(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid,
 			    GPGPU_QUEUE_ERROR_DESCRIPTOR, packet->kernel_object, desc,
 			    sizeof(*desc)))
 		return 0;
@@ -73,7 +73,7 @@ int cp_aql(u32 slot)
 
 	if (!cp_next_packet(slot, &address, sizeof(packet)))
 		return 0;
-	if (!cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
+	if (!cp_read32(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
 		       address, &packet.full_header)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
@@ -81,7 +81,7 @@ int cp_aql(u32 slot)
 	if ((packet.full_header & 0xff) == GPGPU_AQL_INVALID)
 		return 0;
 	cp_fence();
-	if (!cp_read_object(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
+	if (!cp_read_object(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RING,
 			    address + 4, (char *)&packet + 4, sizeof(packet) - 4)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
@@ -95,16 +95,16 @@ int cp_aql(u32 slot)
 		return 0;
 	}
 	if (!cp_range(packet.completion_signal, sizeof(GpgpuSignal), 8) ||
-	    !cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read64(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal, &value) ||
 	    value != 1 ||
-	    !cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read32(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 8, &event) ||
 	    !event ||
-	    !cp_read32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read32(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 12, &reserved) ||
 	    reserved ||
-	    !cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_read64(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal + 16, &mailbox)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SIGNAL);
 		return 0;
@@ -152,16 +152,16 @@ int cp_aql(u32 slot)
 		return 1;
 	}
 	cp_fence();
-	if (!cp_read64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	if (!cp_read64(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 		       packet.completion_signal, &value) ||
 	    value != 1 ||
-	    !cp_write64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
+	    !cp_write64(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_SIGNAL,
 			packet.completion_signal, value - 1)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_SIGNAL);
 		return 1;
 	}
 	cp_fence();
-	if (!cp_write64(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_MAILBOX,
+	if (!cp_write64(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_MAILBOX,
 			mailbox, event)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_MAILBOX);
 		return 1;
@@ -169,7 +169,7 @@ int cp_aql(u32 slot)
 	cp_fence();
 	if (!cp_ih_submit(slot, GPGPU_IH_SIGNAL_NOTIFY, event))
 		return 1;
-	if (!cp_write32(slot, GPGPU_VM_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE,
+	if (!cp_write32(slot, GPGPU_CP_DOMAIN_USER, cp_slots[slot].vmid, GPGPU_QUEUE_ERROR_RETIRE,
 			address, GPGPU_AQL_INVALID)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RETIRE);
 		return 1;

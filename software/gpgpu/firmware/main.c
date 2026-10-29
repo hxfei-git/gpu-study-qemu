@@ -3,7 +3,7 @@
 
 u32 cp_gpuvm;
 
-CpSlot cp_slots[GPGPU_QUEUE_SLOTS];
+CpSlot cp_slots[GPGPU_HQD_SLOTS];
 volatile u32 cp_stopped;
 static GpgpuIhRecord cp_ih_record __attribute__((aligned(8)));
 
@@ -18,7 +18,7 @@ int cp_ih_submit(u32 slot, u32 type, u32 data)
 
 	cp_ih_record.type = type;
 	cp_ih_record.hqd_slot = slot;
-	cp_ih_record.mqd_addr = slot < GPGPU_QUEUE_SLOTS ? cp_slots[slot].mqd : 0;
+	cp_ih_record.mqd_addr = slot < GPGPU_HQD_SLOTS ? cp_slots[slot].mqd : 0;
 	cp_ih_record.data = data;
 	cp_ih_record.reserved[0] = 0;
 	cp_ih_record.reserved[1] = 0;
@@ -61,7 +61,7 @@ void cp_queue_error(u32 slot, u32 error)
 void cp_fatal(void)
 {
 	cp_stopped = 1;
-	cp_ih_submit(~0u, GPGPU_IH_DEVICE_ERROR, GPGPU_QUEUE_ERR_FIRMWARE);
+	cp_ih_submit(~0u, GPGPU_IH_DEVICE_ERROR, GPGPU_ERR_FIRMWARE);
 	for (;;)
 		__asm__ volatile("wfi");
 }
@@ -147,7 +147,7 @@ void cp_main(void)
 	    cp_hqd_read(0, GPGPU_HQD_ERROR)) {
 		cp_fatal();
 	}
-	for (slot = 1; slot < GPGPU_QUEUE_SLOTS; slot++) {
+	for (slot = 1; slot < GPGPU_HQD_SLOTS; slot++) {
 		if (cp_hqd_read(slot, GPGPU_HQD_ACTIVE) || cp_hqd_read(slot, GPGPU_HQD_MQD_LO) ||
 		    cp_hqd_read(slot, GPGPU_HQD_MQD_HI)) {
 			cp_fatal();

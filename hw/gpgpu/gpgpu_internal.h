@@ -48,9 +48,9 @@ struct GPGPUState {
 	uint32_t warp_size;
 	uint64_t vram_size;
 	bool gpuvm;
-	GPGPUControl global_ctrl;
-	GPGPUStatus global_status;
-	GPGPUError error_status;
+	uint32_t global_ctrl;
+	uint32_t global_status;
+	uint32_t error_status;
 	GPGPUCPState cp;
 	GPGPUHQDState hqd;
 	GPGPUDoorbellState doorbell;

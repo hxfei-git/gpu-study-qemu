@@ -12,7 +12,7 @@
 #include "gpgpu_core.h"
 #include "gpgpu_compute_internal.h"
 #include "gpgpu_isa.h"
-#include "software/gpgpu/include/gpgpu_queue.h"
+#include "gpgpu/gpgpu_protocol.h"
 
 /* 先除后乘检查维度，防止乘法溢出或线程身份超出既有编码范围。 */
 static bool core_set_shape(GPGPUDispatchTask *task)

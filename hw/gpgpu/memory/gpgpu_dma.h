@@ -24,8 +24,8 @@ typedef struct GPGPUDMAState {
 	uint64_t src_addr;
 	uint64_t dst_addr;
 	uint32_t size;
-	GPGPUDMAControl ctrl;
-	GPGPUDMAStatus status;
+	uint32_t ctrl;
+	uint32_t status;
 	QEMUTimer *timer;
 } GPGPUDMAState;
 

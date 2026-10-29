@@ -122,8 +122,8 @@ MQD 及相关引用。本轮已修复，并通过三个独立注入场景核对�
 `hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支，
 `hxfei-qemu` 保留早期开发历史。软件栈位于 `software/gpgpu/`；
 修改接口前阅读其中的 `README.md` 和 `WORK_ITEMS.md`。
-共享队列协议为 `include/gpgpu_queue.h`，旧驱动接口为 `include/gpgpu_uapi.h`；
-GPUVM 编码和 DRM 接口分别为 `include/gpgpu_vm.h`、`include/gpgpu_drm.h`。
+设备、固件、驱动与用户库共用的协议头集中在 `include/gpgpu/`：寄存器为
+`gpgpu_regs.h`，内存对象为 `gpgpu_queue_abi.h`，DRM 接口为 `uapi/gpgpu_drm.h`。
 HSAKMT 风格库位于 `hsakmt/`。模块参数 `queue_mode=0/1/2` 选择互斥的
 同步、物理队列和 GPUVM 模式；前两种保留 `/dev/gpgpu0`，第三种使用 DRM render
 node，设备须以 `-global gpgpu.gpuvm=on` 启动。
