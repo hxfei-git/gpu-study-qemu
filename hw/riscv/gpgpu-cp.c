@@ -12,11 +12,11 @@
 #include "hw/pci/pci_host.h"
 #include "hw/remote/machine.h"
 #include "hw/gpgpu/gpgpu.h"
-#include "hw/gpgpu/gpgpu_mmio.h"
-#include "hw/gpgpu/cp/gpgpu_cp.h"
-#include "hw/gpgpu/cp/gpgpu_cp_window.h"
-#include "hw/gpgpu/cp/gpgpu_hqd.h"
-#include "hw/gpgpu/memory/gpgpu_vram.h"
+#include "hw/gpgpu/bar0.h"
+#include "hw/gpgpu/cp/cp_ctrl.h"
+#include "hw/gpgpu/cp/cp_window.h"
+#include "hw/gpgpu/cp/hqd.h"
+#include "hw/gpgpu/mem/vram.h"
 #include "target/riscv/cpu.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -57,7 +57,7 @@ static void gpgpu_cp_set_state_on_cpu(CPUState *cs, run_on_cpu_data data)
         }
         s->cp.env.resetvec = change->reset_vector;
         resettable_assert_reset(OBJECT(cs), RESET_TYPE_COLD);
-        gpgpu_cp_reset_access(s->gpgpu);
+        gpgpu_cp_on_cpu_reset(s->gpgpu);
         s->reset_asserted = true;
         cs->halted = true;
         /* 暂停取指，防止复位前残留的 pending IRQ 唤醒 CPU。 */
@@ -146,12 +146,12 @@ static void gpgpu_cp_machine_init(MachineState *machine)
     memory_region_init_alias(&s->vram_alias, OBJECT(machine), "gpgpu-cp-vram",
                              gpgpu_vram_region(gpgpu), 0, gpgpu_vram_size(gpgpu));
     memory_region_add_subregion(&s->cp_memory, 0, &s->vram_alias);
-    memory_region_init_io(&s->host_window, OBJECT(machine), &gpgpu_cp_host_ops,
+    memory_region_init_io(&s->host_window, OBJECT(machine), &gpgpu_cp_window_ops,
                           gpgpu, "gpgpu-cp-host-window", GPGPU_CP_WINDOW_SIZE);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_WINDOW_BASE,
                                 &s->host_window);
     memory_region_init_io(&s->host_window_regs, OBJECT(machine),
-                          &gpgpu_cp_host_regs_ops, gpgpu,
+                          &gpgpu_cp_window_regs_ops, gpgpu,
                           "gpgpu-cp-host-window-regs", GPGPU_CP_WINDOW_REGS_SIZE);
     memory_region_add_subregion(&s->cp_memory, GPGPU_CP_WINDOW_REGS,
                                 &s->host_window_regs);
@@ -175,7 +175,7 @@ static void gpgpu_cp_machine_init(MachineState *machine)
                              &error_fatal);
     qdev_realize(DEVICE(&s->cp), NULL, &error_fatal);
     s->vm_state = qemu_add_vm_change_state_handler(gpgpu_cp_vm_state_change, s);
-    gpgpu_attach_cp(gpgpu, gpgpu_cp_set_state, s);
+    gpgpu_cp_attach(gpgpu, gpgpu_cp_set_state, s);
 }
 
 static void gpgpu_cp_machine_instance_finalize(Object *obj)
