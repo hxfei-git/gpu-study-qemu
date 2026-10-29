@@ -1,4 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * RV64 CP 固件：模块间共享的状态与接口
+ *
+ * 固件运行在设备 VRAM 末尾的 4 MiB 保留区，由 Host 驱动装载后释放 CP 复位。
+ * 主循环依次检查三类队列：
+ *
+ *   KIQ（槽 0）  管理命令：映射 / 卸载 HIQ
+ *   HIQ（槽 1）  管理命令：映射 / 卸载用户 AQL 队列
+ *   用户槽 2、3  AQL Kernel Dispatch，两个槽轮流优先
+ *
+ * 文件划分：
+ *   main.c  启动检查与调度循环
+ *   ring.c  按 R/W 取包与回收
+ *   mgmt.c  MAP_QUEUES / UNMAP_QUEUES / WRITE_COMPLETION
+ *   aql.c   派发包检查、提交执行器、完成发布
+ *   ih.c    IH 通知、队列错误与固件致命错误
+ *   mem.c   经 CP 访存窗口读写 GPU 地址，以及访存异常的恢复
+ */
 #ifndef GPGPU_FIRMWARE_CP_H
 #define GPGPU_FIRMWARE_CP_H
 
@@ -13,171 +31,156 @@ typedef gpgpu_q_u64 u64;
 #define RISCV_CAUSE_STORE_ACCESS 7
 
 /**
- * struct CpSlot - 固件私有的 HQD 占用与管理结果记录
- * @mqd: 当前绑定 MQD 的完整 GPU 物理地址；占用解除前不得复用。
- * @domain: 管理对象直接访问物理地址，用户对象按设备模式解释地址。
- * @occupied: 占用标记，ACTIVE 清零不代表该槽可重新分配。
- * @pending: 管理操作已结束，正在等待相邻 WRITE_COMPLETION 回报。
- * @result: 暂存的 GpgpuManagementStatus，由完成命令写入 Host。
- * @vmid: 本对象所属的设备地址空间编号，管理访问为零。
+ * struct CpSlot - 固件私有的槽占用记录
+ * @mqd: 绑定的 MQD GPU 物理地址；占用解除前同一地址不能再次映射。
+ * @occupied: 槽已被占用。ACTIVE 清零（如出错停止）不等于释放，只有正常卸载才清除。
+ * @domain: 本槽队列对象的访问域：管理队列为 GPGPU_CP_DOMAIN_MANAGEMENT，
+ *          用户队列为 GPGPU_CP_DOMAIN_USER。MQD 本身总按管理域访问。
+ * @vmid: 用户队列的 VMID；管理队列为 0。
+ * @pending: 管理槽专用：上一条命令已执行，等待相邻的 WRITE_COMPLETION。
+ * @result: 管理槽专用：暂存的 GpgpuManagementStatus。
  */
 typedef struct CpSlot {
 	u64 mqd;
 	u32 occupied;
-	u32 domain; /* 明确区分管理物理访问与用户访问。 */
-	u32 vmid;   /* 普通队列访问的上下文；MQD 本体显式使用管理域。 */
+	u32 domain;
+	u32 vmid;
 	u32 pending;
 	u32 result;
 } CpSlot;
 
-/**
- * struct CpAccess - 记录 Host 窗口访问归属及最近异常现场
- * @address: 本次访问的 GPU 地址，由 domain 决定是否翻译。
- * @fault_address: 陷阱返回的故障地址，即 mtval。
- * @cause: 最近一次陷阱的 mcause 值。
- * @slot: 当前访问归属的 HQD 槽号。
- * @phase: 访问所在阶段，使用 GpgpuQueueError 编码。
- * @source: 映射请求来自哪个管理槽，0 为 KIQ、1 为 HIQ。
- * @kind: 最近一次映射请求的 GpgpuQueueKind。
- * @mqd: 最近一次映射请求的目标 MQD 物理地址。
- */
-typedef struct CpAccess {
-	u64 address;
-	u64 fault_address;
-	u64 cause;
-	u32 slot;
-	u32 phase;
-	u32 source;
-	u32 kind;
-	u64 mqd;
-} CpAccess;
-
+/* 各槽的占用记录。 */
 extern CpSlot cp_slots[GPGPU_HQD_SLOTS];
-extern volatile CpAccess cp_access;
+/* 全局停止标记：KIQ 故障、IH 故障或固件致命错误后置位，主循环只等待。 */
 extern volatile u32 cp_stopped;
+/* 设备以 gpuvm=on 启动；启动时从 VM_MODE 读取。 */
 extern u32 cp_gpuvm;
 
-/*
- * cp_fence() - 建立 CP 内存与 MMIO 的访问顺序
- *
- * 使用带编译器 memory 约束的 fence iorw，连接输入、提交与完成发布。
- */
+/* ---- 寄存器访问（main.c 之外也会用到的内联函数） ---- */
+
+/* 建立 CP 内存访问与 MMIO 之间的顺序。 */
 static inline void cp_fence(void)
 {
 	__asm__ volatile("fence iorw, iorw" ::: "memory");
 }
 
-/*
- * cp_reg_read() - 读取一个 CP 本地控制寄存器
- *
- * offset 是寄存器窗口内的字节偏移，按完整 32 位访问。
- */
+/* 读 CP 本地寄存器窗口；offset 与 BAR0 偏移相同。 */
 static inline u32 cp_reg_read(u32 offset)
 {
 	return *(volatile u32 *)(unsigned long)(GPGPU_CP_REG_BASE + offset);
 }
 
-/*
- * cp_reg_write() - 写入一个 CP 本地控制寄存器
- *
- * 调用者在配置发布或结果通知边界显式执行 cp_fence。
- */
+/* 写 CP 本地寄存器窗口；发布顺序由调用者用 cp_fence() 保证。 */
 static inline void cp_reg_write(u32 offset, u32 value)
 {
 	*(volatile u32 *)(unsigned long)(GPGPU_CP_REG_BASE + offset) = value;
 }
 
-/*
- * cp_window_write() - 写一个访存窗口配置寄存器
- *
- * offset 为 GPGPU_CP_WINDOW_* 字段偏移；配置在下一次窗口访问前生效。
- */
+/* 写访存窗口配置寄存器；offset 为 GPGPU_CP_WINDOW_* 字段。 */
 static inline void cp_window_write(u32 offset, u32 value)
 {
 	*(volatile u32 *)(unsigned long)(GPGPU_CP_WINDOW_REGS + offset) = value;
 }
 
-/*
- * cp_hqd_read() - 读取指定槽的 HQD 寄存器
- *
- * 按槽号与字节步长计算 CP 本地直接地址，执行一次完整 32 位读取。
- */
-static inline u32 cp_hqd_read(u32 slot, u32 offset)
+static inline u32 cp_hqd_read(u32 slot, u32 field)
 {
 	return *(volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE +
-						offset);
+						field);
 }
 
-/*
- * cp_hqd_write() - 写入指定槽的 HQD 寄存器
- *
- * 通过 CP 本地直接窗口访问，激活与地址发布顺序由调用者用屏障保证。
- */
-static inline void cp_hqd_write(u32 slot, u32 offset, u32 value)
+static inline void cp_hqd_write(u32 slot, u32 field, u32 value)
 {
-	*(volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE + offset) =
+	*(volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE + field) =
 		value;
 }
 
-/*
- * cp_hqd_address() - 读取 HQD 中的完整 GPU 地址
- *
- * 合并低、高两个静态配置寄存器，不用于读取动态 64 位共享值。
- */
-static inline u64 cp_hqd_address(u32 slot, u32 offset)
+/* 读 HQD 中 LO/HI 字段对组成的静态地址；不用于读取动态共享值。 */
+static inline u64 cp_hqd_read64(u32 slot, u32 lo)
 {
-	return cp_hqd_read(slot, offset) | ((u64)cp_hqd_read(slot, offset + 4) << 32);
+	return cp_hqd_read(slot, lo) | (u64)cp_hqd_read(slot, lo + 4) << 32;
 }
 
-/*
- * cp_hqd_set_address() - 向 HQD 写入完整 GPU 地址
- *
- * 分别写低、高 32 位配置，调用者须在激活前完成全部字段。
- */
-static inline void cp_hqd_set_address(u32 slot, u32 offset, u64 address)
+/* 先低后高写入 LO/HI 字段对；只在激活前配置。 */
+static inline void cp_hqd_write64(u32 slot, u32 lo, u64 value)
 {
-	cp_hqd_write(slot, offset, (u32)address);
-	cp_hqd_write(slot, offset + 4, address >> 32);
+	cp_hqd_write(slot, lo, (u32)value);
+	cp_hqd_write(slot, lo + 4, value >> 32);
 }
 
-/*
- * cp_range() - 检查 GPU 对象地址是否可访问
- *
- * 要求非零长度与指定对齐，完整范围必须可由 RV32 地址表达。
- */
-static inline int cp_range(u64 address, u64 size, u32 align)
+/* 地址按 align 对齐、长度非零，且 [addr, addr + size) 在 32 位 GPU 地址空间内。 */
+static inline int cp_range_ok(u64 addr, u64 size, u32 align)
 {
-	return !(address & (align - 1)) && size && address < GPGPU_VM_ADDRESS_LIMIT &&
-		size <= GPGPU_VM_ADDRESS_LIMIT - address;
+	return !(addr & (align - 1)) && size && addr < GPGPU_VM_ADDRESS_LIMIT &&
+		size <= GPGPU_VM_ADDRESS_LIMIT - addr;
 }
 
-/* 从当前指定域 GPU 地址读写一个完整标量；成功返回 1。 */
-/* 从指定域完整读取一个 32 位标量。 */
-int cp_read32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 *value);
-/* 从指定域完整读取一个 64 位标量。 */
-int cp_read64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 *value);
-/* 向指定域完整写入一个 32 位标量。 */
-int cp_write32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u32 value);
-/* 向指定域完整写入一个 64 位标量。 */
-int cp_write64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, u64 value);
-/* 读取初始化后固定的 GPU 对象。 */
-int cp_read_object(u32 slot, u32 domain, u32 vmid, u32 phase, u64 address, void *dest, u32 size);
-/* 通过设备同步发布一条 IH 记录。 */
+/* Ring 容量合法：2 的幂，GPGPU_QUEUE_RING_MIN 到 GPGPU_QUEUE_RING_MAX。 */
+static inline int cp_ring_size_ok(u32 size)
+{
+	return size >= GPGPU_QUEUE_RING_MIN && size <= GPGPU_QUEUE_RING_MAX &&
+		!(size & (size - 1));
+}
+
+/* ---- start.S：恢复型访存 ---- */
+
+/* 成功返回 1；访存故障时 cp_trap() 把 PC 改到 cp_access_failed，返回 0。 */
+int cp_access_load32(unsigned long addr, u32 *value);
+int cp_access_load64(unsigned long addr, u64 *value);
+int cp_access_store32(unsigned long addr, u32 value);
+int cp_access_store64(unsigned long addr, u64 value);
+/* 四条访存指令的地址，以及故障后的恢复点。 */
+extern char cp_fault_load32[], cp_fault_load64[];
+extern char cp_fault_store32[], cp_fault_store64[], cp_access_failed[];
+
+/* ---- mem.c：GPU 地址访问 ---- */
+
+/*
+ * 以下函数经 CP 访存窗口访问一个 GPU 地址，成功返回 1。
+ * domain 为访问域；vmid 与 slot 用于用户域翻译和故障归属；phase 记入故障。
+ * 访问失败（含窗口触发的 access fault）返回 0，已执行的写入不重试。
+ */
+int cp_read32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, u32 *value);
+int cp_read64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, u64 *value);
+int cp_write32(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, u32 value);
+int cp_write64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, u64 value);
+/* 按 32 位分段读取初始化后不再变化的对象；动态字段须用标量接口单独读取。 */
+int cp_read_object(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, void *dest, u32 size);
+
+/* 以 slot 自己的访问域与 VMID 读写（用于 Ring、进度、Signal 等队列对象）。 */
+int cp_queue_read32(u32 slot, u32 phase, u64 addr, u32 *value);
+int cp_queue_read64(u32 slot, u32 phase, u64 addr, u64 *value);
+int cp_queue_write32(u32 slot, u32 phase, u64 addr, u32 value);
+int cp_queue_write64(u32 slot, u32 phase, u64 addr, u64 value);
+int cp_queue_read_object(u32 slot, u32 phase, u64 addr, void *dest, u32 size);
+
+/* 陷阱入口调用：窗口访存故障返回恢复点，其余异常不返回。 */
+u64 cp_trap(u64 cause, u64 epc, u64 tval);
+
+/* ---- ih.c：通知与错误 ---- */
+
+/* 经设备同步发布一条 IH 记录；失败时置 cp_stopped 并返回 0。 */
 int cp_ih_submit(u32 slot, u32 type, u32 data);
-/* 保存指定队列的首次错误并停止取包。 */
+/* 当 IH 通道已故障时置 cp_stopped，返回 1。 */
+int cp_ih_faulted(void);
+/* 停止 slot 取包并记录首次错误；首次出错时发 QUEUE_ERROR。KIQ 出错停止全部调度。 */
 void cp_queue_error(u32 slot, u32 error);
-/* 报告固件不可恢复异常并停机。 */
+/* 报告固件致命错误并停机。 */
 void cp_fatal(void) __attribute__((noreturn));
-/* 处理 RV64 固件异常。 */
-u64 cp_trap(u64 cause, u64 epc, u64 address);
-/* 定位槽内下一待处理包。 */
-int cp_next_packet(u32 slot, u64 *address, u32 packet_size);
-/* 归还一个已经完成处理的 Ring 槽。 */
+
+/* ---- ring.c：取包与回收 ---- */
+
+/* 定位 slot 中下一个待处理包；有包时写入 *addr 并返回 1。 */
+int cp_next_packet(u32 slot, u64 *addr, u32 packet_size);
+/* 推进 R 并写回共享进度；写回失败停止该队列并返回 0。 */
 int cp_retire(u32 slot);
-/* 消费一条 KIQ 或 HIQ 管理命令。 */
+
+/* ---- mgmt.c / aql.c / main.c ---- */
+
+/* 处理 KIQ 或 HIQ 中的一条管理命令。 */
 void cp_management(u32 slot);
-/* 处理一个已发布的用户派发包。 */
+/* 处理用户槽中的一个派发包；本轮做了工作（成功或出错）返回 1。 */
 int cp_aql(u32 slot);
-/* 运行 CP 冷启动与队列调度循环。 */
+/* 启动检查与调度循环。 */
 void cp_main(void) __attribute__((noreturn));
-#endif
+
+#endif /* GPGPU_FIRMWARE_CP_H */

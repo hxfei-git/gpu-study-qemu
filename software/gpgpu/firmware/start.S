@@ -1,8 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * CP 固件入口、异常入口与恢复型访存指令
+ *
+ * 复位向量指向 _start。异常使用独立栈，普通栈本身出错时也能报告致命错误。
+ * cp_access_* 是仅有的几条可以触发并恢复 access fault 的指令，见 mem.c。
+ */
 .option norvc
 .section .text.start,"ax"
 .global _start
-/* 建立普通栈、清零 BSS 并安装异常入口，随后进入不返回的 CP 主循环。 */
+/* 1. 建立栈；2. 清零 BSS；3. 安装异常栈与入口，关闭中断；4. 进入主循环。 */
 _start:
 	la sp, __stack_top
 	la t0, __bss_start
@@ -21,7 +27,10 @@ _start:
 	call cp_main
 	j .
 
-/* 单独异常栈使普通栈访存异常也能留下设备错误；不允许嵌套异常。 */
+/*
+ * 异常入口：换到异常栈，保存调用者保存寄存器，调用 cp_trap(mcause, mepc, mtval)，
+ * 把返回值写入 mepc 后返回。不支持嵌套异常。
+ */
 .align 2
 cp_trap_entry:
 	csrrw sp, mscratch, sp
@@ -67,8 +76,10 @@ cp_trap_entry:
 	csrrw sp, mscratch, sp
 	mret
 
-/* 仅这四条 Host 窗口指令可恢复；其他异常全部停止固件调度。 */
-/* a0 为窗口地址、a1 为输出指针；成功返回 1，访存异常转失败入口。 */
+/*
+ * 恢复型 load：a0 为窗口地址，a1 为输出指针，成功返回 1。
+ * 访存故障时 cp_trap() 把 PC 改到 cp_access_failed，返回 0。
+ */
 .macro load_access name, instruction, store
 .global cp_access_\name, cp_fault_\name
 cp_access_\name:
@@ -80,7 +91,7 @@ cp_fault_\name:
 .endm
 load_access load32, lwu, sw
 load_access load64, ld, sd
-/* a0 为窗口地址、a1 为待写值；只执行一次 store，失败不重试。 */
+/* 恢复型 store：a0 为窗口地址，a1 为待写值；只执行一次，失败不重试。 */
 .macro store_access name, instruction
 .global cp_access_\name, cp_fault_\name
 cp_access_\name:
@@ -92,7 +103,7 @@ cp_fault_\name:
 store_access store32, sw
 store_access store64, sd
 .global cp_access_failed
-/* 陷阱处理器将已知访存故障的 PC 改到这里，以 a0=0 返回调用者。 */
+/* 恢复点：以 a0 = 0 返回访存函数的调用者。 */
 cp_access_failed:
 	li a0, 0
 	ret
