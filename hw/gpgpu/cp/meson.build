@@ -1,6 +1,7 @@
+# 原生 CP 控制、CP 访存窗口、HQD 与 Doorbell。
 system_ss.add(when: 'CONFIG_GPGPU', if_true: files(
-    'gpgpu_cp.c',
-    'gpgpu_cp_window.c',
-    'gpgpu_hqd.c',
-    'gpgpu_doorbell.c',
+    'cp_ctrl.c',
+    'cp_window.c',
+    'hqd.c',
+    'doorbell.c',
 ))
