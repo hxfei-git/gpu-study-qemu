@@ -1,309 +1,213 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <linux/io.h>
+/*
+ * GPGPU 驱动：完成事件
+ *
+ * 每个事件独占会话通知页中的一个 8 字节通知槽。应用把事件编号和通知槽地址
+ * 写进 Signal；任务完成时 CP 依次写 Signal、通知槽、IH 记录。驱动消费 IH
+ * 记录时核对通知槽内容，把事件置为 NOTIFIED，清零通知槽，再唤醒等待者。
+ *
+ * 事件状态只前进不回退：PENDING → NOTIFIED 或 FAILED。等待不消费状态，
+ * 同一任务可以唤醒多个等待者。队列出错或设备停止时，相关的 PENDING 事件
+ * 置为 FAILED 并唤醒。
+ */
 #include <linux/slab.h>
-#include "gpgpu_queue_drv.h"
+#include "gpgpu_drv.h"
 
-/*
- * gpgpu_events_fault() - 向受影响队列及等待者发布失败
- *
- * 调用方持 dev->lock；先保存首次错误与事件状态，再唤醒全部相关等待者。
- */
-void gpgpu_events_fault(struct gpgpu_qdev *dev, struct gpgpu_user_queue *queue, u32 error)
+static struct gpgpu_event *event_lookup(struct gpgpu_fpriv *fpriv, u32 id)
 {
-	struct gpgpu_qclient *c;
-	struct gpgpu_qevent *e;
-	struct gpgpu_user_queue *q;
+	struct gpgpu_event *e;
 
-	list_for_each_entry(c, &dev->clients, node) {
-		list_for_each_entry(q, &c->queues, node) {
-			if (!q->dead && (!queue || q == queue)) {
-				if (queue && !q->error)
-					q->error = error;
-				gpgpu_vm_save_fault(q);
-				q->state = GPGPU_QUEUE_FAULTED;
-			}
-		}
-		list_for_each_entry(e, &c->events, node) {
-			if ((!queue || e->queue == queue) && e->state == GPGPU_EVENT_PENDING) {
-				e->error = error;
-				/* 条件先保存，wait_event 登记后会再次检查。 */
-				WRITE_ONCE(e->state, GPGPU_EVENT_FAILED);
-				wake_up_all(&e->wait);
-			}
-		}
-	}
-}
-
-/*
- * find_mqd() - 按完整 MQD 地址查找用户队列
- *
- * 调用方持 dev->lock，在所有会话中匹配 IH 记录的来源。
- */
-static struct gpgpu_user_queue *find_mqd(struct gpgpu_qdev *dev, u64 mqd)
-{
-	struct gpgpu_qclient *c;
-	struct gpgpu_user_queue *q;
-
-	list_for_each_entry(c, &dev->clients, node) {
-		list_for_each_entry(q, &c->queues, node) {
-			if (q->mqd_address == mqd)
-				return q;
-		}
-	}
-	return NULL;
-}
-
-/*
- * gpgpu_ih_drain_locked() - 消费当前已发布的 IH 记录
- *
- * 调用方持 dev->lock；读 W 后同步记录，保存事件再清通知槽，最后归还 R。
- */
-void gpgpu_ih_drain_locked(struct gpgpu_qdev *dev)
-{
-	u32 wptr = readl(dev->regs + GPGPU_REG_IH_WPTR);
-
-	if ((u32)(wptr - dev->ih_rptr) > GPGPU_IH_BYTES / sizeof(*dev->ih)) {
-		WRITE_ONCE(dev->fatal, true);
-		gpgpu_events_fault(dev, NULL, GPGPU_ERR_IH_FAULT);
-		return;
-	}
-	/*
-	 * WPTR 发布在记录之后，
-	 * 读到编号后才能读取对应记录。
-	 */
-	dma_rmb();
-	while (dev->ih_rptr != wptr) {
-		GpgpuIhRecord *r = &dev->ih[dev->ih_rptr % (GPGPU_IH_BYTES / sizeof(*dev->ih))];
-		u32 type = le32_to_cpu(r->type), data = le32_to_cpu(r->data);
-		u64 mqd = le64_to_cpu(r->mqd_addr);
-		struct gpgpu_user_queue *q = find_mqd(dev, mqd);
-
-		if (type == GPGPU_IH_SIGNAL_NOTIFY && q) {
-			struct gpgpu_qevent *e;
-
-			list_for_each_entry(e, &q->client->events, node) {
-				if (e->queue == q && e->id == data &&
-				    le64_to_cpu(READ_ONCE(*e->mailbox)) == data) {
-					if (e->state == GPGPU_EVENT_PENDING)
-						WRITE_ONCE(e->state, GPGPU_EVENT_NOTIFIED);
-					/*
-					 * 状态保留，通知槽清空后再唤醒；
-					 * 等待不消费状态。
-					 */
-					WRITE_ONCE(*e->mailbox, cpu_to_le64(0));
-					dma_wmb();
-					wake_up_all(&e->wait);
-					break;
-				}
-			}
-		} else if (type == GPGPU_IH_QUEUE_ERROR) {
-			if (q) {
-				gpgpu_events_fault(dev, q, data);
-			} else if (mqd == dev->management[1].mqd_address) {
-				WRITE_ONCE(dev->management[1].failed, true);
-			} else if (mqd == dev->management[0].mqd_address) {
-				WRITE_ONCE(dev->management[0].failed, true);
-				WRITE_ONCE(dev->fatal, true);
-				gpgpu_events_fault(dev, NULL, data);
-			}
-		} else if (type == GPGPU_IH_DEVICE_ERROR) {
-			WRITE_ONCE(dev->fatal, true);
-			gpgpu_events_fault(dev, NULL, data);
-		}
-		dev->ih_rptr++;
-	}
-	/* 完成记录读取及事件更新后，才把槽位归还设备。 */
-	dma_mb();
-	writel(dev->ih_rptr, dev->regs + GPGPU_REG_IH_RPTR);
-}
-
-/*
- * gpgpu_ih_work() - 在工作队列中处理 IH 通知
- *
- * 取得设备锁消费记录，随后在中断锁下 ACK 并重新使能 IH 通知。
- */
-void gpgpu_ih_work(struct work_struct *work)
-{
-	struct gpgpu_qdev *dev = container_of(work, struct gpgpu_qdev, ih_work);
-	unsigned long flags;
-
-	mutex_lock(&dev->lock);
-	if (dev->present) {
-		gpgpu_ih_drain_locked(dev);
-		if (dev->fatal)
-			gpgpu_events_fault(dev, NULL, GPGPU_ERR_IH_FAULT);
-		spin_lock_irqsave(&dev->irq_lock, flags);
-		writel(GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
-		writel(GPGPU_IRQ_ALL, dev->regs + GPGPU_REG_IRQ_ENABLE);
-		spin_unlock_irqrestore(&dev->irq_lock, flags);
-	}
-	mutex_unlock(&dev->lock);
-}
-
-/*
- * gpgpu_qdev_irq() - 处理队列模式的中断上半部
- *
- * 中断锁下确认 DMA/错误，IH 先屏蔽再交给工作线程，避免反复触发。
- */
-irqreturn_t gpgpu_qdev_irq(struct gpgpu_qdev *dev)
-{
-	unsigned long flags;
-	u32 pending, error;
-
-	spin_lock_irqsave(&dev->irq_lock, flags);
-	if (!READ_ONCE(dev->present)) {
-		spin_unlock_irqrestore(&dev->irq_lock, flags);
-		return IRQ_NONE;
-	}
-	pending = readl(dev->regs + GPGPU_REG_IRQ_STATUS) & GPGPU_IRQ_ALL;
-	if (!pending) {
-		spin_unlock_irqrestore(&dev->irq_lock, flags);
-		return IRQ_NONE;
-	}
-	if (pending & GPGPU_IRQ_ERROR) {
-		error = readl(dev->regs + GPGPU_REG_ERROR_STATUS);
-		if (error & GPGPU_ERR_DMA_FAULT) {
-			WRITE_ONCE(dev->dma_failed, true);
-			complete(&dev->dma_done);
-		}
-		if (error & (GPGPU_ERR_IH_FAULT | GPGPU_ERR_FIRMWARE)) {
-			WRITE_ONCE(dev->fatal, true);
-			schedule_work(&dev->ih_work);
-		}
-	}
-	if (pending & GPGPU_IRQ_DMA_DONE)
-		complete(&dev->dma_done);
-	if (pending & GPGPU_IRQ_IH) {
-		/*
-		 * 工作线程消费后再 ACK 并恢复使能，
-		 * 避免未消费记录反复中断。
-		 */
-		writel(GPGPU_IRQ_ALL & ~GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ENABLE);
-		schedule_work(&dev->ih_work);
-	}
-	writel(pending & ~GPGPU_IRQ_IH, dev->regs + GPGPU_REG_IRQ_ACK);
-	spin_unlock_irqrestore(&dev->irq_lock, flags);
-	return IRQ_HANDLED;
-}
-
-/*
- * find_event() - 查找会话内的事件编号
- *
- * 调用方持 dev->lock，未找到时返回 NULL。
- */
-static struct gpgpu_qevent *find_event(struct gpgpu_qclient *client, u32 id)
-{
-	struct gpgpu_qevent *e;
-
-	list_for_each_entry(e, &client->events, node) {
+	list_for_each_entry(e, &fpriv->events, node)
 		if (e->id == id)
 			return e;
-	}
 	return NULL;
 }
 
-/*
- * delete_event() - 释放事件的通知槽与链表节点
- *
- * 调用方已确认没有等待者及后续设备通知，并持有设备锁。
+/* 先写状态再唤醒：等待者登记后会重新检查状态，不会错过通知。 */
+static void event_complete(struct gpgpu_event *e, u32 state, u32 error)
+{
+	e->error = error;
+	WRITE_ONCE(e->state, state);
+	wake_up_all(&e->wait);
+}
+
+/**
+ * gpgpu_fail_queues() - 让队列出错并结束相关等待
+ * @dev: 设备；调用者持 dev->lock。
+ * @queue: 出错的队列；为 NULL 时作用于全部会话的全部队列。
+ * @error: 错误值；指定队列时记为该队列的首次错误。
  */
-static void delete_event(struct gpgpu_qclient *client, struct gpgpu_qevent *e)
+void gpgpu_fail_queues(struct gpgpu_device *dev, struct gpgpu_queue *queue, u32 error)
+{
+	struct gpgpu_fpriv *fpriv;
+	struct gpgpu_queue *q;
+	struct gpgpu_event *e;
+
+	list_for_each_entry(fpriv, &dev->fprivs, node) {
+		list_for_each_entry(q, &fpriv->queues, node) {
+			if (q->dead || (queue && q != queue))
+				continue;
+			if (queue && !q->error)
+				q->error = error;
+			gpgpu_vm_save_fault(q);
+			q->state = GPGPU_QUEUE_FAULTED;
+		}
+		list_for_each_entry(e, &fpriv->events, node)
+			if ((!queue || e->queue == queue) && e->state == GPGPU_EVENT_PENDING)
+				event_complete(e, GPGPU_EVENT_FAILED, error);
+	}
+}
+
+/**
+ * gpgpu_event_signal() - 处理一条 SIGNAL_NOTIFY 记录
+ * @q: 记录来源队列；调用者持 dev->lock。
+ * @event_id: 记录中的事件编号。
+ *
+ * 只有通知槽中确实写着同一编号时才接受，防止过期记录误唤醒新事件。
+ */
+void gpgpu_event_signal(struct gpgpu_queue *q, u32 event_id)
+{
+	struct gpgpu_event *e;
+
+	list_for_each_entry(e, &q->fpriv->events, node) {
+		if (e->queue != q || e->id != event_id ||
+		    le64_to_cpu(READ_ONCE(*e->mailbox)) != event_id)
+			continue;
+		if (e->state == GPGPU_EVENT_PENDING)
+			WRITE_ONCE(e->state, GPGPU_EVENT_NOTIFIED);
+		WRITE_ONCE(*e->mailbox, cpu_to_le64(0));
+		dma_wmb();
+		wake_up_all(&e->wait);
+		return;
+	}
+}
+
+static void event_report(struct gpgpu_event *e, struct gpgpu_event_request *args)
+{
+	args->state = e->state;
+	args->error = e->error;
+	args->queue_id = e->queue->id;
+}
+
+/* 1. 来源队列必须就绪；2. 分配通知槽；3. 登记并返回编号与通知槽地址。 */
+int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
+{
+	struct gpgpu_vm *vm = &fpriv->vm;
+	struct gpgpu_queue *q = gpgpu_queue_lookup(fpriv, args->queue_id);
+	struct gpgpu_event *e;
+	u32 slot;
+
+	/* 1. 来源队列。 */
+	if (!q || q->dead || q->state != GPGPU_QUEUE_READY || !fpriv->next_event)
+		return -EINVAL;
+
+	/* 2. 通知槽。 */
+	slot = find_first_zero_bit(vm->notify_slots, GPGPU_NOTIFY_SLOTS);
+	if (!vm->notify.cpu || slot >= GPGPU_NOTIFY_SLOTS)
+		return -ENOSPC;
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+	set_bit(slot, vm->notify_slots);
+	e->slot = slot;
+	e->mailbox = (u64 *)vm->notify.cpu + slot;
+	e->mailbox_addr = (fpriv->dev->gpuvm ? GPGPU_VM_NOTIFY_VA : vm->notify.addr) + slot * 8;
+	*e->mailbox = 0;
+
+	/* 3. 登记。 */
+	e->queue = q;
+	e->id = fpriv->next_event++;
+	init_waitqueue_head(&e->wait);
+	list_add_tail(&e->node, &fpriv->events);
+	args->event_id = e->id;
+	args->mailbox_address = e->mailbox_addr;
+	event_report(e, args);
+	return 0;
+}
+
+int gpgpu_event_query(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
+{
+	struct gpgpu_event *e = event_lookup(fpriv, args->event_id);
+
+	if (!e)
+		return -EINVAL;
+	event_report(e, args);
+	return 0;
+}
+
+/*
+ * gpgpu_event_wait() - 等待事件离开 PENDING
+ *
+ * timeout_ms 为 0 只检查一次；为 U32_MAX 不设期限；其余为毫秒期限。
+ * 等待期间释放 dev->lock，waiters 计数阻止事件被销毁。
+ *
+ * Return: 0 表示已通知；-ETIMEDOUT、-ERESTARTSYS，或事件失败时 -EIO。
+ */
+int gpgpu_event_wait(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
+{
+	struct gpgpu_device *dev = fpriv->dev;
+	struct gpgpu_event *e = event_lookup(fpriv, args->event_id);
+	long waited;
+	int ret = 0;
+
+	if (!e)
+		return -EINVAL;
+	e->waiters++;
+	mutex_unlock(&dev->lock);
+	if (!args->timeout_ms) {
+		waited = READ_ONCE(e->state) != GPGPU_EVENT_PENDING;
+	} else if (args->timeout_ms == U32_MAX) {
+		waited = wait_event_interruptible(e->wait,
+						  READ_ONCE(e->state) != GPGPU_EVENT_PENDING);
+		if (!waited)
+			waited = 1;
+	} else {
+		waited = wait_event_interruptible_timeout(
+			e->wait, READ_ONCE(e->state) != GPGPU_EVENT_PENDING,
+			msecs_to_jiffies(args->timeout_ms));
+	}
+	mutex_lock(&dev->lock);
+	e->waiters--;
+	if (waited < 0)
+		ret = waited;
+	else if (!waited)
+		ret = -ETIMEDOUT;
+	event_report(e, args);
+	if (e->state == GPGPU_EVENT_FAILED)
+		ret = -EIO;
+	return ret;
+}
+
+static void event_free(struct gpgpu_fpriv *fpriv, struct gpgpu_event *e)
 {
 	WRITE_ONCE(*e->mailbox, cpu_to_le64(0));
-	clear_bit(e->mailbox_slot, client->notify_slots);
+	clear_bit(e->slot, fpriv->vm.notify_slots);
 	list_del(&e->node);
 	kfree(e);
 }
 
 /*
- * gpgpu_event_operation() - 执行事件创建、查询、等待或销毁
- *
- * 入口持 dev->lock；等待期间释放锁并保持 waiters 计数，返回前重新持锁。
+ * 先消费旧 IH，再检查：没有等待者，且来源队列已卸载或事件已通知。
+ * 否则 CP 或旧 IH 记录可能仍会写这个通知槽。
  */
-int gpgpu_event_operation(struct gpgpu_qclient *client, unsigned int command,
-			  struct gpgpu_event_request *r)
+int gpgpu_event_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
 {
-	struct gpgpu_qdev *dev = client->dev;
-	struct gpgpu_qevent *e;
-	long waited;
-	int ret = 0;
+	struct gpgpu_event *e = event_lookup(fpriv, args->event_id);
 
-	if (command == GPGPU_DRM_EVENT_CREATE) {
-		struct gpgpu_user_queue *q = gpgpu_queue_find(client, r->queue_id);
-
-		if (!q || q->dead || q->state != GPGPU_QUEUE_READY || !client->next_event)
-			return -EINVAL;
-		e = kzalloc(sizeof(*e), GFP_KERNEL);
-		if (!e)
-			return -ENOMEM;
-		e->mailbox_slot = find_first_zero_bit(client->notify_slots, 512);
-		if (!client->notify_cpu || e->mailbox_slot >= 512) {
-			kfree(e);
-			return -ENOSPC;
-		}
-		set_bit(e->mailbox_slot, client->notify_slots);
-		e->mailbox = (u64 *)client->notify_cpu + e->mailbox_slot;
-		e->mailbox_address = (dev->gpuvm ? GPGPU_VM_NOTIFY_VA : client->notify_address) +
-			e->mailbox_slot * 8;
-		*e->mailbox = 0;
-		e->queue = q;
-		e->id = client->next_event++;
-		init_waitqueue_head(&e->wait);
-		list_add_tail(&e->node, &client->events);
-		r->event_id = e->id;
-		r->mailbox_address = e->mailbox_address;
-	} else {
-		e = find_event(client, r->event_id);
-		if (!e)
-			return -EINVAL;
-	}
-	if (command == GPGPU_DRM_EVENT_DESTROY) {
-		gpgpu_ih_drain_locked(dev);
-		if (e->waiters || (!e->queue->dead && e->state != GPGPU_EVENT_NOTIFIED))
-			return -EBUSY;
-		delete_event(client, e);
-		return 0;
-	}
-	if (command == GPGPU_DRM_EVENT_WAIT) {
-		e->waiters++;
-		mutex_unlock(&dev->lock);
-		if (!r->timeout_ms) {
-			waited = READ_ONCE(e->state) != GPGPU_EVENT_PENDING;
-		} else if (r->timeout_ms == U32_MAX) {
-			waited = wait_event_interruptible(
-				e->wait, READ_ONCE(e->state) != GPGPU_EVENT_PENDING);
-			if (!waited)
-				waited = 1;
-		} else {
-			waited = wait_event_interruptible_timeout(
-				e->wait, READ_ONCE(e->state) != GPGPU_EVENT_PENDING,
-				msecs_to_jiffies(r->timeout_ms));
-		}
-		mutex_lock(&dev->lock);
-		e->waiters--;
-		if (waited < 0)
-			ret = waited;
-		else if (!waited)
-			ret = -ETIMEDOUT;
-	}
-	r->state = e->state;
-	r->error = e->error;
-	r->queue_id = e->queue->id;
-	if (command == GPGPU_DRM_EVENT_WAIT && e->state == GPGPU_EVENT_FAILED)
-		ret = -EIO;
-	return ret;
+	if (!e)
+		return -EINVAL;
+	gpgpu_ih_drain(fpriv->dev);
+	if (e->waiters || (!e->queue->dead && e->state != GPGPU_EVENT_NOTIFIED))
+		return -EBUSY;
+	event_free(fpriv, e);
+	return 0;
 }
 
-/*
- * gpgpu_event_release_all() - 释放会话的所有事件
- *
- * 调用方在设备访问已结束或设备停机后持锁调用。
- */
-void gpgpu_event_release_all(struct gpgpu_qclient *client)
+/* 会话结束、设备访问已停止后释放全部事件。调用者持 dev->lock。 */
+void gpgpu_event_release_all(struct gpgpu_fpriv *fpriv)
 {
-	struct gpgpu_qevent *e, *next;
+	struct gpgpu_event *e, *next;
 
-	list_for_each_entry_safe(e, next, &client->events, node) {
-		delete_event(client, e);
-	}
+	list_for_each_entry_safe(e, next, &fpriv->events, node)
+		event_free(fpriv, e);
 }
