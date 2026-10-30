@@ -164,7 +164,10 @@ enum GpgpuQueueError {
 #define GPGPU_AQL_INVALID 1u
 /* AQL Header 类型：Kernel Dispatch。 */
 #define GPGPU_AQL_DISPATCH 2u
-/* 唯一支持的 Dispatch Header：类型 DISPATCH，acquire/release 均为 SYSTEM。 */
+/*
+ * 唯一支持的 Dispatch Header：位 7:0 为类型 DISPATCH，位 8 为 barrier（0），
+ * 位 10:9、12:11 为 acquire、release scope，均为 SYSTEM（2）。
+ */
 #define GPGPU_AQL_HEADER 0x1402u
 /* Header 的 barrier 位；本版串行执行，允许设置。 */
 #define GPGPU_AQL_BARRIER 0x0100u

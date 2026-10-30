@@ -10,10 +10,18 @@
 #include "cp_window.h"
 
 /*
- * window_rw() - 把一次窗口内的标量访问转发到目标地址
+ * window_rw() - 把 CP 对窗口的一次 1/2/4/8 字节访问转发到目标地址
  *
- * 1. 窗口内偏移与目标地址相加不能溢出；
- * 2. 按访问域转发；未定义的域直接失败。
+ * off 是 CP 地址相对窗口起点的偏移。目标地址 = 配置的窗口基址 + off，
+ * 再按配置的访问域决定是否经过 GPUVM：
+ *
+ * 1. 检查访问不越出 64 KiB 窗口，基址加偏移、再加访问长度都不溢出
+ *    64 位，否则返回 MEMTX_ERROR；
+ * 2. 管理域把目标当 GPU 物理地址访问（MQD、Ring、IH 等驱动对象）；
+ *    用户域按配置的 VMID 访问用户地址，gpuvm=on 时经页表翻译，失败时
+ *    故障记到配置的 HQD 槽和阶段。未定义的域直接失败。
+ *
+ * 返回 MEMTX_ERROR 时 CP 收到 access fault，由固件陷阱处理恢复。
  */
 static MemTxResult window_rw(GPGPUState *s, hwaddr off, uint8_t *buf, unsigned int size,
 			     bool is_write)
@@ -21,22 +29,22 @@ static MemTxResult window_rw(GPGPUState *s, hwaddr off, uint8_t *buf, unsigned i
 	GPGPUCPWindowState *w = &s->window;
 	uint64_t addr;
 
-	/* 1. 目标地址。 */
+	/* 1. 窗口内范围与目标地址的 64 位溢出检查。 */
 	if (!gpgpu_range_ok(off, size, GPGPU_CP_WINDOW_SIZE) || w->base > UINT64_MAX - off)
 		return MEMTX_ERROR;
 	addr = w->base + off;
 	if (addr > UINT64_MAX - (size - 1))
 		return MEMTX_ERROR;
 
-	/* 2. 访问域。 */
+	/* 2. 管理域走物理地址，用户域走 gpgpu_user_rw()。 */
 	switch (w->domain) {
 	case GPGPU_CP_DOMAIN_MANAGEMENT:
 		return gpgpu_phys_rw(s, addr, buf, size, is_write);
 	case GPGPU_CP_DOMAIN_USER:
-		return gpgpu_user_rw(s, w->vmid, w->slot, addr, buf, size,
-				     is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ, w->phase) ?
-			MEMTX_OK :
-			MEMTX_ERROR;
+		if (!gpgpu_user_rw(s, w->vmid, w->slot, addr, buf, size,
+				   is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ, w->phase))
+			return MEMTX_ERROR;
+		return MEMTX_OK;
 	default:
 		return MEMTX_ERROR;
 	}
@@ -90,7 +98,10 @@ static uint64_t window_regs_read(void *opaque, hwaddr reg, unsigned int size)
 	}
 }
 
-/* 配置只保存不检查；非法组合在下一次窗口访问时失败。BASE_LO 的低 16 位读零。 */
+/*
+ * 配置只保存不检查，非法组合在下一次窗口访问时失败。
+ * 窗口按 64 KiB 对齐，BASE_LO 写入时清掉低 16 位，读回为零。
+ */
 static void window_regs_write(void *opaque, hwaddr reg, uint64_t value, unsigned int size)
 {
 	GPGPUCPWindowState *w = &((GPGPUState *)opaque)->window;

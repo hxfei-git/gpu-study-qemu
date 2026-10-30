@@ -59,7 +59,10 @@
 #define GPGPU_MGMT_BYTES 4096U
 /* 每个 VM 通知页中的 8 字节通知槽数。 */
 #define GPGPU_NOTIFY_SLOTS (PAGE_SIZE / sizeof(u64))
-/* 每个会话的用户队列上限，等于每页 Doorbell 中可用的入口数。 */
+/*
+ * 每个会话可同时占用的 Doorbell 入口数（页内入口 0、1），包括已卸载但
+ * 尚未回收的队列。设备只有两个用户队列槽，更多入口用不上。
+ */
 #define GPGPU_QUEUES_PER_FILE 2
 
 struct drm_device;

@@ -367,9 +367,7 @@ enum GpgpuDispatchError {
 
 /* 执行器访问阶段：取指。 */
 #define GPGPU_VM_PHASE_FETCH 0x100U
-/* 执行器访问阶段：读参数。 */
-#define GPGPU_VM_PHASE_ARGS 0x101U
-/* 执行器访问阶段：读写数据。 */
+/* 执行器访问阶段：参数块与普通数据，都经 LW/SW 访问；0x101 保留。 */
 #define GPGPU_VM_PHASE_DATA 0x102U
 
 /*

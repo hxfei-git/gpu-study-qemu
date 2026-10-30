@@ -19,12 +19,17 @@
 #include <drm/drm_ioctl.h>
 #include "gpgpu_drv.h"
 
-/* GPUVA 位数与每个 VM 的队列数，供 INFO 报告。 */
+/* INFO 报告的 GPUVA 位数。 */
 #define GPGPU_GPUVA_BITS 32
+/* INFO 报告的每个 VM 用户队列数。 */
 #define GPGPU_QUEUES_PER_VM 1
 
 /* ---- 会话 ---- */
 
+/*
+ * 打开 render node：创建会话，只接受 render client。设备已移除或故障时
+ * 拒绝。会话挂到设备链表并持有一个设备引用。
+ */
 static int gpgpu_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct gpgpu_device *dev = drm->dev_private;
@@ -32,9 +37,11 @@ static int gpgpu_open(struct drm_device *drm, struct drm_file *file)
 
 	if (!drm_is_render_client(file))
 		return -EOPNOTSUPP;
+
 	fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
 	if (!fpriv)
 		return -ENOMEM;
+
 	fpriv->dev = dev;
 	fpriv->file = file;
 	fpriv->owner = task_tgid_nr(current);
@@ -122,6 +129,7 @@ static int gpgpu_ioctl_enter(struct gpgpu_fpriv *fpriv, u32 version, bool serial
 		return -EPROTONOSUPPORT;
 	if (task_tgid_nr(current) != fpriv->owner)
 		return -EOPNOTSUPP;
+
 	if (serial)
 		mutex_lock(&dev->vm_serial);
 	mutex_lock(&dev->lock);
@@ -294,7 +302,10 @@ static const struct drm_driver gpgpu_drm_driver = {
 	.minor = 0,
 };
 
-/* 设备页表固定使用 4 KiB 页，客体页大小必须一致。 */
+/*
+ * 注册 render node。设备页表固定使用 4 KiB 页，客体 PAGE_SIZE 必须一致。
+ * 注册失败时撤销 dev->drm，gpgpu_drm_unregister() 据此跳过。
+ */
 int gpgpu_drm_register(struct gpgpu_device *dev)
 {
 	struct drm_device *drm;
@@ -302,6 +313,7 @@ int gpgpu_drm_register(struct gpgpu_device *dev)
 
 	if (PAGE_SIZE != GPGPU_VM_PAGE_SIZE)
 		return -EOPNOTSUPP;
+
 	drm = drm_dev_alloc(&gpgpu_drm_driver, &dev->pdev->dev);
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);

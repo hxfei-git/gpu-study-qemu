@@ -43,10 +43,19 @@ typedef struct AqlTask {
 /*
  * aql_shape_valid() - 检查 Header 与网格尺寸，算出各维工作组数
  *
- * 1. Header 必须是 GPGPU_AQL_HEADER（允许 barrier 位），维度数 1～3；
- * 2. 保留字段、私有段与共享段都为 0；
- * 3. 每维：尺寸非零且能被工作组尺寸整除；未使用的维度为 1；
- *    累计线程数、工作组数和总线程数不超过上限（先除后乘，乘积不会溢出）。
+ * AQL 包里的 grid_size 是各维的总线程数，执行器要的是各维工作组数，
+ * 所以这里用 grid_size / workgroup_size 换算，并在换算时检查上限：
+ *
+ * 1. Header 去掉 barrier 位后必须等于 GPGPU_AQL_HEADER（Kernel Dispatch、
+ *    acquire/release 均为 SYSTEM），setup 中的维度数为 1～3；
+ * 2. 保留字段为 0；本版本不支持私有段和工作组共享段，
+ *    两者大小必须为 0；
+ * 3. 逐维检查：工作组尺寸和总线程数都非零，总线程数能被
+ *    工作组尺寸整除，超出维度数的维必须两项都为 1。
+ *    把本维乘进三个累计值前，先与“上限 / 已有累计值”比较，
+ *    保证每组线程数、工作组数和总线程数都不超限，乘法也不会溢出。
+ *
+ * Return: 1 表示合法，并已填好 t->block 和 t->grid；0 时调用者记 PACKET 错误。
  */
 static int aql_shape_valid(AqlTask *t)
 {
@@ -60,15 +69,15 @@ static int aql_shape_valid(AqlTask *t)
 	t->block[1] = p->workgroup_size_y;
 	t->block[2] = p->workgroup_size_z;
 
-	/* 1. Header。 */
+	/* 1. 包类型、fence scope 与维度数。 */
 	if ((header & ~GPGPU_AQL_BARRIER) != GPGPU_AQL_HEADER || dims < 1 || dims > 3)
 		return 0;
 
-	/* 2. 保留与段大小。 */
+	/* 2. 保留字段与两种段大小都必须为 0。 */
 	if (p->reserved0 || p->reserved2 || p->private_segment_size || p->group_segment_size)
 		return 0;
 
-	/* 3. 各维。 */
+	/* 3. 逐维整除、换算工作组数，并在累乘前检查上限。 */
 	for (u32 i = 0; i < 3; i++) {
 		if (!t->block[i] || !sizes[i] || sizes[i] % t->block[i] ||
 		    (i >= dims && (sizes[i] != 1 || t->block[i] != 1)))
@@ -87,8 +96,18 @@ static int aql_shape_valid(AqlTask *t)
 /*
  * aql_read_descriptor() - 读取并检查 Kernel 描述对象
  *
- * ABI 版本一致；代码入口与长度按 4 字节对齐且范围在 32 位空间内；
- * 参数长度 4 字节到 64 KiB、按 4 字节对齐，参数地址按 8 字节对齐。
+ * 包中的 kernel_object 指向运行时生成的 16 字节描述对象。地址按 8 字节
+ * 对齐时，按队列的访问域把它复制到 t->desc，再检查：
+ *
+ * - ABI 版本与固件一致；
+ * - 代码长度非零，入口和长度按 4 字节对齐，代码不越过 32 位地址空间；
+ * - 参数长度在 4 字节到 64 KiB 之间且为 4 的倍数；包中的参数地址
+ *   按 8 字节对齐，整段参数块在 32 位地址空间内。
+ *
+ * 这些是提交执行器前的静态检查，运行中的取指和参数读取越界仍由
+ * 执行器检查。
+ *
+ * Return: 1 表示合法；0 时调用者记 DESCRIPTOR 错误。
  */
 static int aql_read_descriptor(u32 slot, AqlTask *t)
 {
@@ -105,7 +124,17 @@ static int aql_read_descriptor(u32 slot, AqlTask *t)
 		cp_range_ok(t->packet.kernarg_address, d->kernarg_size, 8);
 }
 
-/* 读取并检查 Signal：完成值为 1，事件编号非零，保留字段为 0；取得通知槽地址。 */
+/*
+ * 读取并检查完成 Signal，取出完成时要用的事件编号和通知槽地址。
+ * Signal 按 8 字节对齐；完成值必须是 Host 提交前写入的 1；事件编号
+ * 非零，保留字段为 0。
+ *
+ * 完成值是 Host 与 CP 共享的动态值，要用单条 64 位 load 读到完整值，
+ * 所以各字段逐个标量读取，不用 cp_read_object() 整体复制。
+ * 通知槽地址的范围由调用者检查。
+ *
+ * Return: 1 表示合法；0 时调用者记 SIGNAL 错误。
+ */
 static int aql_read_signal(u32 slot, AqlTask *t)
 {
 	const u32 phase = GPGPU_QUEUE_ERROR_SIGNAL;
@@ -129,6 +158,12 @@ static int aql_read_signal(u32 slot, AqlTask *t)
 /*
  * aql_fetch() - 第 1、2 步：取包并检查
  *
+ * 多个 Host 线程可能先预留编号再填包，W 已经越过 R 并不代表 R 处的包已
+ * 发布。Host 最后才用一次 32 位写发布 Header，所以 CP 先单独读 Header：
+ * 仍是 INVALID 就返回 0，下一轮再看，不跳过这个包。
+ * Header 有效后，依次读包体，检查形状、描述对象、Signal 和通知槽地址，
+ * 每项失败都记对应的队列错误并停止该队列，不推进 R。
+ *
  * Return: 1 表示包可执行；0 表示没有已发布的包，或已按错误停止队列。
  */
 static int aql_fetch(u32 slot, AqlTask *t)
@@ -136,7 +171,11 @@ static int aql_fetch(u32 slot, AqlTask *t)
 	if (!cp_next_packet(slot, &t->addr, sizeof(t->packet)))
 		return 0;
 
-	/* 1. Header：先单独读取，未发布时不读包体。 */
+	/*
+	 * 1. 先单独读 Header 和 setup 所在的 32 位字，
+	 *    类型为 INVALID 时还未发布，不读包体。
+	 *    fence 保证读到有效 Header 后，才读 Host 写好的包体。
+	 */
 	if (!cp_queue_read32(slot, GPGPU_QUEUE_ERROR_RING, t->addr, &t->packet.full_header)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
@@ -145,12 +184,13 @@ static int aql_fetch(u32 slot, AqlTask *t)
 		return 0;
 	cp_fence();
 
-	/* 2. 包体、描述对象与 Signal。 */
+	/* 2. 读剩余 60 字节包体，再逐项检查；错误编号指出哪一项出错。 */
 	if (!cp_queue_read_object(slot, GPGPU_QUEUE_ERROR_RING, t->addr + 4,
 				  (char *)&t->packet + 4, sizeof(t->packet) - 4)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RING);
 		return 0;
 	}
+
 	if (!aql_shape_valid(t)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_PACKET);
 		return 0;
@@ -170,7 +210,14 @@ static int aql_fetch(u32 slot, AqlTask *t)
 	return 1;
 }
 
-/* 第 3 步：写入执行器配置。调用者已确认执行器空闲。 */
+/*
+ * 第 3 步：把已检查的包写入执行器的分发寄存器。
+ * 调用者已确认 DISPATCH_STATUS 为空闲，执行器此时不会读这些寄存器。
+ * VMID 和 slot 决定执行器访存时的地址翻译和故障归属；代码与参数地址、
+ * 长度供执行器做运行时范围检查；网格写入各维工作组数和工作组尺寸。
+ * 本版本不支持工作组共享存储，大小固定写 0。
+ * 写入顺序由调用者的 fence 保证。
+ */
 static void aql_configure(u32 slot, const AqlTask *t)
 {
 	cp_reg_write(GPGPU_REG_DISPATCH_VMID, cp_slots[slot].vmid);
@@ -189,9 +236,15 @@ static void aql_configure(u32 slot, const AqlTask *t)
 }
 
 /*
- * 第 4 步：提交并等待终态，读出错误后写 ACK 让执行器回到空闲。
+ * 第 4 步：提交并等待执行器给出终态。
  *
- * Return: 执行器成功且没有细分错误时为 1。
+ * 写 DISPATCH=1 启动执行器，然后轮询 DISPATCH_STATUS 直到不再为 BUSY；
+ * 执行器只有在结果写回和相关访存都结束后才给出 DONE 或失败。
+ * fence 保证先看到终态，再读 DISPATCH_ERROR。
+ * 最后写 ACK，执行器清除结果并回到空闲，下一次派发才能提交；
+ * ACK 不会中止执行，因为此时执行已经结束。
+ *
+ * Return: 状态为 DONE 且没有细分错误时为 1；0 时调用者记 EXECUTOR 错误。
  */
 static int aql_run(void)
 {
@@ -208,21 +261,27 @@ static int aql_run(void)
 }
 
 /*
- * aql_complete() - 第 5 步：按序发布完成
+ * aql_complete() - 第 5 步：任务成功后按序发布完成
  *
- * 1. Signal：再次确认仍为 1，写为 0；
- * 2. 通知槽：写入事件编号；
- * 3. IH：SIGNAL_NOTIFY，失败时调度已停止；
- * 4. Header 写回 INVALID，Host 才能复用该槽；
- * 5. R+1 并写回共享进度。
- * 每一步都在上一步可见之后进行；任一步失败停止该队列，之后的步骤不执行。
+ * Host 等待方先轮询 Signal，超时后阻塞在事件上，由驱动根据 IH 记录和
+ * 通知槽唤醒；Host 提交方根据 R 复用 Ring 槽。所以顺序必须是：
+ *
+ * 1. Signal：fence 保证执行器写回的结果先于 Signal 可见；再读一次确认
+ *    完成值仍为 1，然后用单条 64 位 store 写 0；
+ * 2. 通知槽：fence 后写入零扩展的事件编号，驱动消费 IH 记录时用它核对；
+ * 3. IH：fence 后提交 SIGNAL_NOTIFY，驱动据此唤醒等待者。提交失败时
+ *    cp_ih_submit() 已置 cp_stopped，直接返回；
+ * 4. Header 写回 INVALID，Host 复用该槽时才能从“未发布”状态开始填包；
+ * 5. R+1 并写回共享进度，Host 读到新 R 后才会复用该槽。
+ *
+ * 任一步失败停止该队列，之后的步骤不执行，已写入的内容不回退。
  */
 static void aql_complete(u32 slot, const AqlTask *t)
 {
 	u64 sig = t->packet.completion_signal;
 	u64 value;
 
-	/* 1. Signal。 */
+	/* 1. 结果先可见，再把 Signal 从 1 改为 0。 */
 	cp_fence();
 	if (!cp_queue_read64(slot, GPGPU_QUEUE_ERROR_SIGNAL, sig, &value) || value != 1 ||
 	    !cp_queue_write64(slot, GPGPU_QUEUE_ERROR_SIGNAL, sig, 0)) {
@@ -230,30 +289,33 @@ static void aql_complete(u32 slot, const AqlTask *t)
 		return;
 	}
 
-	/* 2. 通知槽。 */
+	/* 2. Signal 可见后再写通知槽。 */
 	cp_fence();
 	if (!cp_queue_write64(slot, GPGPU_QUEUE_ERROR_MAILBOX, t->mailbox, t->event_id)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_MAILBOX);
 		return;
 	}
 
-	/* 3. IH。 */
+	/* 3. 通知槽可见后再发 IH 记录。 */
 	cp_fence();
 	if (!cp_ih_submit(slot, GPGPU_IH_SIGNAL_NOTIFY, t->event_id))
 		return;
 
-	/* 4. Header。 */
+	/* 4. 把 Header 恢复为 INVALID，供 Host 下一次复用该槽。 */
 	if (!cp_queue_write32(slot, GPGPU_QUEUE_ERROR_RETIRE, t->addr, GPGPU_AQL_INVALID)) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_RETIRE);
 		return;
 	}
 
-	/* 5. R。 */
+	/* 5. 推进 R 并写回共享进度。 */
 	cp_retire(slot);
 }
 
 /*
  * cp_aql() - 处理用户槽中的一个派发包
+ *
+ * 一次调用同步走完文件头的 5 步：取包并检查，配置执行器，等待整个
+ * Dispatch 结束，再发布完成。CP 在等待期间不处理其他队列。
  *
  * Return: 本轮提交过执行器或调度已停止时为 1，供主循环轮换两个用户槽的
  * 优先顺序；没有可执行的包（含提交前即出错）时为 0。
@@ -262,11 +324,15 @@ int cp_aql(u32 slot)
 {
 	AqlTask t;
 
-	/* 1. 2. 取包与检查。 */
+	/* 1. 2. 没有已发布的包或检查失败时返回 0，失败已记错误。 */
 	if (!aql_fetch(slot, &t))
 		return 0;
 
-	/* 3. 配置。 */
+	/*
+	 * 3. 执行器须空闲，否则说明上一次结果没有确认，记 EXECUTOR 错误。
+	 *    配置写完后 fence，再确认 IH 仍正常：IH 已故障时
+	 *    完成通知送不到 Host，不再提交。
+	 */
 	if (cp_reg_read(GPGPU_REG_DISPATCH_STATUS) != GPGPU_DISPATCH_IDLE) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_EXECUTOR);
 		return 0;
@@ -276,7 +342,7 @@ int cp_aql(u32 slot)
 	if (cp_ih_faulted())
 		return 1;
 
-	/* 4. 执行。 */
+	/* 4. 提交并等待终态；执行失败记 EXECUTOR 错误，不发布成功 Signal。 */
 	if (!aql_run()) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_EXECUTOR);
 		return 1;
@@ -286,7 +352,7 @@ int cp_aql(u32 slot)
 	if (cp_ih_faulted())
 		return 1;
 
-	/* 5. 完成。 */
+	/* 5. 执行成功，按序发布 Signal、通知槽、IH、Header 和 R。 */
 	aql_complete(slot, &t);
 	return 1;
 }

@@ -10,7 +10,12 @@
  */
 #include "cp.h"
 
-/* 配置窗口指向 addr 所在的 64 KiB 区域，返回 addr 在 CP 本地的地址。 */
+/*
+ * 让访存窗口指向 addr 所在的 64 KiB 区域，返回 addr 在 CP 本地的地址。
+ * 前一个 fence 保证上一次窗口访问已经完成，才改写窗口配置；后一个 fence
+ * 保证全部配置生效后，调用者才通过返回的地址访问。BASE_LO 最后写入，
+ * 只保留 64 KiB 对齐的部分，页内偏移由返回地址的低 16 位给出。
+ */
 static unsigned long cp_window(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr)
 {
 	cp_fence();
@@ -54,6 +59,11 @@ int cp_write64(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, u64 value)
 	return cp_access_store64(cp_window(slot, domain, vmid, phase, addr), value);
 }
 
+/*
+ * 按 4 字节逐个读取对象，每次都重新配置窗口，
+ * 所以对象可以跨 64 KiB 边界。
+ * 只用于 MQD、AQL 包体、描述对象这类读取期间不会被另一方修改的内容。
+ */
 int cp_read_object(u32 slot, u32 domain, u32 vmid, u32 phase, u64 addr, void *dest, u32 size)
 {
 	u32 *words = dest;

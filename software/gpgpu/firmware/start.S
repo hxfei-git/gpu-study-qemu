@@ -8,7 +8,17 @@
 .option norvc
 .section .text.start,"ax"
 .global _start
-/* 1. 建立栈；2. 清零 BSS；3. 安装异常栈与入口，关闭中断；4. 进入主循环。 */
+/*
+ * _start：CP 释放复位后执行的第一条指令。
+ *
+ * 1. sp 指向 VRAM 末尾的 __stack_top（link.ld 定义），
+ *    普通栈占保留区最后 64 KiB；
+ * 2. 按 8 字节清零 [__bss_start, __bss_end)，cp_slots、cp_stopped 等
+ *    全局状态从 0 开始；
+ * 3. mscratch 保存异常栈顶，cp_trap_entry 用它与 sp 交换；mtvec 指向异常入口；
+ *    清 mie 关闭全部中断，固件只靠轮询工作；
+ * 4. 调用 cp_main()，它不返回；万一返回则原地循环。
+ */
 _start:
 	la sp, __stack_top
 	la t0, __bss_start

@@ -52,30 +52,38 @@ bool gpgpu_engines_idle(GPGPUState *s)
 /*
  * gpgpu_reset_registers() - 按依赖顺序复位各模块寄存器
  *
- * 1. 有跨进程物理访问在途时拒绝：它可能暂时释放了主锁，返回后仍会使用
- *    当前地址配置；
- * 2. 先停止访问的发起方：CP、执行器；
- * 3. 再复位被访问的状态：GPUVM、HQD、IH；
- * 4. 最后复位全局寄存器、中断、DMA 与 Outbound。
+ * Host 写 GLOBAL_CTRL.RESET 和 QOM 复位都走这里。各模块之间有访问
+ * 关系：CP、执行器会读写 GPUVM、HQD、IH 的状态，所以先停发起方，
+ * 再清被访问的状态，避免复位中途还有访问用到半清空的配置：
+ *
+ * 1. 有跨进程物理访问在途时拒绝复位并锁存 INVALID_CMD。这类访问
+ *    经 vfio-user DMA 时可能暂时释放了主锁，返回后仍会使用当前的
+ *    地址配置，此时清空会让它访问到错误位置；
+ * 2. 先让 CP 保持复位、停止执行器，此后不再产生新访问；
+ * 3. 再复位被访问的状态：GPUVM 上下文与 TLB、HQD、IH；
+ * 4. 最后复位全局寄存器、中断、DMA 与 Outbound 窗口。
+ *
+ * Return: true 表示已复位；false 表示被拒绝，除锁存的 INVALID_CMD
+ * 外各模块状态不变。
  */
 bool gpgpu_reset_registers(GPGPUState *s)
 {
-	/* 1. 在途访问。 */
+	/* 1. 在途物理访问未结束时整体拒绝，不做部分复位。 */
 	if (gpgpu_phys_busy(s)) {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return false;
 	}
 
-	/* 2. 发起方。 */
+	/* 2. 停住访问发起方：CP 保持复位，执行器回到 IDLE 并释放任务。 */
 	gpgpu_cp_reset(s);
 	gpgpu_dispatch_reset(s);
 
-	/* 3. 被访问的状态。 */
+	/* 3. 发起方已停，可以安全清空它们会访问的状态。 */
 	gpgpu_vm_reset(s);
 	gpgpu_hqd_reset(s);
 	gpgpu_ih_reset(s);
 
-	/* 4. 全局与外围。 */
+	/* 4. 全局状态回到 READY，中断、DMA 与 Outbound 回到复位值。 */
 	s->global_ctrl = 0;
 	s->global_status = GPGPU_STATUS_READY;
 	s->error_status = 0;
@@ -152,27 +160,33 @@ static bool gpgpu_check_properties(GPGPUState *s, Error **errp)
 }
 
 /*
- * gpgpu_realize() - 建立 PCI 资源
+ * gpgpu_realize() - 实例化设备并建立 PCI 资源
  *
- * 1. 检查属性；2. 注册 VRAM（BAR2）、寄存器（BAR0）、Doorbell（BAR4）；
- * 3. 建立中断与 PCIe 能力；4. 创建定时器并进入复位后状态。
+ * QOM 在设备加入机器时调用一次。按资源依赖分四步，后一步失败时
+ * 逆序撤销已建立的部分：
+ *
+ * 1. 检查 vram_size 等属性，设置 INTx 引脚；
+ * 2. 注册 VRAM（BAR2）、寄存器（BAR0）、Doorbell（BAR4）三个 BAR；
+ * 3. 建立中断与 PCIe 端点能力。MSI-X 表挂在 BAR0 末尾，
+ *    所以必须在第 2 步建好 BAR0 之后；
+ * 4. 创建 DMA 和执行器的定时器，把 Outbound 与全局状态置为复位值。
  */
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 {
 	GPGPUState *s = GPGPU(pdev);
 
-	/* 1. 属性。 */
+	/* 1. 属性不合法时直接返回，此时尚未分配任何资源。 */
 	if (!gpgpu_check_properties(s, errp))
 		return;
 	pci_config_set_interrupt_pin(pdev->config, 1);
 
-	/* 2. BAR。 */
+	/* 2. VRAM 失败直接返回；BAR0、Doorbell 只建区域，不会失败。 */
 	if (!gpgpu_vram_init(s, errp))
 		return;
 	gpgpu_bar0_init(s);
 	gpgpu_doorbell_init(s);
 
-	/* 3. 中断与 PCIe。 */
+	/* 3. 失败时跳到对应标签，逆序释放中断和 VRAM。 */
 	if (!gpgpu_irq_init(s, errp))
 		goto fail_vram;
 	if (pcie_endpoint_cap_init(pdev, 0) < 0) {
@@ -180,7 +194,7 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 		goto fail_irq;
 	}
 
-	/* 4. 定时器与初始状态。 */
+	/* 4. 定时器与复位后状态，此后 Host 读到 GLOBAL_STATUS = READY。 */
 	gpgpu_dma_init(s);
 	gpgpu_dispatch_init(s);
 	gpgpu_outbound_reset(s);
@@ -199,6 +213,7 @@ static void gpgpu_exit(PCIDevice *pdev)
 	GPGPUState *s = GPGPU(pdev);
 
 	gpgpu_cp_hold(s);
+
 	gpgpu_dma_cleanup(s);
 	gpgpu_dispatch_cleanup(s);
 	gpgpu_irq_cleanup(s);
@@ -206,7 +221,10 @@ static void gpgpu_exit(PCIDevice *pdev)
 	gpgpu_vram_cleanup(s);
 }
 
-/* QOM 复位：复位寄存器后再清空 VRAM 和 PCI 中断能力；寄存器复位被拒绝时都保留。 */
+/*
+ * QOM 复位：先复位寄存器，再清空 VRAM 和 PCI 中断能力。
+ * 寄存器复位被拒绝（仍有在途物理访问）时，VRAM 和中断能力也保留。
+ */
 static void gpgpu_reset(DeviceState *dev)
 {
 	GPGPUState *s = GPGPU(dev);

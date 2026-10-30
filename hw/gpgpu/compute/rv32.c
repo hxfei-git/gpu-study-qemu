@@ -2,9 +2,9 @@
 /*
  * RV32 解释器：解码与按类别执行
  *
- * 每条指令先由 rv32_decode() 拆出字段和立即数，再由 gpgpu_rv32_step() 按
- * opcode 分派到一个类别函数。类别函数只做两件事：检查本类编码是否合法，
- * 合法则执行并推进 PC。非法编码统一返回 GPGPU_EXEC_ERR_INSTRUCTION。
+ * 每条指令先由 rv32_decode() 拆出字段和立即数，再由 gpgpu_rv32_step()
+ * 按 opcode 分派到一个类别函数。类别函数检查本类编码是否合法，合法则
+ * 执行并推进 PC。非法编码统一返回 GPGPU_EXEC_ERR_INSTRUCTION。
  */
 #include "qemu/osdep.h"
 #include "compute_internal.h"
@@ -109,6 +109,7 @@ static void set_gpr(GPGPULane *lane, uint32_t rd, uint32_t value)
 		lane->gpr[rd] = value;
 }
 
+/* 当前指令编码非法或不受支持。 */
 static bool illegal(GPGPUExecContext *ctx)
 {
 	return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_INSTRUCTION);
@@ -281,7 +282,10 @@ static bool exec_store(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *i
 
 /* ---- 浮点指令 ---- */
 
-/* 设置本条指令的舍入模式（rm=7 时取 frm）并清除异常标志；保留编码返回 false。 */
+/*
+ * 设置本条指令的舍入模式（rm=7 时取 fcsr.frm）并清除 SoftFloat 异常标志。
+ * rm 为保留值 5、6，或 rm=7 而 frm 不是 0～4 时返回 false。
+ */
 static bool fp_set_rounding(GPGPULane *lane, uint32_t rm)
 {
 	static const FloatRoundMode modes[] = {
@@ -313,8 +317,9 @@ static void fp_accumulate_flags(GPGPULane *lane)
 /*
  * fp32_to_e2m1() - FP32 饱和转换为 E2M1（FP4）
  *
- * E2M1 只有 8 个非负值且没有 NaN/无穷：NaN 与无穷饱和为同号最大值；其余值
- * 先找相邻的两个可表示值，再按舍入模式决定取上或取下。
+ * E2M1 只有 8 个非负值，没有 NaN 和无穷：NaN、无穷和溢出都饱和为
+ * 同号最大值 6.0；其余值先找相邻的两个可表示值，再按舍入模式
+ * 取上或取下。
  */
 static float4_e2m1 fp32_to_e2m1(float32 value, float_status *status)
 {
@@ -335,6 +340,7 @@ static float4_e2m1 fp32_to_e2m1(float32 value, float_status *status)
 	uint32_t result;
 	bool round_up;
 
+	/* NaN、无穷与不小于 8.0 的有限值都饱和。 */
 	if (magnitude >= 0x7f800000) {
 		if (magnitude > 0x7f800000)
 			float_raise(float_flag_invalid, status);
@@ -344,11 +350,14 @@ static float4_e2m1 fp32_to_e2m1(float32 value, float_status *status)
 		float_raise(float_flag_overflow | float_flag_inexact, status);
 		return sign | 7;
 	}
+
+	/* 找到第一个不小于 magnitude 的级别；恰好相等时无需舍入。 */
 	while (magnitude > levels[upper])
 		upper++;
 	if (magnitude == levels[upper])
 		return sign | upper;
 
+	/* magnitude 在 levels[upper - 1] 与 levels[upper] 之间，按舍入模式取一端。 */
 	switch (get_float_rounding_mode(status)) {
 	case float_round_nearest_even:
 		round_up = magnitude > midpoints[upper - 1] ||
@@ -369,6 +378,7 @@ static float4_e2m1 fp32_to_e2m1(float32 value, float_status *status)
 	default:
 		g_assert_not_reached();
 	}
+
 	result = upper - 1 + round_up;
 	if (result > 7) {
 		result = 7;
@@ -415,7 +425,10 @@ static uint32_t fp_convert_e2m1(GPGPULane *lane, uint32_t src, uint32_t rs2)
 	return bfloat16_to_float32(float8_e4m3_to_bfloat16(e4m3, st), st);
 }
 
-/* OP-FP 各 funct7 允许的 rs2 上限；不在表中的 funct7 非法。 */
+/*
+ * OP-FP 各 funct7 对 rs2 字段的要求：FADD.S、FMUL.S 的 rs2 是源寄存器，
+ * 转换指令用 rs2 选择方向。不在表中的 funct7 非法。
+ */
 static bool fp_rs2_valid(uint32_t funct7, uint32_t rs2)
 {
 	switch (funct7) {
@@ -436,18 +449,23 @@ static bool fp_rs2_valid(uint32_t funct7, uint32_t rs2)
 }
 
 /*
- * exec_fp() - OP-FP
+ * exec_fp() - 执行 OP-FP 类指令（FADD.S、FMUL.S、类型转换与 FMV.W.X）
  *
- * 1. FMV.W.X 只搬运位，不涉及舍入；
- * 2. 其余指令先检查 rs2 与舍入模式；
- * 3. 计算并写回；4. 累加异常标志。
+ * OP-FP 用 funct7 区分操作，用 rs2 区分转换方向，用 funct3 保存舍入模式：
+ *
+ * 1. FMV.W.X 把整数寄存器的位原样搬到浮点寄存器，不涉及舍入和异常，
+ *    rs2 与 funct3 必须为 0，单独处理后直接返回；
+ * 2. 其余指令先检查 rs2 是否在该 funct7 允许的范围内，再设置本条指令
+ *    的舍入模式并清除 SoftFloat 异常标志，保留的舍入编码视为非法；
+ * 3. 按 funct7 计算并写回 rd；FCVT.W.S 的结果写整数寄存器；
+ * 4. 把本条指令产生的异常累加到 fcsr.fflags，再推进 PC。
  */
 static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 {
 	float_status *st = &lane->fp_status;
 	uint32_t a = lane->fpr[in->rs1];
 
-	/* 1. 位搬运。 */
+	/* 1. FMV.W.X：只搬运位，不设置舍入模式。 */
 	if (in->funct7 == FP_MV_W_X) {
 		if (in->rs2 || in->funct3)
 			return illegal(ctx);
@@ -456,11 +474,11 @@ static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 		return true;
 	}
 
-	/* 2. 编码检查。 */
+	/* 2. rs2 越界或舍入模式为保留值时按非法指令失败。 */
 	if (!fp_rs2_valid(in->funct7, in->rs2) || !fp_set_rounding(lane, in->funct3))
 		return illegal(ctx);
 
-	/* 3. 计算。 */
+	/* 3. 计算，舍入与异常记录在 lane->fp_status 中。 */
 	switch (in->funct7) {
 	case FP_ADD_S:
 		lane->fpr[in->rd] = float32_add(a, lane->fpr[in->rs2], st);
@@ -486,7 +504,7 @@ static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 		break;
 	}
 
-	/* 4. 异常标志。 */
+	/* 4. fflags 只累加不清除，与 RISC-V 的语义一致。 */
 	fp_accumulate_flags(lane);
 	lane->pc += 4;
 	return true;
@@ -500,14 +518,17 @@ bool gpgpu_rv32_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_i
 	uint32_t raw;
 	Rv32Insn in;
 
-	/* 1. 取指。 */
+	/* 1. 取指：pc 越出代码范围、未对齐或读取失败时任务失败。 */
 	if (!gpgpu_lane_fetch(ctx, lane->pc, &raw))
 		return false;
 
-	/* 2. 解码。 */
+	/* 2. 拆出寄存器号、funct 字段和立即数，合法性留给第 3 步。 */
 	in = rv32_decode(raw);
 
-	/* 3. 按类别执行。 */
+	/*
+	 * 3. 按主 opcode 分派到类别函数，由它检查本类编码并执行；
+	 *    LUI、JAL 没有非法编码，直接在这里执行。
+	 */
 	switch (in.opcode) {
 	case OP_SYSTEM:
 		return exec_system(ctx, warp, lane_id, &in);

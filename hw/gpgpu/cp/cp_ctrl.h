@@ -6,7 +6,8 @@
  * gpgpu_cp_attach() 登记一个回调；Host 写 CP_CTRL / CP_RESET_VECTOR 时，
  * 设备通过该回调在 CPU 线程中同步完成复位或启动。
  *
- * “冷启动”指设备复位后 CP 从未被释放过复位：只有此时 Host 才能配置 KIQ。
+ * “冷启动”指设备复位后 CP 还没有释放过复位；
+ * 只有此时 Host 才能配置 KIQ。
  */
 #ifndef HW_GPGPU_CP_CTRL_H
 #define HW_GPGPU_CP_CTRL_H

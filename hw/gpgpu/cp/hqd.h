@@ -2,14 +2,14 @@
 /*
  * HQD：4 个硬件队列槽的寄存器
  *
- * 槽 0 为 KIQ，槽 1 为 HIQ，槽 2、3 为用户 AQL 队列。两条访问路径共用同一份
- * 状态和检查规则：
+ * 槽 0 为 KIQ，槽 1 为 HIQ，槽 2、3 为用户 AQL 队列。两条访问路径
+ * 共用同一份状态和检查规则：
  *
  *   Host：BAR0 0x600 选槽，再经 0x700 窗口读写；只在 CP 冷启动前配置 KIQ。
  *   CP  ：本地 0xffff_0000 + 槽号 × 0x100 + 字段偏移，直接读写任意槽。
  *
- * 激活（ACTIVE 由 0 写为 1）前检查整套配置；激活期间只允许改 ACTIVE、RPTR、
- * ERROR 和 Doorbell 使能位。
+ * 激活（ACTIVE 由 0 写为 1）前检查整套配置；激活期间只允许改
+ * ACTIVE、RPTR、ERROR 和 Doorbell 使能位。
  */
 #ifndef HW_GPGPU_CP_HQD_H
 #define HW_GPGPU_CP_HQD_H

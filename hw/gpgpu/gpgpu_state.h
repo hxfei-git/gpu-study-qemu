@@ -2,9 +2,10 @@
 /*
  * GPGPU 设备的组装状态
  *
- * GPGPUState 把各模块的子状态放在一起。模块实现包含本文件只为取得自己的
- * 子状态（如 hqd.c 只访问 s->hqd）；读取或修改其他模块的状态必须调用对方
- * 头文件中的函数。全局寄存器（global_ctrl 等）只由 gpgpu.c 访问。
+ * GPGPUState 把各模块的子状态放在一起。模块实现包含本文件只为取得
+ * 自己的子状态（如 hqd.c 只访问 s->hqd）；读取或修改其他模块的状态
+ * 必须调用对方头文件中的函数。全局寄存器（global_ctrl 等）只由
+ * gpgpu.c 访问。
  */
 #ifndef HW_GPGPU_STATE_H
 #define HW_GPGPU_STATE_H

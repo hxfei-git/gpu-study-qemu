@@ -20,7 +20,10 @@ typedef struct GPGPUWarp GPGPUWarp;
  * @warp: lane 所属 warp。
  * @lane_id: lane 编号，0～31，调用者保证该 lane 活跃。
  *
- * 1. 取指；2. 解码并检查编码；3. 执行，更新寄存器、PC 或结束标记。
+ * 1. 按 lane 的 pc 取指，越出代码范围或未对齐时失败；
+ * 2. 拆出寄存器号、funct 字段和立即数，此时不判断编码是否合法；
+ * 3. 按主 opcode 分派到类别函数，由它检查编码并执行，更新寄存器、
+ *    PC 或结束标记。非法编码记 GPGPU_EXEC_ERR_INSTRUCTION。
  *
  * Return: 成功为 true；失败时 ctx->error 为细分错误。
  */

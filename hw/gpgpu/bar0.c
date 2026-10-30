@@ -69,7 +69,7 @@ static const Bar0Group bar0_background = {
 
 QEMU_BUILD_BUG_ON(ARRAY_SIZE(bar0_groups) + 2 != GPGPU_BAR0_REGIONS);
 
-/* 寄存器只接受对齐的 32 位访问；否则锁存 INVALID_CMD，IH 组另记协议故障。 */
+/* 只接受对齐的 32 位访问；否则锁存 INVALID_CMD，IH 组另记协议故障。 */
 static bool access_ok(GPGPUState *s, const Bar0Group *g, hwaddr off, unsigned int size)
 {
 	if (size == 4 && !(off & 3))
@@ -80,6 +80,7 @@ static bool access_ok(GPGPUState *s, const Bar0Group *g, hwaddr off, unsigned in
 	return false;
 }
 
+/* off 是组内偏移，加上组基址后交给模块，模块看到的是完整 BAR0 偏移。 */
 static uint64_t group_read(void *opaque, hwaddr off, unsigned int size)
 {
 	GPGPUBar0Region *r = opaque;
@@ -116,74 +117,102 @@ static void add_group(GPGPUState *s, GPGPUBar0Region *r, const Bar0Group *g, int
 }
 
 /*
- * 1. 建立 1 MiB 容器并铺上背景区；2. 挂入各寄存器组；3. 注册 BAR 0。
- * MSI-X 表与 PBA 由 irq.c 随后挂在容器末尾，覆盖背景区。
+ * gpgpu_bar0_init() - 建立 BAR0 寄存器空间
+ *
+ * BAR0 是一个 1 MiB 的容器区域，本身不处理访问，访问按偏移落到其中的
+ * 子区域，再由各模块的读写函数处理：
+ *
+ * 1. 建立容器，先铺一个覆盖整个 BAR0、优先级为 -1 的背景区，
+ *    使没有定义寄存器的偏移也按统一宽度规则读零、忽略写入；
+ * 2. 以优先级 0 挂入各寄存器组和 HQD 窗口，覆盖对应位置的背景区；
+ * 3. 把容器注册为 64 位内存 BAR 0。
+ *
+ * MSI-X 表与 PBA 由 irq.c 随后挂在容器末尾，同样覆盖背景区。
  */
 void gpgpu_bar0_init(GPGPUState *s)
 {
 	GPGPUBar0Region *regions = s->bar0_regions;
 
-	/* 1. 容器与背景区。 */
+	/* 1. 1 MiB 容器，背景区放在 regions[0]，优先级最低。 */
 	memory_region_init(&s->bar0, OBJECT(s), "gpgpu-bar0", GPGPU_CTRL_BAR_SIZE);
 	add_group(s, &regions[0], &bar0_background, -1);
 
-	/* 2. 寄存器组。 */
+	/*
+	 * 2. bar0_groups 依次放在 regions[1..]，HQD 窗口放在最后一项；
+	 *    数量由文件前部的 QEMU_BUILD_BUG_ON 核对。
+	 */
 	for (unsigned int i = 0; i < ARRAY_SIZE(bar0_groups); i++)
 		add_group(s, &regions[i + 1], &bar0_groups[i], 0);
 	add_group(s, &regions[ARRAY_SIZE(bar0_groups) + 1], &bar0_hqd_window, 0);
 
-	/* 3. BAR。 */
+	/* 3. 注册为 64 位内存 BAR，此后 Host 才能看到这段寄存器空间。 */
 	pci_register_bar(PCI_DEVICE(s), 0,
 			 PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &s->bar0);
 }
 
 /* ---- CP 本地寄存器窗口 ---- */
 
-/* CP 视图的 GPUVM 只读部分：版本、模式、握手、失效状态与上下文。 */
+/*
+ * CP 视图中 GPUVM 可读范围的结束偏移（不含）：0x900 起的版本、模式、
+ * 握手、失效状态与上下文寄存器可读，0xa00 起的故障组不开放给 CP。
+ */
 #define CP_VM_READ_END 0x0a00
 
+/* reg 所在寄存器组的起始偏移，例如 0x804 属于 0x800 起的 IH 组。 */
+static hwaddr reg_group(hwaddr reg)
+{
+	return reg & ~(hwaddr)(REG_GROUP_SIZE - 1);
+}
+
+/* 与 BAR0 相同的宽度规则：只接受对齐的 32 位访问，IH 组另记协议故障。 */
 static bool cp_access_ok(GPGPUState *s, hwaddr reg, unsigned int size)
 {
 	if (size == 4 && !(reg & 3))
 		return true;
 	gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
-	if ((reg & ~(hwaddr)(REG_GROUP_SIZE - 1)) == GPGPU_REG_IH_BASE_LO)
+	if (reg_group(reg) == GPGPU_REG_IH_BASE_LO)
 		gpgpu_ih_protocol_fault(s);
 	return false;
 }
 
-/* CP 可读：VM 0x900–0x9ff、Dispatch、IH 与 ERROR_STATUS；其余锁存 INVALID_CMD。 */
+/* CP 可读：VM 0x900～0x9ff、Dispatch、IH 与 ERROR_STATUS；其余锁存 INVALID_CMD。 */
 static uint64_t cp_regs_read(void *opaque, hwaddr reg, unsigned int size)
 {
 	GPGPUState *s = opaque;
 
 	if (!cp_access_ok(s, reg, size))
 		return 0;
+
 	if (reg >= GPGPU_REG_VM_VERSION && reg < CP_VM_READ_END)
 		return gpgpu_vm_read(s, reg);
-	if ((reg & ~(hwaddr)(REG_GROUP_SIZE - 1)) == GPGPU_REG_KERNEL_ADDR_LO)
+	if (reg_group(reg) == GPGPU_REG_KERNEL_ADDR_LO)
 		return gpgpu_dispatch_read(s, reg);
-	if ((reg & ~(hwaddr)(REG_GROUP_SIZE - 1)) == GPGPU_REG_IH_BASE_LO)
+	if (reg_group(reg) == GPGPU_REG_IH_BASE_LO)
 		return gpgpu_ih_read(s, reg);
 	if (reg == GPGPU_REG_ERROR_STATUS)
 		return gpgpu_global_read(s, reg);
+
 	gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 	return 0;
 }
 
-/* CP 可写：VM_FIRMWARE 握手、Dispatch 与 IH_SUBMIT；版本不符或其余偏移锁存 INVALID_CMD。 */
+/*
+ * CP 可写：VM_FIRMWARE 握手、Dispatch 与 IH_SUBMIT。
+ * 握手版本不符或其余偏移锁存 INVALID_CMD。
+ */
 static void cp_regs_write(void *opaque, hwaddr reg, uint64_t value, unsigned int size)
 {
 	GPGPUState *s = opaque;
 
 	if (!cp_access_ok(s, reg, size))
 		return;
+
 	if (reg == GPGPU_REG_VM_FIRMWARE) {
 		if (!gpgpu_vm_firmware_handshake(s, value))
 			gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
-	} else if ((reg & ~(hwaddr)(REG_GROUP_SIZE - 1)) == GPGPU_REG_KERNEL_ADDR_LO) {
+	} else if (reg_group(reg) == GPGPU_REG_KERNEL_ADDR_LO) {
 		gpgpu_dispatch_cp_write(s, reg, value);
-	} else if ((reg & ~(hwaddr)(REG_GROUP_SIZE - 1)) == GPGPU_REG_IH_BASE_LO) {
+	} else if (reg_group(reg) == GPGPU_REG_IH_BASE_LO) {
 		gpgpu_ih_cp_write(s, reg, value);
 	} else {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);

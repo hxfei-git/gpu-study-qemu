@@ -6,7 +6,7 @@
  * 建队列与事件、组 AQL 包、准备 Signal 并等待。本层把这些固定步骤收起来，
  * 应用只描述“哪段代码、什么参数、多大网格”：
  *
- *   gpgpu_rt_create()            建一条队列、一个事件与上传用的暂存区
+ *   gpgpu_rt_create()            分配暂存区、参数块、Ring、进度页与 Signal
  *   gpgpu_rt_kernel_load()       上传代码并生成 Kernel 描述对象（均在 VRAM）
  *   gpgpu_rt_buffer_alloc()      VRAM 数据区，可 upload/download
  *   gpgpu_rt_dispatch()          写参数、组包、提交并等待完成

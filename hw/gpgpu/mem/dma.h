@@ -2,9 +2,9 @@
 /*
  * DMA：Host RAM 与 VRAM 之间的描述符搬运
  *
- * 驱动写好源、目的和长度后写 DMA_CTRL.START。设备在写寄存器的同一次调用里
- * 同步完成数据搬运，再延迟 1 ms 发布 COMPLETE 和完成中断，模拟真实引擎的
- * 完成时延。Host 端地址是 GPU 物理地址，经 Outbound 换算为 IOVA。
+ * 驱动写好源、目的和长度后写 DMA_CTRL.START。设备在写寄存器的同一次
+ * 调用里同步完成数据搬运，再延迟 1 ms 发布 COMPLETE 和完成中断，模拟
+ * 真实引擎的完成时延。Host 端地址是 GPU 物理地址，经 Outbound 换算为 IOVA。
  */
 #ifndef HW_GPGPU_MEM_DMA_H
 #define HW_GPGPU_MEM_DMA_H

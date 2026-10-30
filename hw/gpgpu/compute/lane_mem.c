@@ -20,11 +20,17 @@ bool gpgpu_lane_fetch(GPGPUExecContext *ctx, uint32_t pc, uint32_t *insn)
 	const GPGPUKernelParams *p = &ctx->params;
 	uint8_t buf[4];
 
+	/*
+	 * 越出代码范围的 pc 不交给 gpgpu_user_rw()，这里自行记一条
+	 * RANGE 故障，与其他取指故障一样归属到来源槽。
+	 */
 	if (!fetch_in_code_range(p, pc)) {
 		gpgpu_vm_record_fault(ctx->device, p->vmid, p->source_slot, pc, GPGPU_VM_EXEC,
 				      GPGPU_VM_PHASE_FETCH, GPGPU_VM_FAULT_RANGE);
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_CODE_RANGE);
 	}
+
+	/* 翻译或读取失败时故障已由 gpgpu_user_rw() 记录，同样报 CODE_RANGE。 */
 	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, pc, buf, sizeof(buf),
 			   GPGPU_VM_EXEC, GPGPU_VM_PHASE_FETCH))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_CODE_RANGE);

@@ -56,7 +56,7 @@ extern volatile u32 cp_stopped;
 /* 设备以 gpuvm=on 启动；启动时从 VM_MODE 读取。 */
 extern u32 cp_gpuvm;
 
-/* ---- 寄存器访问（main.c 之外也会用到的内联函数） ---- */
+/* ---- 寄存器访问：CP 本地寄存器、访存窗口配置与 HQD 窗口 ---- */
 
 /* 建立 CP 内存访问与 MMIO 之间的顺序。 */
 static inline void cp_fence(void)
@@ -82,16 +82,20 @@ static inline void cp_window_write(u32 offset, u32 value)
 	*(volatile u32 *)(unsigned long)(GPGPU_CP_WINDOW_REGS + offset) = value;
 }
 
+/* HQD 槽 slot 中字段 field（GPGPU_HQD_* 偏移）在 CP 本地地址空间的位置。 */
+static inline volatile u32 *cp_hqd_reg(u32 slot, u32 field)
+{
+	return (volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE + field);
+}
+
 static inline u32 cp_hqd_read(u32 slot, u32 field)
 {
-	return *(volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE +
-						field);
+	return *cp_hqd_reg(slot, field);
 }
 
 static inline void cp_hqd_write(u32 slot, u32 field, u32 value)
 {
-	*(volatile u32 *)(unsigned long)(GPGPU_CP_HQD_BASE + slot * GPGPU_HQD_STRIDE + field) =
-		value;
+	*cp_hqd_reg(slot, field) = value;
 }
 
 /* 读 HQD 中 LO/HI 字段对组成的静态地址；不用于读取动态共享值。 */
@@ -178,7 +182,10 @@ int cp_retire(u32 slot);
 
 /* 处理 KIQ 或 HIQ 中的一条管理命令。 */
 void cp_management(u32 slot);
-/* 处理用户槽中的一个派发包；本轮做了工作（成功或出错）返回 1。 */
+/*
+ * 处理用户槽中的一个派发包。提交过执行器或调度已停止时返回 1；
+ * 没有可执行的包，或提交执行器前就已出错时返回 0。
+ */
 int cp_aql(u32 slot);
 /* 启动检查与调度循环。 */
 void cp_main(void) __attribute__((noreturn));

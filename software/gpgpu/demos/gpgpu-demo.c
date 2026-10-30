@@ -40,6 +40,7 @@ typedef struct DemoJob {
 	GpgpuRtDim3 block;
 } DemoJob;
 
+/* status 非成功时打印“what：原因”并返回 -1，成功返回 0。 */
 static int check(GpgpuKmtStatus status, const char *what)
 {
 	if (status == GPGPU_KMT_SUCCESS)
@@ -83,13 +84,16 @@ static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 	if (arg_count > GPGPU_RT_MAX_ARGS)
 		return -1;
 
-	/* 1. 运行时。 */
+	/* 1. 暂存区要能容纳最大的一次上传、下载或代码。 */
 	for (uint32_t i = 0; i < job->array_count; i++)
 		staging = job->arrays[i].bytes > staging ? job->arrays[i].bytes : staging;
 	if (check(gpgpu_rt_create(ctx, staging, &rt), "建立运行时"))
 		return -1;
 
-	/* 2. Kernel 与数据。 */
+	/*
+	 * 2. 第一次派发前必须分配完所有对象。参数块前 array_count 个是
+	 *    数组的 32 位设备地址，后面接标量。
+	 */
 	if (check(gpgpu_rt_kernel_load(rt, job->code, job->code_size, arg_count, &kernel),
 		  "装载 Kernel"))
 		goto out;
@@ -102,7 +106,7 @@ static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 	}
 	memcpy(&args[job->array_count], job->scalars, job->scalar_count * sizeof(uint32_t));
 
-	/* 3. 派发。 */
+	/* 3. 派发是同步的，返回时输出已写完，再下载最后一个数组。 */
 	if (check(gpgpu_rt_dispatch(rt, &kernel, args, arg_count, job->grid, job->block,
 				    DEMO_TIMEOUT_MS),
 		  "派发") ||
@@ -111,13 +115,16 @@ static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 		goto out;
 	rc = 0;
 out:
-	/* 4. 回收。 */
+	/* 4. 成败都回收运行时；回收失败也算示例失败。 */
 	if (check(gpgpu_rt_destroy(rt), "回收运行时"))
 		rc = -1;
 	return rc;
 }
 
-/* 17,003 个元素：覆盖多次 64 KiB 分块与最后一个工作组中多出的线程。 */
+/*
+ * 17,003 个元素，不是 64 的整数倍：266 个工作组中最后一组只有 43 个
+ * 线程对应有效元素，Kernel 须按 count 跳过其余线程。
+ */
 static int vector_add_demo(GpgpuKmtContext *ctx)
 {
 	const uint32_t count = 17003;
@@ -243,6 +250,7 @@ int main(int argc, char **argv)
 	if (check(gpgpuKmtGetVmInfo(ctx, &info), "查询 GPUVM"))
 		goto out;
 	printf("GPGPU DRM ABI=%u GPUVM=%s\n", info.version, info.range_count ? "on" : "off");
+
 	if (vector_add_demo(ctx) || matmul_demo(ctx) || relu_demo(ctx))
 		goto out;
 	rc = EXIT_SUCCESS;

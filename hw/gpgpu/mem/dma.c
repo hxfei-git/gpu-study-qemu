@@ -23,6 +23,7 @@ static void dma_complete(void *opaque)
 		gpgpu_raise_irq(s, GPGPU_IRQ_DMA_DONE);
 }
 
+/* 描述符非法或 Host 访问失败：状态置 ERROR，并锁存全局 DMA_FAULT。 */
 static void dma_fail(GPGPUState *s)
 {
 	s->dma.status = GPGPU_DMA_ERROR;
@@ -32,11 +33,18 @@ static void dma_fail(GPGPUState *s)
 /*
  * dma_start() - 处理一次 DMA_CTRL 写入
  *
- * 1. 锁存方向与中断位，未带 START 时到此为止；
- * 2. 检查描述符：设备已使能、长度非零、VRAM 端完整在 VRAM 内、Host 端可路由
- *    且不在 VRAM 内；
- * 3. 映射 VRAM 端，与 Host 端直接搬运；失败保留已写入部分；
- * 4. 安排定时器延迟发布 COMPLETE。
+ * 驱动先写源、目的和长度，最后写 DMA_CTRL。方向位决定哪一端是 VRAM：
+ * H2D 时源在 Host、目的在 VRAM，D2H 时相反。数据在本次写寄存器的调用里
+ * 同步搬完，完成状态再延迟发布：
+ *
+ * 1. 锁存方向与中断使能位；没有 START 位时只更新这两位，不搬运；
+ * 2. 检查描述符：设备已使能、长度非零、VRAM 端完整位于 VRAM 内，
+ *    Host 端不在 VRAM 范围内且落在已使能的 Outbound 窗口里。
+ *    不合法时置 ERROR 并锁存 DMA_FAULT，不搬运；
+ * 3. 置 BUSY，把 VRAM 端映射成一段 Host 指针，再经 gpgpu_phys_rw()
+ *    与 Host 端直接互拷。Host 访问失败时置 ERROR，已写入的部分保留；
+ * 4. 搬运成功后安排 1 ms 定时器，到期才发布 COMPLETE 和完成中断，
+ *    模拟真实引擎的完成时延。BUSY 期间描述符不能改写。
  */
 static void dma_start(GPGPUState *s, uint32_t ctrl)
 {
@@ -47,19 +55,22 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 	MemTxResult result;
 	void *vram;
 
-	/* 1. 控制位。 */
+	/* 1. START 不锁存，读回 DMA_CTRL 只有方向与中断使能位。 */
 	d->ctrl = ctrl & (GPGPU_DMA_DIR_FROM_VRAM | GPGPU_DMA_IRQ_ENABLE);
 	if (!(ctrl & GPGPU_DMA_START))
 		return;
 
-	/* 2. 描述符。 */
+	/* 2. 两端范围检查，任一项不满足即失败。 */
 	if (!gpgpu_enabled(s) || !d->size || !gpgpu_vram_contains(s, vram_addr, d->size) ||
 	    host_addr < gpgpu_vram_size(s) || !gpgpu_phys_contains(s, host_addr, d->size)) {
 		dma_fail(s);
 		return;
 	}
 
-	/* 3. 搬运：VRAM 端只读（D2H）或只写（H2D）。 */
+	/*
+	 * 3. VRAM 端映射：D2H 时只读，H2D 时只写；Host 端读写方向与之相反。
+	 *    Host 端走 Outbound 时经 vfio-user DMA，可能暂时释放主锁。
+	 */
 	d->status = GPGPU_DMA_BUSY;
 	vram = gpgpu_vram_map(s, vram_addr, d->size, !to_host);
 	result = gpgpu_phys_rw(s, host_addr, vram, d->size, to_host);
@@ -69,7 +80,7 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 		return;
 	}
 
-	/* 4. 延迟完成。 */
+	/* 4. 状态保持 BUSY，直到定时器回调 dma_complete() 发布 COMPLETE。 */
 	timer_mod(d->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DMA_COMPLETION_DELAY_MS);
 }
 
@@ -99,11 +110,12 @@ void gpgpu_dma_write(GPGPUState *s, hwaddr reg, uint32_t value)
 {
 	GPGPUDMAState *d = &s->dma;
 
-	/* BUSY 期间描述符和 CTRL 都不能改写。 */
+	/* BUSY 期间描述符和 CTRL 都不能改写；它们的偏移都不大于 DMA_CTRL。 */
 	if (d->status == GPGPU_DMA_BUSY && reg <= GPGPU_REG_DMA_CTRL) {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 		return;
 	}
+
 	switch (reg) {
 	case GPGPU_REG_DMA_SRC_LO:
 	case GPGPU_REG_DMA_SRC_HI:

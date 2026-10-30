@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include "kmt_internal.h"
 
+/* 把 value 向上取整到 alignment 的倍数；alignment 为 2 的幂。 */
 static uint64_t align_up(uint64_t value, uint64_t alignment)
 {
 	return (value + alignment - 1) & ~(alignment - 1);
@@ -61,11 +62,20 @@ static bool map_error_uncertain(int error)
 /*
  * gpgpuKmtAllocMemory() - 创建并绑定一个整对象
  *
- * 1. 创建 GEM 对象；
- * 2. Host 对象建立 CPU 映射；
- * 3. 选定 GPU 地址（GPUVM 关闭时由驱动返回物理地址）并绑定；
- * 4. 登记到连接。
- * 整个过程持连接锁，保证并发分配不会选到同一个 GPUVA。
+ * 一个内存对象由三部分组成：驱动中的 GEM 对象、Host 对象在本进程的 CPU
+ * 映射，以及设备可用的 GPU 地址。依次建立：
+ *
+ * 1. GPGPU_DRM_BO_CREATE 创建 GEM 对象，驱动返回句柄、页对齐后的
+ *    mapped_size 和 mmap 偏移；
+ * 2. Host 对象用 mmap 建立 CPU 映射。VRAM 对象没有 CPU 映射，
+ *    只能经 CopyMemory 访问；
+ * 3. GPUVM 开启时由库在可分配区间中挑选对齐的 GPUVA（或使用 fixed_va），
+ *    再用 GPGPU_DRM_MAP 让驱动写页表；关闭时驱动在 map.address 中返回
+ *    GPU 物理地址。绑定失败且驱动可能已写入部分页表时标记 uncertain；
+ * 4. 填写公开信息，挂到连接的 memory 链表。
+ *
+ * 第 2、3 步失败时解除 CPU 映射并关闭 GEM 句柄。整个过程持连接锁，
+ * 保证并发分配不会选到同一个 GPUVA。
  */
 GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t size,
 				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
@@ -92,17 +102,19 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 	if (status != GPGPU_KMT_SUCCESS)
 		goto free_m;
 	pthread_mutex_lock(&c->lock);
+
+	/* GPUVM 关闭时设备地址由驱动分配，不能指定 fixed_va。 */
 	if (!c->gpuvm && fixed_va) {
 		status = GPGPU_KMT_NOT_SUPPORTED;
 		goto out;
 	}
 
-	/* 1. GEM 对象。 */
+	/* 1. 创建 GEM 对象，取得句柄、mapped_size 和 mmap 偏移。 */
 	status = kmt_ioctl(c, GPGPU_DRM_BO_CREATE, &create);
 	if (status != GPGPU_KMT_SUCCESS)
 		goto out;
 
-	/* 2. CPU 映射。 */
+	/* 2. 只有 Host 对象建立 CPU 映射。 */
 	if (kind == GPGPU_MEMORY_HOST) {
 		cpu = mmap(NULL, create.mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, c->fd,
 			   create.mmap_offset);
@@ -113,7 +125,10 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 		}
 	}
 
-	/* 3. GPU 绑定。 */
+	/*
+	 * 3. GPUVM 开启时先选 GPUVA，再请驱动写页表；
+	 *    关闭时 address 为 0，由驱动填回 GPU 物理地址。
+	 */
 	map.handle = create.handle;
 	if (c->gpuvm) {
 		map.address = fixed_va ? fixed_va :
@@ -132,7 +147,7 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 		goto undo;
 	}
 
-	/* 4. 登记。 */
+	/* 4. 挂入链表后把 m 置 NULL，避免末尾的 free 释放它。 */
 	m->pub = (GpgpuKmtMemory) {
 		.kind = kind,
 		.size = size,
@@ -165,9 +180,16 @@ free_m:
 /*
  * gpgpuKmtFreeMemory() - 释放内存对象
  *
- * 连接中有任何存活队列时地址空间冻结，拒绝释放。
- * 1. 解除 GPU 绑定；2. 解除 CPU 映射；3. 关闭句柄；4. 摘除并释放。
- * 任一步失败都返回错误并保留对象，已完成的步骤记在对象上，可以重试。
+ * 连接中还有存活队列时地址空间冻结，返回 UNAVAILABLE；本对象被某条队列
+ * 用作 Ring 或进度时同样拒绝。按与分配相反的顺序撤销：
+ *
+ * 1. GPGPU_DRM_UNMAP 解除 GPU 绑定，设备不能再经这个地址访问对象；
+ * 2. 解除 CPU 映射；
+ * 3. 关闭 GEM 句柄；
+ * 4. 从连接链表摘除，释放库内对象。
+ *
+ * 任一步失败都返回错误并保留对象。已完成的步骤记在 bound 和 cpu 上，
+ * 重试时不会重复执行。
  */
 GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 {
@@ -182,12 +204,14 @@ GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 	pthread_mutex_lock(&c->lock);
+
+	/* 队列存活期间地址空间冻结，任何对象都不能释放。 */
 	if (m->queue_users || c->queues) {
 		status = GPGPU_KMT_UNAVAILABLE;
 		goto out;
 	}
 
-	/* 1. GPU 绑定。 */
+	/* 1. 解绑成功后清除 bound。 */
 	if (m->bound) {
 		unmap.address = m->pub.gpu_address;
 		status = kmt_ioctl(c, GPGPU_DRM_UNMAP, &unmap);
@@ -196,7 +220,7 @@ GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 		m->bound = false;
 	}
 
-	/* 2. CPU 映射。 */
+	/* 2. 解除映射成功后清空 cpu。 */
 	if (m->pub.cpu) {
 		if (munmap(m->pub.cpu, m->pub.mapped_size)) {
 			status = kmt_status(errno);
@@ -205,12 +229,12 @@ GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 		m->pub.cpu = NULL;
 	}
 
-	/* 3. 句柄。 */
+	/* 3. 关闭句柄，驱动放下本连接对 GEM 对象的引用。 */
 	status = gem_close(c, m->handle);
 	if (status != GPGPU_KMT_SUCCESS)
 		goto out;
 
-	/* 4. 摘除。 */
+	/* 4. 从链表摘除并释放库内对象。 */
 	KMT_UNLINK(&c->memory, m);
 	free(m);
 out:
@@ -219,6 +243,10 @@ out:
 	return status;
 }
 
+/*
+ * 请驱动在 Host 对象与 VRAM 对象之间同步复制，返回时复制已结束。
+ * 两个对象须属于同一连接，各自的范围不超过请求长度。
+ */
 GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset,
 				  GpgpuKmtMemory *vram, uint64_t vram_offset, uint64_t size,
 				  uint32_t direction)
@@ -230,6 +258,7 @@ GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset,
 	    h->context != v->context || h->pub.kind != GPGPU_MEMORY_HOST ||
 	    v->pub.kind != GPGPU_MEMORY_VRAM || direction > GPGPU_COPY_D2H)
 		return GPGPU_KMT_INVALID_PARAMETER;
+
 	args = (struct gpgpu_memory_copy) {
 		.version = GPGPU_DRM_VERSION,
 		.direction = direction,
