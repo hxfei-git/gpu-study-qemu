@@ -39,21 +39,275 @@ RISC-V 裸机编译器 `riscv64-unknown-elf-gcc`、Rust 和 `bindgen-cli`。
 
 ## 代码风格与命名
 
-遵循 `.editorconfig` 和 `docs/devel/style.rst`：C 使用四个空格缩进，
-Makefile 配方使用制表符，文件使用 LF 换行，每行尽量不超过 80 列。
-`hw/gpgpu/` 和 `software/` 下的自有 C 代码按用户要求采用 Linux 风格，
-以目录内的 `.editorconfig` 和 `.clang-format` 为准：使用 8 列制表符，
-函数左花括号另起一行，结构体每行只声明一个成员，每行尽量不超过 100 列。
-结构体、成员、枚举值和宏说明用途及单位；接口实现前说明作用、执行思路，
-涉及地址空间、锁、引用或发布顺序时一并写明。Python 和汇编入口也应有用途说明。
-固定版本的外部内核补丁、配置和打包文件保持原貌，不参与批量格式化。
-函数和变量使用 `snake_case`，类型使用 `CamelCase`，宏使用大写。
-QEMU 设备的 C 源文件首先包含 `qemu/osdep.h`。
-用 `scripts/checkpatch.pl --branch HEAD^..HEAD` 检查最新提交。
-上述两个目录使用 Linux 的 `checkpatch.pl` 和 `scripts/kernel-doc -none`
+新增和修改的 C 代码遵循本节规则。各小节先写规则，再给示例；示例中的
+`ring_*`、`GPGPURing*`、`GPGPU_RING_*` 等名称只用于说明写法，仓库中并不存在。
+
+### 适用范围与格式
+
+`hw/gpgpu/` 和 `software/` 下的自有 C 代码采用 Linux 风格，以目录内的
+`.editorconfig` 和 `.clang-format` 为准：使用 8 列制表符，函数左花括号另起一行，
+结构体每行只声明一个成员，每行尽量不超过 100 列，续行与左括号对齐。
+其他目录遵循 `.editorconfig` 和 `docs/devel/style.rst`：C 使用四个空格缩进，
+每行尽量不超过 80 列。缩进和列宽按目录区分，其余规则对全部新增 C 代码适用。
+Makefile 配方使用制表符，文件使用 LF 换行。固定版本的外部内核补丁、配置和
+打包文件保持原貌，不参与批量格式化。
+
+类型命名沿用所在层的写法。QEMU 设备、CP 固件和用户库使用
+`typedef struct CamelCase`；Linux 驱动使用 `struct gpgpu_xxx` 和 `u32`、`u64`，
+不加 `typedef`。Python、Rust 和汇编保持各自的格式规则，入口处写明用途。
+
+### 文件结构
+
+- 第一行是 SPDX 许可证声明，`.c` 用 `//`，`.h` 用 `/* */`；
+- 随后用块注释写“模块：职责”；头文件还要说明谁调用本模块、数据经过哪些层，
+  路径有分支时画出简图；
+- QEMU 设备的 C 源文件首先包含 `qemu/osdep.h`，再依次包含 `qemu/*`、`hw/gpgpu/*`
+  和本目录头文件；
+- `.c` 文件开头放私有宏和常量表，被调用的静态函数放在调用者之前，不写前置声明；
+  寄存器读写放在访问路径之后，握手与复位放在文件末尾。
+
+```c
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Ring：IH 记录的写入、发布与故障记录
+ *
+ * CP 提交记录和设备复位都经过本模块：
+ *
+ *   enable=1   记录 ─校验─▶ Host Ring ─▶ 发布 W ─▶ 调用者发中断
+ *   enable=0   拒绝提交，记录 CONTEXT 故障
+ */
+#ifndef HW_GPGPU_IRQ_RING_H
+#define HW_GPGPU_IRQ_RING_H
+```
+
+```c
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Ring：IH 记录的写入、发布与故障记录
+ */
+#include "qemu/osdep.h"
+#include "qemu/bswap.h"
+#include "hw/gpgpu/gpgpu_state.h"
+#include "ring.h"
+```
+
+### 宏与常量
+
+每个宏和枚举值都用注释写清含义和单位。步长、范围从已有寄存器宏或其他宏推导，
+不直接写魔数。模块私有宏使用模块短前缀，跨文件或协议宏使用 `GPGPU_` 前缀。
+按编号查找的固定数据用 `static const` 数组，注释说明下标与含义的对应关系。
+
+```c
+/* 每条 Ring 的记录条数，等于 W 低 7 位能表示的槽数。 */
+#define RING_ENTRIES 128
+/* 每条记录的字节数。 */
+#define RING_ENTRY_SIZE 32
+/* 每条 Ring 的寄存器组在 BAR0 中占用的字节数。 */
+#define RING_STRIDE (GPGPU_REG_RING(1) - GPGPU_REG_RING(0))
+
+/* 各记录类型的有效载荷字节数，下标为 GPGPU_RING_TYPE_*。 */
+static const unsigned int ring_payload_size[] = { 0, 8, 16 };
+```
+
+### 命名
+
+函数和变量使用 `snake_case`，宏使用大写。
+
+- 对外函数写成 `gpgpu_<模块>_<动作>`，静态函数使用模块短前缀或直接描述动作；
+- 返回 `bool` 的判断函数以 `_valid`、`_ok`、`_enabled`、`_busy` 结尾；
+- 根据寄存器偏移查归属的函数以 `_of` 结尾，返回编号，经输出参数给出组内偏移；
+- 参数名在同一模块内保持一致：`s` 为设备实例，`ctx` 为上下文，`reg` 为寄存器偏移，
+  `field` 为组内偏移。
+
+```c
+void gpgpu_ring_reset(GPGPUState *s);
+static bool ring_addr_valid(const GPGPURing *ring, uint64_t addr);
+static bool ring_busy(GPGPUState *s, unsigned int id);
+static unsigned int ring_of(hwaddr reg, hwaddr *field);
+```
+
+### 注释
+
+注释写原因、约束和失败结果，不逐句复述代码。按函数复杂度分三级。
+
+第一级是对外接口和结构体。kernel-doc 写在头文件，`.c` 中不再重复。
+参数说明写清取值范围、地址类型和调用者需持有的锁；结构体成员写明单位、
+对齐和特殊值。
+
+```c
+/**
+ * struct GPGPURing - 一条 IH Ring 的状态
+ * @base: Ring 的 Host 物理地址，按 4 KiB 对齐。
+ * @rptr_addr: Host 回报消费进度的 8 字节槽地址，按 8 字节对齐。
+ * @wptr: 下一条待写记录的编号，32 位回绕。
+ * @enabled: Host 配置完成后置位；置位期间 @base 只读。
+ */
+typedef struct GPGPURing {
+	uint64_t base;
+	uint64_t rptr_addr;
+	uint32_t wptr;
+	bool enabled;
+} GPGPURing;
+
+/**
+ * gpgpu_ring_push() - 向 Ring 写入并发布一条记录
+ * @s: 设备实例，调用者持有主锁。
+ * @id: Ring 编号；越界时返回 false。
+ * @rec: 32 字节记录，按小端写入。
+ *
+ * Ring 已满时不覆盖旧记录。
+ *
+ * Return: 记录已写入且 W 已发布时为 true。
+ */
+bool gpgpu_ring_push(GPGPUState *s, unsigned int id, const void *rec);
+```
+
+第二级是一两句话能说清的静态函数，上方只写一行 `/* */`，说明它检查什么或返回什么。
+
+```c
+/* 记录地址必须按 32 字节对齐，且整条记录落在 Ring 内。 */
+static bool ring_addr_valid(const GPGPURing *ring, uint64_t addr)
+```
+
+第三级是包含多个步骤，或涉及地址拆分、锁、在途计数、发布顺序、对象寿命的静态函数。
+函数头用 `/*` 开头，沿用 `name() - 一句话` 和 `Return:` 的写法，依次说明：
+
+1. 作用和调用者，以及为什么要分步；
+2. 涉及位段或地址换算时，给出位段图和带具体数值的例子；
+3. 编号步骤，每步写动作、原因和失败结果；
+4. 本函数不负责、交给谁完成的工作；
+5. `Return:`。
+
+函数体内用 `/* 1. … */` 标出相同编号，与函数头一一对应。
+
+```c
+/*
+ * ring_submit() - 校验并发布一条记录
+ *
+ * CP 提交 IH 记录时调用。Host 只读取编号小于 W 的记录，所以必须先写完
+ * 记录内容，再推进 W，否则 Host 可能读到半条记录。记录位置由 W 换算：
+ *
+ *   W 位     31..7       6..0
+ *   用途     回绕次数    槽号（Ring 共 128 条）
+ *
+ * 例：W = 0x0000_0085 写入槽 5，地址为 base + 5 × 32 = base + 0xa0。
+ *
+ * 1. 检查 Ring 已启用、未满，否则记 CONTEXT 故障；
+ * 2. 写入记录内容，失败记 STORAGE 故障，W 保持不变；
+ * 3. 内容写成功后推进 W。
+ *
+ * 函数不发中断，由调用者在返回成功后通知 Host。
+ *
+ * Return: 0 表示成功，否则为 GPGPU_RING_FAULT_*。
+ */
+static uint32_t ring_submit(GPGPUState *s, GPGPURing *ring, void *rec)
+{
+	uint64_t addr;
+
+	/* 1. 未启用或已满时不写任何内容。 */
+	if (!ring->enabled || ring_full(ring))
+		return GPGPU_RING_FAULT_CONTEXT;
+
+	/* 2. 按 W 的低 7 位定位槽号，写入整条记录。 */
+	addr = ring->base + (ring->wptr % RING_ENTRIES) * RING_ENTRY_SIZE;
+	if (gpgpu_phys_rw(s, addr, rec, RING_ENTRY_SIZE, true) != MEMTX_OK)
+		return GPGPU_RING_FAULT_STORAGE;
+
+	/* 3. 记录已写入，Host 此后可以读取这一条。 */
+	ring->wptr++;
+	return 0;
+}
+```
+
+注释中的长十六进制数按 4 位分组书写，如 `0x8000_1234`；代码中的常量保留 C 语法。
+
+### 控制流
+
+- 函数入口先做保护性检查，不满足条件时立即返回；
+- 单语句的 `if`、`for` 体不加花括号；
+- 多个失败点共用同一段收尾时，用 `goto fail`、`goto invalid` 一类标签集中处理，
+  标签前留一个空行；
+- 检查、处理、收尾三段之间用空行分开；
+- 局部变量声明在所在块的开头，与第一条语句之间空一行；循环计数器在 `for` 中声明；
+  只在循环内使用的变量声明在循环体内；
+- 判断零值和空指针写 `!x`；
+- 整体给结构体赋值用复合字面量，清零用 `memset`；
+- `switch` 的 `case` 不缩进，`default` 分支给出明确的返回值；
+- 只读访问的结构体指针加 `const`；
+- 优先复用已有辅助函数，如 `MIN`、`is_power_of_2`，不重写相同逻辑。
+
+```c
+static bool ring_write(GPGPUState *s, unsigned int id, uint64_t addr, void *buf, size_t len)
+{
+	uint32_t reason;
+
+	if (!ring_addr_valid(&s->ring[id], addr)) {
+		reason = GPGPU_RING_FAULT_RANGE;
+		goto fail;
+	}
+	if (gpgpu_phys_rw(s, addr, buf, len, true) != MEMTX_OK) {
+		reason = GPGPU_RING_FAULT_STORAGE;
+		goto fail;
+	}
+	return true;
+
+fail:
+	ring_record_fault(s, id, addr, reason);
+	return false;
+}
+
+static uint32_t ring_reg_read(const GPGPURing *ring, hwaddr field)
+{
+	switch (field) {
+	case GPGPU_RING_WPTR:
+		return ring->wptr;
+	case GPGPU_RING_ENABLE:
+		return ring->enabled;
+	default:
+		return 0;
+	}
+}
+```
+
+### 状态与错误
+
+- 模块内部的检查函数用 `0` 表示成功、非零值表示具体原因；对外接口返回 `bool`，
+  Linux 驱动返回负 errno；
+- 故障只保留首次记录，失败前已完成的部分不回退，并在注释中写明；
+- 设备读取共享内存中的多字节值时，先读到字节缓冲区，再用 `ldq_le_p`、`ldl_le_p`
+  等小端辅助函数解码。
+
+```c
+/* 已有故障时保持首次记录，后续故障不覆盖。 */
+static void ring_record_fault(GPGPUState *s, unsigned int id, uint64_t addr, uint32_t reason)
+{
+	if (id >= GPGPU_RING_COUNT || s->ring_fault[id].reason)
+		return;
+	s->ring_fault[id] = (GPGPURingFault) {
+		.address = addr,
+		.reason = reason,
+	};
+}
+
+static uint32_t ring_read_rptr(GPGPUState *s, const GPGPURing *ring, uint64_t *rptr)
+{
+	uint8_t raw[8];
+
+	if (gpgpu_phys_rw(s, ring->rptr_addr, raw, sizeof(raw), false) != MEMTX_OK)
+		return GPGPU_RING_FAULT_STORAGE;
+	*rptr = ldq_le_p(raw);
+	return 0;
+}
+```
+
+### 检查
+
+用 `scripts/checkpatch.pl --branch HEAD^..HEAD` 检查最新提交。`hw/gpgpu/` 和
+`software/` 使用 Linux 的 `checkpatch.pl` 和 `scripts/kernel-doc -none`
 核对风格及结构体说明；QEMU 检查器的四空格规则不适用于这两个目录。
 Rust 格式检查使用 `make -C build rustfmt`，需要 nightly rustfmt；
 Clippy 的 Meson 开发环境配置见 `docs/devel/rust.rst`。
+工具检查通过后，再按本节各小节逐项核对新增代码。
 
 ## 测试要求
 
