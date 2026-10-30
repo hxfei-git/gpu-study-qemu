@@ -428,8 +428,9 @@ static void test_management(void)
 			 GPGPU_MANAGEMENT_OK);
 	g_assert_cmpuint(queue_manage(&s, 0, GPGPU_UNMAP_QUEUES, GPA(QUEUE_MQD(1))), ==,
 			 GPGPU_MANAGEMENT_OK);
+    /* HIQ 共处理 7 对命令，消费 14 个包。 */
 	g_assert_cmpuint(qtest_readq(s.host, QUEUE_MQD(1) + offsetof(GpgpuMqd, saved_rptr)), ==,
-			 4);
+                         14);
 	cp_stop(&s);
 }
 
