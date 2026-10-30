@@ -18,7 +18,7 @@ LIB_SOURCES = $(wildcard lib/kmt/*.c lib/rt/*.c)
 LIB_OBJECTS = $(patsubst lib/%.c,$(BUILD_DIR)/lib/%.o,$(LIB_SOURCES))
 LIB_HEADERS = $(wildcard lib/include/*.h lib/kmt/*.h include/gpgpu/*.h include/gpgpu/uapi/*.h)
 
-.PHONY: all kernels firmware check clean
+.PHONY: all kernels firmware check check-bootstrap clean
 all: $(BUILD_DIR)/libgpgpu.a $(BUILD_DIR)/gpgpu-demo
 kernels: $(KERNEL_HEADERS) $(KERNEL_BINARIES)
 
@@ -45,6 +45,10 @@ firmware:
 # 汇编器编码回归，不需要设备。
 check:
 	$(PYTHON) kernels/test_assemble.py
+
+# 基础环境的缓存与磁盘保护回归，不需要设备或网络。
+check-bootstrap:
+	$(PYTHON) scripts/test_bootstrap_env.py
 
 clean:
 	rm -rf $(BUILD_DIR)/lib $(BUILD_DIR)/libgpgpu.a $(BUILD_DIR)/gpgpu-demo
