@@ -181,7 +181,7 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
   和 GCC 插件，保留配置、生成头及 `Module.symvers`。该客体默认使用 4 个
   虚拟 CPU、4 GiB 内存和 32 GiB 磁盘，资源参数见 README。
   `--build-mode native` 仍使用原 `build/gpgpu-kernel/` 输出，原发行版环境也保留。
-  构建参数和队列运行命令见 [README](README.md#重建内核与运行队列测试)。
+  当前构建入口见 [README](README.md#51-从零准备基础环境与离线材料)，上述队列入口属于历史记录。
 
 2026-10-19 本轮验收已通过。CP QTest 16/16，单／双进程 SMMUv3 专项
 各 2/2，ARM64／RISC-V 设备检查各 21/21，汇编检查 4/4。
@@ -195,7 +195,7 @@ SMMUv3 模式下 GPGPU domain 类型为 `DMA`，无非预期 SMMU fault。
 结果保存在 `build/gpgpu-kernel-cross/remote/none/queue-test.json` 和
 `build/gpgpu-kernel-cross/stage1-validation.json`。本轮同时修复客体的悬空
 固件目录链接，并将非法参数用例地址移到客体 RAM 与 PCI 窗口之外。
-完整日志和代码依据见 [README](README.md#第二阶段本轮验证状态)；历史第一阶段
+完整日志和代码依据见 [README](README.md#62-第二阶段验证状态历史)；历史第一阶段
 记录保持原日期。
 
 2026-10-19 规格复核仍有管理结果码校验与异常资源回收待修项；既有验收通过

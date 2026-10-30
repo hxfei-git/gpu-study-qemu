@@ -29,6 +29,7 @@
 | TLS | Transport Layer Security | 传输层安全协议 |
 | JSON | JavaScript Object Notation | JavaScript 对象表示法 |
 | ISO | International Organization for Standardization | 此处指 ISO 9660 光盘镜像 |
+| APK | Alpine Linux Package | Alpine 软件包 |
 | SHA-256 | Secure Hash Algorithm 256-bit | 256 位安全散列算法 |
 | BDF | Bus, Device, Function | PCI 总线、设备、功能号 |
 | HSA | Heterogeneous System Architecture | 异构系统架构 |
@@ -171,7 +172,7 @@ KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` �
 
 ## 5. 构建、运行与本次结果
 
-已有开发环境保存在 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`。缺少该环境时先运行内核构建脚本；它使用仓库中的固定源码、配置与工具链清单。
+目标开发环境目录为 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`。缺少该环境时按第 5.1 节先引导基础环境，再运行内核构建脚本；它使用仓库中的固定源码、配置与工具链清单。
 
 ```sh
 # 构建用户库、示例和三个 RV32 Kernel
@@ -195,7 +196,42 @@ make -f Makefile.camp test-gpgpu-qtest
 make -C software/gpgpu check
 ```
 
-以下为协议版本 2 时的运行记录；版本 3 重构后尚未在本文记录新的运行结果。
+2026-10-30 的版本 3 验证：`efd22b0` 的寄存器与 CP QTest 为 11/11，汇编器为 7/7，QEMU 双目标、用户库、示例和 RV64 固件构建通过。固件 SHA-256 为 `d5fc2cb9313c0d6dadaa12932c5b0ee3e38c0027bc8ae9321cabcfe0de3b1449`。
+
+2026-10-30 10:40:58（UTC+8）再次运行 `test-gpgpu-stack`，在环境检查阶段退出：缺少指定开发镜像。实际 Linux kernel release 和模块 SHA-256 均未取得；GPUVM on/off 的 17003/437/513 比较、3/3 汇总、ABI=3 输出和 dmesg 检查均未执行，未生成 `core/summary.json`。不能据此宣布 Linux 全栈验收通过，也没有进入需要按驱动／用户库提交二分的运行阶段。尝试日志在 `build/validation-v3/stack-bootstrap-attempt.log`。
+
+### 5.1 从零准备基础环境与离线材料
+
+先运行独立引导入口，再重建带 DRM/GPU_BUDDY 的实验内核：
+
+```sh
+python3 software/gpgpu/scripts/bootstrap-env.py --list-inputs
+python3 software/gpgpu/scripts/bootstrap-env.py
+python3 software/gpgpu/scripts/kernel-build.py --output-dir build/gpgpu-kernel-gpuvm
+make -f Makefile.camp test-gpgpu-stack
+```
+
+引导入口复用 `kernel-build.py` 的 `download_checked()`。固定 ISO 为 Alpine 3.24.2 aarch64；80 个编译依赖的版本、URL 和 SHA-256 保存在 [bootstrap-packages.json](linux/kernel/bootstrap-packages.json)，两个 6.18.57 内核包沿用 [cached-packages.json](linux/kernel/cached-packages.json)。宿主机先验证全部文件，客体仅从本地安装并保留 APK 签名检查；不运行在线升级或恢复旧同步栈。引导脚本只格式化本次新建的暂存盘，已有未通过校验的开发盘不会被覆盖。安装、重启和内核版本检查都成功后，才发布 `environment.json`。
+
+本机已取得并校验 ISO 与 80 个依赖。镜像移除的两个旧内核包必须从保留同版包的归档或已有缓存补回，文件内容须匹配下列 SHA-256。放置目录为 `build/gpgpu-linux-module/apk-cache/`：
+
+- `linux-virt-6.18.57-r0.ad6fb931.apk`：`b3820fee22e0366a15f7c139e5bc00348e333f3e7f77802271df7ded795aee4f`。
+- `linux-virt-dev-6.18.57-r0.c57a20a2.apk`：`fd3462db5bd0573287ff4aeba0bc35a040af1d218a8871180b134418afad1cac`。
+
+2026-10-30 两个固定 URL 均返回 404，尚未取得可用的同版归档。缓存清单只保存校验信息，不包含 APK 内容。脚本在 `build/gpgpu-linux-module/missing-inputs.json` 列出实际缺件的完整路径、URL、SHA-256 和错误；补齐后可使用 `--offline`，只校验本地缓存。ISO 放在 `build/gpgpu-linux-module/downloads/alpine-virt-3.24.2-aarch64.iso`；完整清单可由 `--list-inputs` 导出。
+
+后续内核重建还需要以下材料；网络不能访问时，按清单固定 URL 获取原文件并放到对应位置，不能改版本或校验值：
+
+- `build/gpgpu-kernel-gpuvm/downloads/linux-6.18.tar.xz`、`patch-6.18.57.patch.xz`：URL 与 SHA-512 在 [sources.json](linux/kernel/sources.json)。当前网络不允许访问 `cdn.kernel.org`。
+- `build/gpgpu-kernel-toolchain/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz`：URL 与 SHA-256 在 [cross-toolchain.json](linux/kernel/cross-toolchain.json)。
+- `build/gpgpu-kernel-host-tools/downloads/`：按 [cross-host-dependencies.json](linux/kernel/cross-host-dependencies.json) 的 `file` 字段放置各包；工具链脚本使用同一清单校验。
+- `build/gpgpu-kernel-gpuvm/apk-cache/`：补充包按 [build-dependencies.json](linux/kernel/build-dependencies.json) 的 `cache_name` 放置，URL 与 SHA-256 也在该清单中。
+
+基础环境的 `environment.json`、`developer.raw`、内核和 initramfs 由引导生成。引导逻辑的缓存与防覆盖回归入口为 `make -C software/gpgpu check-bootstrap`，本次通过 6/6。
+
+2026-10-30 另用已校验 ISO 启动真实 AArch64 客体，离线提交全部 80 个固定依赖包，完成 74 项安装或升级操作，最终为 96 个已安装包，GCC 为 15.2.0。日志保存在 `build/gpgpu-linux-module/bootstrap-package-smoke.log`。该检查使用 ISO 自带的 `6.18.52-0-virt`，仅验证依赖安装；指定的 `6.18.57-0-virt` 开发盘生成与重启验证仍待两个内核包补齐后执行。
+
+以下保留协议版本 2 的历史运行记录。
 
 2026-10-28 已完成版本 2 的全栈构建与核心计算。GPUVM 开启和关闭均通过向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513；每种状态比较 17,953 个结果，客体退出码均为 0。两次运行的驱动与示例散列一致，客体日志未出现内核异常。
 
