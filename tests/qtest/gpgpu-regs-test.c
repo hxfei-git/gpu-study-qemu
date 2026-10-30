@@ -14,9 +14,10 @@
 #include "hw/pci/pci_regs.h"
 #include "gpgpu-test.h"
 
-/* 测试使用的 Host RAM 位置，位于 virt 默认 RAM 内。 */
+/* DMA 测试的 Host 端地址，位于 virt 默认 RAM 内；本文件中无法路由。 */
 #define HOST_BUFFER 0x41000000ULL
 
+/* 进程内设备的测试环境：qts 是 A57 客体，regs、vram 映射 BAR0、BAR2。 */
 typedef struct RegsTest {
 	QTestState *qts;
 	QGenericPCIBus bus;
@@ -30,7 +31,13 @@ static void save_device(QPCIDevice *dev, int devfn, void *opaque)
 	*(QPCIDevice **)opaque = dev;
 }
 
-/* 1. 启动客体；2. 找到设备并打开 Memory/Bus Master；3. 映射 BAR0、BAR2。 */
+/*
+ * regs_start() - 启动挂有 gpgpu 设备的 A57 客体并映射 BAR
+ *
+ * 1. 以 -device gpgpu 启动客体，gpuvm 开关由参数决定；
+ * 2. 按厂商号、设备号找到设备，打开 Memory 与 Bus Master；
+ * 3. 映射 BAR0 寄存器和 BAR2 VRAM。本文件不使用 BAR4 Doorbell。
+ */
 static void regs_start(RegsTest *t, bool gpuvm)
 {
 	t->qts = qtest_initf("-machine virt -cpu cortex-a57 -m 512M -nodefaults "
@@ -44,6 +51,7 @@ static void regs_start(RegsTest *t, bool gpuvm)
 	t->vram = qpci_iomap(t->dev, 2, NULL);
 }
 
+/* 解除映射并关闭客体。 */
 static void regs_stop(RegsTest *t)
 {
 	qpci_iounmap(t->dev, t->regs);
@@ -52,6 +60,7 @@ static void regs_stop(RegsTest *t)
 	qtest_quit(t->qts);
 }
 
+/* BAR0 的对齐 32 位读写，宽度和对齐都符合设备要求。 */
 static uint32_t rd(RegsTest *t, uint64_t reg)
 {
 	return qpci_io_readl(t->dev, t->regs, reg);
@@ -62,7 +71,10 @@ static void wr(RegsTest *t, uint64_t reg, uint32_t value)
 	qpci_io_writel(t->dev, t->regs, reg, value);
 }
 
-/* 读取并清除全部全局错误，返回清除前的值。 */
+/*
+ * 读取并清除全部全局错误，返回清除前的值。ERROR_STATUS 写 1 清除对应位；
+ * 清除后 GLOBAL_STATUS 的 ERROR 位也应随之消失，函数顺带检查这一点。
+ */
 static uint32_t take_errors(RegsTest *t)
 {
 	uint32_t errors = rd(t, GPGPU_REG_ERROR_STATUS);
@@ -73,7 +85,13 @@ static uint32_t take_errors(RegsTest *t)
 	return errors;
 }
 
-/* 身份寄存器、复位状态与未连接 CP 时的读零规则。 */
+/*
+ * test_identity() - 身份寄存器与复位状态
+ *
+ * 期望：设备号、协议版本 3 对应的 DEV_VERSION、64 MiB VRAM 容量和 GPUVM
+ * 协议版本都符合头文件定义；VM_MODE 反映 gpuvm 属性；复位后设备 READY、
+ * 没有错误。进程内设备没有连接 CP，CP_CTRL 读作 0。
+ */
 static void test_identity(void)
 {
 	RegsTest t = { 0 };
@@ -95,29 +113,41 @@ static void test_identity(void)
 	regs_stop(&t);
 }
 
-/* 宽度、只读组、选槽和 GLOBAL_CTRL 的命令位都按 INVALID_CMD 处理。 */
+/*
+ * test_access_rules() - BAR0 的非法访问与 GLOBAL_CTRL 语义
+ *
+ * 期望：非 32 位访问、Host 写 CP 专用寄存器、越界选槽都锁存 INVALID_CMD，
+ * 并保留目标原值；GLOBAL_CTRL 的 ENABLE 可读回，RESET 执行整体复位后
+ * 不留在寄存器中。
+ */
 static void test_access_rules(void)
 {
 	RegsTest t = { 0 };
 
 	regs_start(&t, true);
 
-	/* 1. BAR0 只接受对齐的 32 位访问。 */
+	/* 1. BAR0 只接受对齐的 32 位访问，16 位读取锁存 INVALID_CMD。 */
 	qpci_io_readw(t.dev, t.regs, GPGPU_REG_DEV_ID);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 
-	/* 2. Dispatch 寄存器组只允许 CP 写入。 */
+	/* 2. Dispatch 寄存器组只允许 CP 写入；Host 写入被拒绝，读回仍为 0。 */
 	wr(&t, GPGPU_REG_GRID_DIM_X, 1);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_GRID_DIM_X), ==, 0);
 
-	/* 3. 非法选槽保留原选择。 */
+	/*
+	 * 3. 先合法地选中槽 2，再写超出范围的槽号 GPGPU_HQD_SLOTS：
+	 *    后一次写入锁存 INVALID_CMD，HQD_SELECT 仍为 2。
+	 */
 	wr(&t, GPGPU_REG_HQD_SELECT, 2);
 	wr(&t, GPGPU_REG_HQD_SELECT, GPGPU_HQD_SLOTS);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_HQD_SELECT), ==, 2);
 
-	/* 4. ENABLE 锁存，RESET 是一次性命令。 */
+	/*
+	 * 4. ENABLE 写入后可读回；RESET 是一次性命令，执行整体复位后
+	 *    GLOBAL_CTRL 读作 0，第 3 步选中的 HQD_SELECT 也被清零。
+	 */
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_GLOBAL_CTRL), ==, GPGPU_CTRL_ENABLE);
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
@@ -126,7 +156,13 @@ static void test_access_rules(void)
 	regs_stop(&t);
 }
 
-/* 使能掩码只保留已定义事件，错误事件锁存到 ACK 为止。 */
+/*
+ * test_irq() - 中断使能掩码与错误事件锁存
+ *
+ * 期望：IRQ_ENABLE 写全 1 后只保留 DMA_DONE、ERROR、IH 三个已定义位。
+ * 用一次非法写入（Host 写 GRID_DIM_X）触发全局错误，IRQ_STATUS 的
+ * ERROR 位置 1，写 IRQ_ACK 后清除；最后清掉 ERROR_STATUS 中的错误。
+ */
 static void test_irq(void)
 {
 	const uint32_t defined = GPGPU_IRQ_DMA_DONE | GPGPU_IRQ_ERROR | GPGPU_IRQ_IH;
@@ -144,7 +180,12 @@ static void test_irq(void)
 	regs_stop(&t);
 }
 
-/* BAR2 读写与越界保护：最后一个字可访问，越过末尾锁存 VRAM 错误。 */
+/*
+ * test_vram() - BAR2 的 32 位、64 位读写与末尾边界
+ *
+ * 期望：VRAM 中的 32 位和 64 位写入都能原样读回；VRAM 最后一个 32 位字
+ * 可以访问，整个过程不产生全局错误。
+ */
 static void test_vram(void)
 {
 	RegsTest t = { 0 };
@@ -161,8 +202,13 @@ static void test_vram(void)
 }
 
 /*
- * 未连接 CP 时 Outbound 不可配置，DMA 的 Host 端地址无法路由：
- * 描述符被拒绝，状态为 ERROR 并锁存 DMA 故障。
+ * test_dma_unrouted() - 未打开 Outbound 时 DMA 的 Host 端无法路由
+ *
+ * 准备：进程内设备没有连接 CP，CP 不处于保持复位，设备不满足
+ * “引擎全部停止”的条件，所以 Outbound 不能打开。
+ *
+ * 期望：打开 Outbound 被拒绝；布局寄存器只读；Host→VRAM 的描述符因
+ * Host 端地址无法路由而立即失败，状态为 ERROR 并锁存 DMA 故障。
  */
 static void test_dma_unrouted(void)
 {
@@ -171,12 +217,18 @@ static void test_dma_unrouted(void)
 
 	regs_start(&t, true);
 
-	/* 1. 保持 CP 复位才允许配置 Outbound；这里写入应被拒绝。 */
+	/*
+	 * 1. 只有引擎全部停止（含 CP 保持复位）时才允许配置 Outbound；这里
+	 *    写入被拒绝，OUTBOUND_STATUS 为 ERROR 并锁存 INVALID_CMD。
+	 */
 	wr(&t, GPGPU_REG_OUTBOUND_CONTROL, GPGPU_OUTBOUND_ENABLE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_STATUS), ==, GPGPU_OUTBOUND_ERROR);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 
-	/* 2. Outbound 布局固定为 VRAM 之后的整个 32 位空间，布局寄存器只读。 */
+	/*
+	 * 2. Outbound 布局固定为 VRAM 之后到 4 GiB 的整段 GPU 物理地址，
+	 *    布局寄存器只读：改写 GPU_BASE 锁存 INVALID_CMD，读回不变。
+	 */
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_SIZE_LO), ==,
 			(uint32_t)(GPGPU_VM_ADDRESS_LIMIT - GPGPU_TEST_VRAM_SIZE));
@@ -184,7 +236,10 @@ static void test_dma_unrouted(void)
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
 
-	/* 3. H2D 描述符：Host 端未路由，立即失败。 */
+	/*
+	 * 3. 设备使能后提交 Host→VRAM 的 64 字节描述符：源地址落在未打开的
+	 *    Outbound 窗口内，START 时检查即失败，不会搬运任何数据。
+	 */
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
 	wr(&t, GPGPU_REG_DMA_SRC_LO, (uint32_t)host);
 	wr(&t, GPGPU_REG_DMA_SRC_HI, host >> 32);
@@ -198,8 +253,11 @@ static void test_dma_unrouted(void)
 }
 
 /*
- * GPUVM 上下文寄存器：根须为合法表页才能启用，启用后根只读；
- * 同步失效立即返回 ACK；整体复位清除上下文。
+ * test_gpuvm_context() - GPUVM 上下文寄存器的写入规则
+ *
+ * 期望：根须为合法表页才能启用，启用后根只读；没有激活队列和
+ * 在途访问时同步失效立即返回 ACK，非法 VMID 返回 ERROR；
+ * 整体复位清除上下文；gpuvm=off 时上下文寄存器不可写。
  */
 static void test_gpuvm_context(void)
 {
@@ -208,35 +266,41 @@ static void test_gpuvm_context(void)
 
 	regs_start(&t, true);
 
-	/* 1. 根为零（VRAM 首页受保护）时拒绝启用。 */
+	/*
+	 * 1. 根复位为 0，指向受保护的 VRAM 首页，不是合法表页：
+	 *    启用被拒绝，ENABLE 仍为 0。
+	 */
 	wr(&t, ctx + GPGPU_VM_ENABLE, 1);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmpuint(rd(&t, ctx + GPGPU_VM_ENABLE), ==, 0);
 
-	/* 2. 页对齐的 VRAM 根可以启用。 */
+	/* 2. 根设为页对齐的 VRAM 地址 0x20000 后可以启用，不产生错误。 */
 	wr(&t, ctx + GPGPU_VM_ROOT_LO, 0x20000);
 	wr(&t, ctx + GPGPU_VM_ENABLE, 1);
 	g_assert_cmpuint(rd(&t, ctx + GPGPU_VM_ENABLE), ==, 1);
 	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
 
-	/* 3. 启用后不能改根。 */
+	/* 3. 启用后根只读：改写为 0x30000 锁存 INVALID_CMD，读回仍为 0x20000。 */
 	wr(&t, ctx + GPGPU_VM_ROOT_LO, 0x30000);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	g_assert_cmphex(rd(&t, ctx + GPGPU_VM_ROOT_LO), ==, 0x20000);
 
-	/* 4. 无在途访问时同步失效直接确认；非法 VMID 返回 ERROR。 */
+	/*
+	 * 4. VMID 1 没有激活队列和在途访问，同步失效直接确认；用户 VMID
+	 *    只有 1、2，失效 VMID 3 返回 ERROR。
+	 */
 	wr(&t, GPGPU_REG_VM_INVALIDATE, 1);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
 	wr(&t, GPGPU_REG_VM_INVALIDATE, 3);
 	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ERROR);
 
-	/* 5. 整体复位清除上下文。 */
+	/* 5. 整体复位清除上下文：ENABLE 和根都回到 0。 */
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
 	g_assert_cmpuint(rd(&t, ctx + GPGPU_VM_ENABLE), ==, 0);
 	g_assert_cmphex(rd(&t, ctx + GPGPU_VM_ROOT_LO), ==, 0);
 	regs_stop(&t);
 
-	/* 6. GPUVM 关闭时上下文寄存器不可写。 */
+	/* 6. 以 gpuvm=off 重新启动：写上下文的根锁存 INVALID_CMD。 */
 	regs_start(&t, false);
 	wr(&t, ctx + GPGPU_VM_ROOT_LO, 0x20000);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);

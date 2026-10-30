@@ -88,7 +88,8 @@ void *gpgpu_vram_map(GPGPUState *s, uint64_t addr, uint64_t len, bool is_write);
  * @s: 设备实例。
  * @ptr: 映射起点。
  * @len: 映射字节数。
- * @is_write: 与映射时相同；为 true 时整个范围按已写入处理，使 CP 代码缓存失效。
+ * @is_write: 与映射时相同；为 true 时整个范围按已写入处理，
+ *            使 CP 代码缓存失效。
  */
 void gpgpu_vram_unmap(GPGPUState *s, void *ptr, uint64_t len, bool is_write);
 

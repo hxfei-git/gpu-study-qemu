@@ -2,10 +2,11 @@
 /*
  * 调度器：把一次派发拆成 warp，分段推进
  *
- * 工作组按线性编号依次执行（X 维变化最快），每个工作组按 32 线程切成若干
- * warp。一段最多推进 GPGPU_SEGMENT_ROUNDS 轮，一轮让 warp 中每个活跃 lane
- * 各执行一条指令；段与段之间由 Dispatch 的定时器衔接，期间设备可以处理其他
- * MMIO。一个 warp 累计超过 GPGPU_WARP_ROUND_BUDGET 轮仍未结束则判为超预算。
+ * 工作组按线性编号依次执行（X 维变化最快），每个工作组按 32 线程
+ * 切成若干 warp。一段最多推进 GPGPU_SEGMENT_ROUNDS 轮，一轮让 warp
+ * 中每个活跃 lane 各执行一条指令；段与段之间由 Dispatch 的定时器衔接，
+ * 期间设备可以处理其他 MMIO。一个 warp 累计超过
+ * GPGPU_WARP_ROUND_BUDGET 轮仍未结束则判为超预算。
  */
 #ifndef HW_GPGPU_COMPUTE_SCHEDULER_H
 #define HW_GPGPU_COMPUTE_SCHEDULER_H
@@ -35,8 +36,8 @@ GPGPUTask *gpgpu_task_create(GPGPUState *s, const GPGPUKernelParams *params);
  * gpgpu_task_step() - 推进一段
  * @task: 任务。
  *
- * 一段不跨过当前 warp 的结束边界：warp 结束后只记录下一个位置，下一段再
- * 初始化下一个 warp。
+ * 一段不跨过当前 warp 的结束边界：warp 结束后只记录下一个位置，
+ * 下一段再初始化下一个 warp。
  *
  * Return: CONTINUE、COMPLETE，或 FAILED 及细分错误。
  */

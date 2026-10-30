@@ -36,6 +36,9 @@ static void event_complete(struct gpgpu_event *e, u32 state, u32 error)
  * @dev: 设备；调用者持 dev->lock。
  * @queue: 出错的队列；为 NULL 时作用于全部会话的全部队列。
  * @error: 错误值；指定队列时记为该队列的首次错误。
+ *
+ * 未卸载的目标队列先保存所在槽的 GPUVM 故障，再置为 FAULTED；相关的
+ * PENDING 事件以 @error 失败结束并唤醒等待者。
  */
 void gpgpu_fail_queues(struct gpgpu_device *dev, struct gpgpu_queue *queue, u32 error)
 {
@@ -89,7 +92,19 @@ static void event_report(struct gpgpu_event *e, struct gpgpu_event_request *args
 	args->queue_id = e->queue->id;
 }
 
-/* 1. 来源队列必须就绪；2. 分配通知槽；3. 登记并返回编号与通知槽地址。 */
+/*
+ * gpgpu_event_create() - EVENT_CREATE：为一个就绪队列创建完成事件
+ *
+ * 应用随后把返回的事件编号和通知槽地址写进 Signal，CP 完成任务时据此
+ * 写通知槽并提交 SIGNAL_NOTIFY。调用者持 dev->lock。
+ *
+ * 1. 来源队列必须存在、未卸载且处于 READY。事件编号回绕为 0
+ *    后不再创建，避免与仍存活的旧事件同号；
+ * 2. 在会话通知页中找一个空闲的 8 字节槽并清零。通知页在第一次 MAP 时
+ *    才分配，还没有通知页时返回 -ENOSPC；
+ * 3. 登记事件并返回编号与通知槽地址：gpuvm=on 时是通知页的固定 GPUVA，
+ *    gpuvm=off 时是通知页的 GPU 物理地址，再加槽号 * 8。
+ */
 int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
 {
 	struct gpgpu_vm *vm = &fpriv->vm;
@@ -97,28 +112,31 @@ int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *ar
 	struct gpgpu_event *e;
 	u32 slot;
 
-	/* 1. 来源队列。 */
+	/* 1. 只有 READY 的队列才会产生新的完成通知。 */
 	if (!q || q->dead || q->state != GPGPU_QUEUE_READY || !fpriv->next_event)
 		return -EINVAL;
 
-	/* 2. 通知槽。 */
+	/* 2. 占用一个空闲通知槽，CP 写到这里的值就是事件编号。 */
 	slot = find_first_zero_bit(vm->notify_slots, GPGPU_NOTIFY_SLOTS);
 	if (!vm->notify.cpu || slot >= GPGPU_NOTIFY_SLOTS)
 		return -ENOSPC;
+
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e)
 		return -ENOMEM;
+
 	set_bit(slot, vm->notify_slots);
 	e->slot = slot;
 	e->mailbox = (u64 *)vm->notify.cpu + slot;
 	e->mailbox_addr = (fpriv->dev->gpuvm ? GPGPU_VM_NOTIFY_VA : vm->notify.addr) + slot * 8;
 	*e->mailbox = 0;
 
-	/* 3. 登记。 */
+	/* 3. 编号在会话内递增且非零，事件挂到会话链表后返回给应用。 */
 	e->queue = q;
 	e->id = fpriv->next_event++;
 	init_waitqueue_head(&e->wait);
 	list_add_tail(&e->node, &fpriv->events);
+
 	args->event_id = e->id;
 	args->mailbox_address = e->mailbox_addr;
 	event_report(e, args);
@@ -152,13 +170,17 @@ int gpgpu_event_wait(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args
 
 	if (!e)
 		return -EINVAL;
+
+	/* waiters 非零时 gpgpu_event_destroy() 返回 -EBUSY，解锁后 e 仍然有效。 */
 	e->waiters++;
 	mutex_unlock(&dev->lock);
+
 	if (!args->timeout_ms) {
 		waited = READ_ONCE(e->state) != GPGPU_EVENT_PENDING;
 	} else if (args->timeout_ms == U32_MAX) {
 		waited = wait_event_interruptible(e->wait,
 						  READ_ONCE(e->state) != GPGPU_EVENT_PENDING);
+		/* 返回 0 表示条件已满足，记为等到。 */
 		if (!waited)
 			waited = 1;
 	} else {
@@ -166,6 +188,7 @@ int gpgpu_event_wait(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args
 			e->wait, READ_ONCE(e->state) != GPGPU_EVENT_PENDING,
 			msecs_to_jiffies(args->timeout_ms));
 	}
+
 	mutex_lock(&dev->lock);
 	e->waiters--;
 	if (waited < 0)
@@ -187,8 +210,12 @@ static void event_free(struct gpgpu_fpriv *fpriv, struct gpgpu_event *e)
 }
 
 /*
- * 先消费旧 IH，再检查：没有等待者，且来源队列已卸载或事件已通知。
- * 否则 CP 或旧 IH 记录可能仍会写这个通知槽。
+ * gpgpu_event_destroy() - EVENT_DESTROY：销毁事件并归还通知槽
+ *
+ * 先消费旧 IH，让已发布的 SIGNAL_NOTIFY 都处理完，再检查两件事：没有
+ * 线程正在等待；来源队列已卸载，或事件已通知。否则 CP 或尚未消费的 IH
+ * 记录可能还会写这个通知槽，此时返回 -EBUSY 并保留事件。
+ * 调用者持 dev->lock。
  */
 int gpgpu_event_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
 {
@@ -203,7 +230,10 @@ int gpgpu_event_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *a
 	return 0;
 }
 
-/* 会话结束、设备访问已停止后释放全部事件。调用者持 dev->lock。 */
+/*
+ * 释放会话全部事件。调用者持 dev->lock，并已确认 CP 不会再写这些
+ * 通知槽：设备已停止，或本 VM 已无存活队列且旧 IH 已消费。
+ */
 void gpgpu_event_release_all(struct gpgpu_fpriv *fpriv)
 {
 	struct gpgpu_event *e, *next;

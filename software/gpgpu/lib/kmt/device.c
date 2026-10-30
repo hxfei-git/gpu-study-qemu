@@ -7,6 +7,10 @@
 #include <sys/ioctl.h>
 #include "kmt_internal.h"
 
+/* 最后一次 Close 排空每条剩余队列的等待上限，单位毫秒。 */
+#define KMT_CLOSE_DRAIN_TIMEOUT_MS 5000
+
+/* 进程内唯一的连接；fd 为 -1 表示尚未打开。 */
 static GpgpuKmtContext kmt_connection = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.fd = -1,
@@ -108,8 +112,20 @@ static bool kmt_vm_info_supported(const struct gpgpu_vm_info *info)
 }
 
 /*
- * 首次打开时：1. 打开 render node；2. 查询并核对 GPUVM 能力；3. 登记连接。
- * 已打开时：同一进程、同一路径只增加引用。
+ * gpgpuKmtOpen() - 打开或复用进程内唯一的设备连接
+ *
+ * 一个进程只有一个连接 kmt_connection，运行时和应用可以各自 Open，靠引用
+ * 计数共享。整个过程持连接锁。
+ *
+ * 已打开时：同一进程、同一路径且连接不在关闭中才增加引用，否则返回
+ * UNAVAILABLE。fork 出的子进程继承了 fd，但不能复用父进程的连接。
+ *
+ * 首次打开时：
+ * 1. 以 O_CLOEXEC 打开 render node；
+ * 2. 用 GPGPU_DRM_INFO 查询 GPUVM 能力，核对版本、页大小和地址位数，
+ *    不支持时关闭 fd 并返回 VERSION_MISMATCH；
+ * 3. 记录 fd、进程号和能力。range_count 为 1 表示 GPUVM 开启，之后由库
+ *    挑选 GPUVA；为 0 时设备地址就是驱动返回的 GPU 物理地址。
  */
 GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 {
@@ -124,7 +140,7 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 	path = path ? path : KMT_DEFAULT_DEVICE;
 	pthread_mutex_lock(&c->lock);
 
-	/* 已打开。 */
+	/* 已打开：只增加引用。 */
 	if (c->fd >= 0) {
 		if (c->closing || c->process != getpid() || strcmp(c->path, path))
 			status = GPGPU_KMT_UNAVAILABLE;
@@ -133,26 +149,29 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 		goto out;
 	}
 
-	/* 1. 打开。 */
+	/* 1. 打开 render node，exec 时自动关闭。 */
 	fd = open(path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		status = kmt_status(errno);
 		goto out;
 	}
 
-	/* 2. 能力。 */
+	/* 2. 查询并核对能力，再复制路径；任一步失败都关闭 fd。 */
 	if (ioctl(fd, GPGPU_DRM_INFO, &info) < 0)
 		status = kmt_status(errno);
 	else if (!kmt_vm_info_supported(&info))
 		status = GPGPU_KMT_VERSION_MISMATCH;
-	else if (!(c->path = strdup(path)))
-		status = GPGPU_KMT_NO_MEMORY;
+	if (status == GPGPU_KMT_SUCCESS) {
+		c->path = strdup(path);
+		if (!c->path)
+			status = GPGPU_KMT_NO_MEMORY;
+	}
 	if (status != GPGPU_KMT_SUCCESS) {
 		close(fd);
 		goto out;
 	}
 
-	/* 3. 登记。 */
+	/* 3. 记录连接状态；是否使用 GPUVM 由可分配区间数决定。 */
 	c->fd = fd;
 	c->process = getpid();
 	c->references = 1;
@@ -165,24 +184,35 @@ out:
 	return status;
 }
 
-/* 最后一次 Close 时回收剩余对象：队列先排空再卸载，再销毁事件，最后释放内存。 */
+/*
+ * 最后一次 Close 时回收剩余对象，顺序由对象之间的依赖决定：
+ * 1. 队列先排空再卸载。排空返回 WAIT_FAILURE（队列已出错）时也继续卸载；
+ * 2. 再销毁事件。驱动只在来源队列已卸载或事件已通知时允许销毁；
+ * 3. 最后释放内存。队列存活期间地址空间冻结，内存不能先于队列释放。
+ * 任一步失败就停下并返回，剩余对象留在链表中。
+ */
 static GpgpuKmtStatus kmt_release_objects(GpgpuKmtContext *c)
 {
 	GpgpuKmtStatus status;
 
+	/* 1. 销毁成功的队列会从链表摘除，所以总是处理表头。 */
 	while (c->queues) {
-		status = gpgpuKmtDrainQueue(c->queues, 5000);
+		status = gpgpuKmtDrainQueue(c->queues, KMT_CLOSE_DRAIN_TIMEOUT_MS);
 		if (status != GPGPU_KMT_SUCCESS && status != GPGPU_KMT_WAIT_FAILURE)
 			return status;
 		status = gpgpuKmtDestroyQueue(c->queues);
 		if (status != GPGPU_KMT_SUCCESS)
 			return status;
 	}
+
+	/* 2. 队列都已卸载，事件不会再收到通知。 */
 	while (c->events) {
 		status = gpgpuKmtDestroyEvent(&c->events->pub);
 		if (status != GPGPU_KMT_SUCCESS)
 			return status;
 	}
+
+	/* 3. 地址空间已解冻，释放全部内存对象。 */
 	while (c->memory) {
 		status = gpgpuKmtFreeMemory(&c->memory->pub);
 		if (status != GPGPU_KMT_SUCCESS)
@@ -191,16 +221,22 @@ static GpgpuKmtStatus kmt_release_objects(GpgpuKmtContext *c)
 	return GPGPU_KMT_SUCCESS;
 }
 
+/* 连接上还有未回收的内存、队列或事件。调用者持 lock。 */
 static bool kmt_has_objects(GpgpuKmtContext *c)
 {
 	return c->memory || c->queues || c->events;
 }
 
 /*
- * 非最后一次只减少引用。最后一次：
- * 1. 有其他调用进行中，或存在结果未知的资源时拒绝；
- * 2. 标记 closing，解锁后回收剩余对象（回收函数会重新进入本连接）；
- * 3. 全部回收后关闭文件描述符并清空连接。
+ * gpgpuKmtClose() - 放下一次 Open 的引用
+ *
+ * 不是最后一次引用时只减引用。最后一次：
+ * 1. 其他线程仍有库调用进行中，或存在结果未知、驱动仍在保留的
+ *    资源时，返回 UNAVAILABLE，连接保持打开；
+ * 2. 标记 closing 并记下当前线程，然后解锁回收剩余对象。回收函数会再次
+ *    kmt_enter() 本连接，只有记下的线程能通过，其他线程的新调用被拒绝。
+ *    回收失败时清除 closing 并返回错误；
+ * 3. 全部回收后关闭 fd、清空连接，之后可以重新 Open。
  */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 {
@@ -220,13 +256,13 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 		goto out;
 	}
 
-	/* 1. 前提。 */
+	/* 1. 有并发调用或结果未知的资源时不能关闭。 */
 	if (c->calls || c->uncertain) {
 		status = GPGPU_KMT_UNAVAILABLE;
 		goto out;
 	}
 
-	/* 2. 回收。 */
+	/* 2. 回收函数会重新进入本连接并加锁，所以先解锁。 */
 	if (kmt_has_objects(c)) {
 		c->closing = true;
 		c->closer = pthread_self();
@@ -238,7 +274,7 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 			goto out;
 	}
 
-	/* 3. 关闭。 */
+	/* 3. 关闭 fd 并复位连接。 */
 	close(c->fd);
 	free(c->path);
 	c->fd = -1;

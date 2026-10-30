@@ -72,7 +72,10 @@ static void gpgpu_free_irqs(struct pci_dev *pdev, struct gpgpu_pci *gpu)
 	pci_free_irq_vectors(pdev);
 }
 
-/* 第 4 步：所有向量共用同一个处理函数。 */
+/*
+ * 第 4 步：申请全部 MSI-X 向量，它们共用 gpgpu_pci_irq()。申请前先关闭
+ * 设备中断使能，设备对象建立之前不产生中断。
+ */
 static int gpgpu_request_irqs(struct pci_dev *pdev, struct gpgpu_pci *gpu)
 {
 	int ret;
@@ -101,19 +104,29 @@ static int gpgpu_bring_up(struct pci_dev *pdev, struct gpgpu_pci *gpu, bool gpuv
 	writel(GPGPU_CTRL_RESET, gpu->regs + GPGPU_REG_GLOBAL_CTRL);
 	readl(gpu->regs + GPGPU_REG_GLOBAL_CTRL);
 	writel(GPGPU_CTRL_ENABLE, gpu->regs + GPGPU_REG_GLOBAL_CTRL);
+
 	dev = gpgpu_device_create(pdev, gpu->regs, gpu->doorbell, gpuvm);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
 	WRITE_ONCE(gpu->dev, dev);
+
 	ret = gpgpu_device_start(dev);
 	if (!ret)
 		ret = gpgpu_drm_register(dev);
 	if (!ret)
 		return 0;
+
+	/* 设备可能已开始运行，先停止访问；设备引用由 probe 放下。 */
 	gpgpu_device_stop(dev);
 	return ret;
 }
 
+/*
+ * gpgpu_probe() - 按文件头的 probe 顺序接管设备
+ *
+ * 失败时按 irqs → unmap → release → disable 的标签逆序撤销已完成的步骤。
+ * gpgpu_bring_up() 失败时已经停止设备，这里放下 probe 持有的设备引用。
+ */
 static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct gpgpu_pci *gpu;
@@ -124,7 +137,7 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!gpu)
 		return -ENOMEM;
 
-	/* 1. PCI 资源。 */
+	/* 1. 使能内存空间，申请全部 BAR 并检查三个 BAR 的类型与大小。 */
 	ret = pci_enable_device_mem(pdev);
 	if (ret)
 		goto free_gpu;
@@ -135,7 +148,10 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto release;
 
-	/* 2. DMA 与映射。 */
+	/*
+	 * 2. DMA 地址限制在 31 位内，换算成 GPU 物理地址 vram_size + IOVA 后
+	 *    仍在 Outbound 窗口内；映射 BAR0 寄存器与 BAR4 Doorbell。
+	 */
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(31));
 	if (ret)
 		goto release;
@@ -147,18 +163,21 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto unmap;
 	}
 
-	/* 3. 设备身份。 */
+	/* 3. 读寄存器确认设备身份与协议版本，并取得 GPUVM 模式。 */
 	ret = gpgpu_check_device(pdev, gpu->regs, &gpuvm);
 	if (ret)
 		goto unmap;
 
-	/* 4. 中断。 */
+	/*
+	 * 4. 申请 MSI-X 向量。gpu->dev 此时还是 NULL，提前到达的中断返回
+	 *    IRQ_NONE。
+	 */
 	ret = gpgpu_request_irqs(pdev, gpu);
 	if (ret)
 		goto unmap;
 	pci_set_drvdata(pdev, gpu);
 
-	/* 5. 启动。 */
+	/* 5. 复位设备、创建设备对象、启动 CP 并注册 DRM。 */
 	ret = gpgpu_bring_up(pdev, gpu, gpuvm);
 	if (ret)
 		goto irqs;
@@ -186,6 +205,11 @@ free_gpu:
 	return ret;
 }
 
+/*
+ * 先撤销 DRM 入口，不再有新的会话；再停止设备访问并回收 orphan 会话；
+ * 中断处理已结束后释放中断向量，最后放下 probe 的设备引用并释放 BAR。
+ * 仍有会话或 GEM 对象时，设备对象由它们的引用继续保活。
+ */
 static void gpgpu_remove(struct pci_dev *pdev)
 {
 	struct gpgpu_pci *gpu = pci_get_drvdata(pdev);

@@ -58,7 +58,16 @@ static GpgpuKmtStatus rt_alloc(GpgpuRt *rt, uint32_t kind, size_t size, uint32_t
 	return status;
 }
 
-/* 1. 暂存区与参数块；2. Ring、进度与 Signal。队列推迟到第一次派发时创建。 */
+/*
+ * gpgpu_rt_create() - 分配运行时内部的 Host 对象
+ *
+ * 1. 暂存区（上传、下载时与 VRAM 之间中转）和参数块（设备只读）；
+ * 2. AQL Ring（4 KiB，64 个槽）、R/W 进度页和一个 Signal。
+ *
+ * 它们都是 Host 对象，CPU 可以直接写。队列推迟到第一次派发时创建：
+ * 队列存活期间地址空间冻结，调用者要在那之前分配完 Kernel 和数据区。
+ * 任一对象分配失败时，释放已分配的部分并返回错误。
+ */
 GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, GpgpuRt **out)
 {
 	const uint32_t rw = GPGPU_VM_READ | GPGPU_VM_WRITE;
@@ -73,7 +82,10 @@ GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, Gp
 		return GPGPU_KMT_NO_MEMORY;
 	rt->context = context;
 
-	/* 1. 2. */
+	/*
+	 * 1. 暂存区和参数块；2. Ring、进度页和 Signal。
+	 *    某次分配失败后跳过后面的分配，统一在下方回收。
+	 */
 	status = rt_alloc(rt, GPGPU_MEMORY_HOST, staging_size, rw, &rt->staging);
 	if (status == GPGPU_KMT_SUCCESS)
 		status = rt_alloc(rt, GPGPU_MEMORY_HOST, GPGPU_RT_MAX_ARGS * sizeof(uint32_t),
@@ -93,8 +105,15 @@ GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, Gp
 }
 
 /*
- * 1. 排空并卸载队列（出错的队列直接卸载）；2. 销毁事件；3. 逆序释放对象。
- * 任一步失败立即返回，已释放的部分不再恢复，剩余资源由 KMT 的 Close 处理。
+ * gpgpu_rt_destroy() - 回收运行时
+ *
+ * 1. 先排空再卸载队列，卸载前 CP 必须处理完所有包。队列已出错时排空
+ *    返回 WAIT_FAILURE，照常卸载；
+ * 2. 再销毁事件。驱动要求来源队列已卸载或事件已通知；
+ * 3. 最后按分配的逆序释放全部对象。队列卸载后地址空间才解冻。
+ *
+ * 任一步失败立即返回并保留 rt，已释放的部分不再恢复。调用者可以
+ * 重试，剩余资源也会在 KMT 最后一次 Close 时回收。
  */
 GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 {
@@ -103,7 +122,7 @@ GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 	if (!rt)
 		return GPGPU_KMT_INVALID_PARAMETER;
 
-	/* 1. 队列。 */
+	/* 1. 排空超时等其他错误直接返回，队列和对象都保留。 */
 	if (rt->queue) {
 		status = gpgpuKmtDrainQueue(rt->queue, RT_DRAIN_TIMEOUT_MS);
 		if (status != GPGPU_KMT_SUCCESS && status != GPGPU_KMT_WAIT_FAILURE)
@@ -114,7 +133,7 @@ GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 		rt->queue = NULL;
 	}
 
-	/* 2. 事件。 */
+	/* 2. 队列已卸载，事件不会再收到通知，可以销毁。 */
 	if (rt->event) {
 		status = gpgpuKmtDestroyEvent(rt->event);
 		if (status != GPGPU_KMT_SUCCESS)
@@ -122,7 +141,7 @@ GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 		rt->event = NULL;
 	}
 
-	/* 3. 对象。 */
+	/* 3. 每释放一个就减少计数，失败后重试不会重复释放。 */
 	while (rt->object_count) {
 		status = gpgpuKmtFreeMemory(rt->objects[rt->object_count - 1]);
 		if (status != GPGPU_KMT_SUCCESS)
@@ -172,9 +191,16 @@ GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **
 /*
  * gpgpu_rt_kernel_load() - 装载 Kernel
  *
- * 1. 分配代码区（读 + 执行）与描述对象区（只读），都在 VRAM；
- * 2. 上传代码；
- * 3. 生成描述对象（入口为代码区的设备地址）并上传。
+ * CP 经 AQL 包的 kernel_object 找到描述对象，再按其中的入口和长度让 RV32
+ * 计算执行器取指，所以代码和描述对象都放在 VRAM：
+ *
+ * 1. 分配代码区（读 + 执行）和描述对象区（只读），取代码区的 32 位设备
+ *    地址作为入口；
+ * 2. 经暂存区把代码上传到代码区；
+ * 3. 填写描述对象：入口、代码长度、参数块长度（args_count 个 32 位参数）
+ *    和 ABI 版本，再上传。
+ *
+ * 失败时已分配的对象仍登记在 rt 中，随 gpgpu_rt_destroy() 释放。
  */
 GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_size,
 				    uint32_t args_count, GpgpuRtKernel *kernel)
@@ -187,7 +213,7 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 	    args_count > GPGPU_RT_MAX_ARGS || !kernel)
 		return GPGPU_KMT_INVALID_PARAMETER;
 
-	/* 1. 存储。 */
+	/* 1. 代码区可执行，描述对象只读；入口地址必须能放进 32 位。 */
 	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, code_size, GPGPU_VM_READ | GPGPU_VM_EXEC,
 			  &kernel->code);
 	if (status == GPGPU_KMT_SUCCESS)
@@ -198,12 +224,12 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 
-	/* 2. 代码。 */
+	/* 2. 上传 RV32 机器码。 */
 	status = gpgpu_rt_upload(rt, kernel->code, code, code_size);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 
-	/* 3. 描述对象。 */
+	/* 3. 多字节字段按小端写入，与设备端读取方式一致。 */
 	desc = (GpgpuKernelDescriptor) {
 		.code_entry = htole32(entry),
 		.code_size = htole32(code_size),
@@ -213,7 +239,10 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 	return gpgpu_rt_upload(rt, kernel->descriptor, &desc, sizeof(desc));
 }
 
-/* 第一次派发时创建队列与事件；此后地址空间冻结。 */
+/*
+ * 第一次派发时创建队列，再为它创建事件（事件必须绑定来源队列）。
+ * 此后地址空间冻结，不能再分配或释放内存。
+ */
 static GpgpuKmtStatus rt_ensure_queue(GpgpuRt *rt)
 {
 	GpgpuKmtStatus status;
@@ -237,6 +266,10 @@ static uint32_t rt_dimensions(GpgpuRtDim3 grid, GpgpuRtDim3 block)
 	return 1;
 }
 
+/*
+ * 组一个 Kernel Dispatch 包。AQL 的 grid_size 是各维总线程数，
+ * 所以用工作组数乘每组尺寸；Header 由 Publish 最后写入。
+ */
 static GpgpuAqlPacket rt_packet(const GpgpuRt *rt, const GpgpuRtKernel *kernel,
 				GpgpuRtDim3 grid, GpgpuRtDim3 block)
 {
@@ -257,13 +290,18 @@ static GpgpuAqlPacket rt_packet(const GpgpuRt *rt, const GpgpuRtKernel *kernel,
 }
 
 /*
- * gpgpu_rt_dispatch() - 一次派发
+ * gpgpu_rt_dispatch() - 同步执行一次派发
+ *
+ * 运行时只有一个参数块和一个 Signal，每次派发都复用，所以要等本次
+ * 完成才返回。超时返回时 CP 可能仍在使用它们。
  *
  * 1. 确保队列与事件存在；
- * 2. 写参数块；
- * 3. 把 Signal 置为 1，并填入事件编号与通知槽地址；
- * 4. 组包、预留、发布；
- * 5. 等 Signal 归零。
+ * 2. 把参数按小端写进参数块。RV32 执行器把参数块地址放进 a0，
+ *    Kernel 用普通 LW 读取；
+ * 3. 把 Signal 置为 1，填入事件编号与通知槽地址。CP 完成后把值减为 0，
+ *    再写通知槽，驱动随后唤醒事件等待者；
+ * 4. 组包，经 Reserve 取号并等到空槽，再由 Publish 发布 Header、敲 Doorbell；
+ * 5. 等 Signal 归零，期限为 timeout_ms。
  */
 GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const uint32_t *args,
 				 uint32_t args_count, GpgpuRtDim3 grid, GpgpuRtDim3 block,
@@ -278,17 +316,23 @@ GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const
 	if (!rt || !kernel || !args || !args_count || args_count > GPGPU_RT_MAX_ARGS)
 		return GPGPU_KMT_INVALID_PARAMETER;
 
-	/* 1. 队列。 */
+	/* 1. 只有第一次派发会真正创建。 */
 	status = rt_ensure_queue(rt);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 
-	/* 2. 参数。 */
+	/*
+	 * 2. 参数块是 Host 对象，CPU 直接写；
+	 *    可见性由 Publish 中的屏障保证。
+	 */
 	block_args = rt->args->cpu;
 	for (uint32_t i = 0; i < args_count; i++)
 		block_args[i] = htole32(args[i]);
 
-	/* 3. Signal。 */
+	/*
+	 * 3. 必须在发布包之前写好 Signal：
+	 *    CP 取到包后随时可能完成并递减它。
+	 */
 	signal = rt->signal->cpu;
 	*signal = (GpgpuSignal) {
 		.value = htole64(1),
@@ -296,13 +340,13 @@ GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const
 		.event_mailbox_ptr = htole64(rt->event->mailbox_address),
 	};
 
-	/* 4. 提交。 */
+	/* 4. Reserve 失败时编号已被占用，队列不能再用，直接返回错误。 */
 	packet = rt_packet(rt, kernel, grid, block);
 	status = gpgpuKmtReserve(rt->queue, &number);
 	if (status == GPGPU_KMT_SUCCESS)
 		status = gpgpuKmtPublish(rt->queue, number, &packet);
 
-	/* 5. 等待。 */
+	/* 5. 先忙等约 200 μs，再阻塞等待事件。 */
 	if (status == GPGPU_KMT_SUCCESS)
 		status = gpgpuKmtWaitSignal(signal, rt->event, timeout_ms);
 	return status;

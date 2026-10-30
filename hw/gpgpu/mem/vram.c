@@ -19,7 +19,10 @@ static uint64_t vram_bar_read(void *opaque, hwaddr addr, unsigned int size)
 	return ldn_le_p(s->vram.ptr + addr, size);
 }
 
-/* BAR2 写：越界锁存 VRAM_FAULT；合法写入经地址空间，使 CP 代码缓存失效。 */
+/*
+ * BAR2 写：越界锁存 VRAM_FAULT。合法写入经内部地址空间，
+ * 使原生 CP 已翻译的代码失效。
+ */
 static void vram_bar_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
 	GPGPUState *s = opaque;

@@ -22,8 +22,20 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
 }
 
 /*
- * 1. 检查路由；2. 计入在途访问；3. VRAM 走内部地址空间，Outbound 换算成
- * Host IOVA 后经 vfio-user DMA（可能暂时释放主锁）；4. 撤销在途计数。
+ * gpgpu_phys_rw() - 按 GPU 物理地址读写 VRAM 或 Host 内存
+ *
+ * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都经过这里。
+ * GPU 物理空间低端是 VRAM，其上是 Outbound 窗口，窗口内的地址对应 Host
+ * 内存：
+ *
+ * 1. 检查 [addr, addr + len) 完整落在 VRAM 或已使能的 Outbound 窗口内，
+ *    不允许跨越两者的边界；
+ * 2. 增加在途访问计数。访问 Host 内存时 vfio-user DMA 可能暂时释放
+ *    主锁，此时 Host 发起的设备复位和 Outbound 重配会因计数非零被拒绝，
+ *    窗口配置不会在访问中途被改掉；
+ * 3. VRAM 直接读写设备内部的后备 RAM；Outbound 把地址减去窗口起点、
+ *    加上 Host 基址换算成 Host IOVA，再经 vfio-user DMA 读写；
+ * 4. 成功或失败都撤销计数，失败前已写入的部分保留。
  *
  * 使能时 host_base 为 0 且窗口不超过 4 GiB，换算后的 IOVA 不会溢出。
  */
@@ -32,14 +44,14 @@ MemTxResult gpgpu_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, b
 	GPGPUPhysState *p = &s->phys;
 	MemTxResult result;
 
-	/* 1. 路由。 */
+	/* 1. 范围不可路由时直接失败，不计数。 */
 	if (!gpgpu_phys_contains(s, addr, len))
 		return MEMTX_ERROR;
 
-	/* 2. 在途计数。 */
+	/* 2. 计数非零期间 gpgpu_phys_busy() 为真，直到第 4 步撤销。 */
 	p->accesses++;
 
-	/* 3. 访问。 */
+	/* 3. 按地址落在 VRAM 还是 Outbound 窗口分两条路径。 */
 	if (addr < s->vram_size) {
 		result = gpgpu_vram_rw(s, addr, buf, len, is_write);
 	} else {
@@ -48,7 +60,7 @@ MemTxResult gpgpu_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, b
 		result = vfu_object_dma_rw(PCI_DEVICE(s), iova, buf, len, is_write);
 	}
 
-	/* 4. 撤销计数。 */
+	/* 4. 只撤销计数，不回退已经写入的数据。 */
 	p->accesses--;
 	return result;
 }
@@ -97,6 +109,7 @@ void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 	p->enabled = value;
 	p->status = GPGPU_OUTBOUND_ACK;
 	return;
+
 invalid:
 	p->status = GPGPU_OUTBOUND_ERROR;
 	gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);

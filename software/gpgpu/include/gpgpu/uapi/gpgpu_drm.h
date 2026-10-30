@@ -142,6 +142,7 @@ struct gpgpu_va_range {
 	gpgpu_u64 start;
 	gpgpu_u64 end;
 };
+
 /**
  * struct gpgpu_vm_info - GPUVM 能力及当前绑定数量
  * @version: 输入输出接口版本，必须为 GPGPU_DRM_VERSION。
@@ -165,10 +166,11 @@ struct gpgpu_vm_info {
 	gpgpu_u32 bindings;
 	struct gpgpu_va_range ranges[1];
 };
+
 /**
  * struct gpgpu_bo_create - 创建固定存储的 GEM 对象
- * @version: 接口版本。
- * @kind: Host coherent 或 VRAM 存储类型。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
+ * @kind: GPGPU_MEMORY_HOST 或 GPGPU_MEMORY_VRAM。
  * @size: 逻辑大小，单位为字节。
  * @alignment: 存储对齐，单位为字节，必须为 2 的幂。
  * @handle: 输出的本文件 GEM handle，不暴露设备物理地址。
@@ -186,12 +188,13 @@ struct gpgpu_bo_create {
 	gpgpu_u64 mapped_size;
 	gpgpu_u64 mmap_offset;
 };
+
 /**
  * struct gpgpu_vm_map - 整对象绑定或按 GPU 地址撤销绑定
- * @version: 接口版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @handle: MAP 的本文件 GEM handle；UNMAP 必须为零。
- * @address: MAP 开启翻译时输入 GPUVA，关闭时输入零；输出最终 GPU 地址。
- * UNMAP 用此地址定位已有绑定。
+ * @address: MAP 时 GPUVM 开启输入 GPUVA、关闭输入 0，返回最终 GPU 地址；
+ *           UNMAP 时输入要撤销的绑定地址。
  * @permissions: MAP 的读、写、取指权限组合；UNMAP 必须为零。
  * @reserved: 保留，输入必须为零。
  */
@@ -202,9 +205,10 @@ struct gpgpu_vm_map {
 	gpgpu_u32 permissions;
 	gpgpu_u32 reserved;
 };
+
 /**
  * struct gpgpu_vm_fault - 所属队列的首次 GPUVM 故障
- * @version: 接口版本。
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
  * @queue_id: 本文件的队列编号，必须仍持有队列对象。
  * @address: 出错的完整用户字节地址。
  * @vmid: 出错时绑定的 VMID。
@@ -221,6 +225,7 @@ struct gpgpu_vm_fault {
 	gpgpu_u32 access;
 	gpgpu_u32 phase;
 };
+
 /*
  * 用户态库运行在只有 musl 头文件的客体中，没有 <drm/drm.h>，因此这里按
  * DRM 的约定自行展开：DRM 命令的类型码为 'd'，驱动私有命令从
@@ -240,6 +245,8 @@ struct gpgpu_gem_close {
 	gpgpu_u32 handle;
 	gpgpu_u32 pad;
 };
+
+/* ioctl 编号：GEM_CLOSE 沿用 DRM 核心命令，其余是驱动私有命令 0x00～0x0c。 */
 #define GPGPU_DRM_GEM_CLOSE _IOW(GPGPU_DRM_IOCTL_BASE, 0x09, struct gpgpu_gem_close)
 #define GPGPU_DRM_INFO GPGPU_DRM_IOWR(0x00, struct gpgpu_vm_info)
 #define GPGPU_DRM_BO_CREATE GPGPU_DRM_IOWR(0x01, struct gpgpu_bo_create)
@@ -254,6 +261,8 @@ struct gpgpu_gem_close {
 #define GPGPU_DRM_EVENT_WAIT GPGPU_DRM_IOWR(0x0a, struct gpgpu_event_request)
 #define GPGPU_DRM_EVENT_DESTROY GPGPU_DRM_IOWR(0x0b, struct gpgpu_event_request)
 #define GPGPU_DRM_FAULT GPGPU_DRM_IOWR(0x0c, struct gpgpu_vm_fault)
+
+/* 布局检查：内核与用户态的结构体大小或关键偏移不一致时编译失败。 */
 _Static_assert(sizeof(struct gpgpu_memory_copy) == 40, "copy ABI");
 _Static_assert(sizeof(struct gpgpu_queue_create) == 64, "queue create ABI");
 _Static_assert(sizeof(struct gpgpu_queue_state) == 24, "queue state ABI");
@@ -263,4 +272,4 @@ _Static_assert(__builtin_offsetof(struct gpgpu_queue_create, doorbell_mmap_offse
 _Static_assert(__builtin_offsetof(struct gpgpu_event_request, mailbox_address) == 24,
 	       "mailbox ABI");
 
-#endif
+#endif /* GPGPU_DRM_H */

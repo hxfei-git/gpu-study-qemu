@@ -12,7 +12,7 @@ static uint64_t doorbell_read(void *opaque, hwaddr addr, unsigned int size)
 	return 0;
 }
 
-/* 只接受 8 字节对齐的完整 64 位写入，且高 32 位为 0；其余锁存 INVALID_CMD。 */
+/* 只接受 8 字节对齐、高 32 位为 0 的 64 位写入；其余锁存 INVALID_CMD。 */
 static void doorbell_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
 {
 	GPGPUState *s = opaque;

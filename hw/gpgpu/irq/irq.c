@@ -26,6 +26,8 @@ static void irq_update(GPGPUState *s, uint32_t events)
 
 	events &= pending;
 	pci_set_irq(pdev, pending && !msix_enabled(pdev) && !msi_enabled(pdev));
+
+	/* MSI-X 每类事件一个向量；MSI 只有一个向量，有新事件就发一次。 */
 	if (msix_enabled(pdev)) {
 		if (events & GPGPU_IRQ_DMA_DONE)
 			msix_notify(pdev, GPGPU_MSIX_VEC_DMA);
@@ -57,7 +59,8 @@ uint32_t gpgpu_irq_read(GPGPUState *s, hwaddr reg)
 }
 
 /*
- * ENABLE：新使能 IH 时若 Ring 中已有记录，补锁存 IH 事件；新使能的事件立即通知。
+ * ENABLE：新使能 IH 时若 Ring 中已有记录，补锁存 IH 事件；
+ *         新使能的事件立即通知。
  * ACK：写 1 清除；清除 IH 后若仍有未消费记录，重新锁存并通知。
  */
 void gpgpu_irq_write(GPGPUState *s, hwaddr reg, uint32_t value)

@@ -101,6 +101,7 @@ static int bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 	if (bo->kind != GPGPU_MEMORY_HOST || vma->vm_end - vma->vm_start != bo->mapped_size ||
 	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
+
 	vma->vm_pgoff = 0;
 	vm_flags_clear(vma, VM_PFNMAP | VM_MAYEXEC);
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
@@ -118,6 +119,10 @@ static const struct drm_gem_object_funcs bo_funcs = {
 	.mmap = bo_mmap,
 };
 
+/*
+ * 种类为 Host 或 VRAM；长度非零且不超过可用 VRAM；
+ * 对齐为 2 的幂且不超过 GPGPU_QUEUE_RING_MAX。
+ */
 static bool bo_args_valid(const struct gpgpu_bo_create *args)
 {
 	return (args->kind == GPGPU_MEMORY_HOST || args->kind == GPGPU_MEMORY_VRAM) &&
@@ -144,11 +149,21 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  * @fpriv: 会话；调用者持 dev->lock，函数内会暂时释放。
  * @args: ioctl 参数。
  *
- * 1. 检查参数；队列存活期间冻结对象集合；
- * 2. 分配存储并初始化 GEM，对象持有 DRM 与设备引用；
- * 3. 建立 mmap 偏移；
- * 4. 创建句柄：GEM 核心可能回调 bo_close()，因此先取临时引用并解锁；
- * 5. 填写输出。
+ * 为会话创建一个固定存储的对象：Host 对象分配一致性 DMA 内存，VRAM 对象
+ * 从 gpu_buddy 分配连续块。存储在对象寿命内不迁移，绑定后的 GPU 地址
+ * 因此不变。
+ *
+ * 1. VM 已失败或还有存活队列时返回 -EBUSY：队列存活期间冻结对象集合；
+ *    之后才检查参数格式；
+ * 2. 分配并清零存储，初始化 GEM。对象另取 DRM 与设备引用，句柄和会话
+ *    都关闭后对象仍能安全释放存储；挂入会话链表即持有列表引用；
+ * 3. 建立 mmap 偏移，Host 对象之后可经 render node 映射到用户态；
+ * 4. 创建 GEM 句柄。句柄一出现，其他线程就可能用它关闭对象，GEM 核心
+ *    随即回调要取 dev->lock 的 bo_close()。因此先取临时引用保住对象，
+ *    解锁后再创建；重新加锁后若句柄已被关闭，按失败处理；
+ * 5. 记录句柄，返回映射长度和 mmap 偏移（VRAM 对象为 0，不可映射）。
+ *
+ * 失败时放下列表引用；GEM 的最后一个引用会经 bo_free() 释放存储。
  */
 int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 {
@@ -157,13 +172,13 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	u32 handle;
 	int ret;
 
-	/* 1. 状态，再参数。 */
+	/* 1. 先检查对象集合是否冻结，再检查参数。 */
 	if (args->reserved || fpriv->vm.failed || gpgpu_queue_any_live(fpriv))
 		return -EBUSY;
 	if (!bo_args_valid(args))
 		return -EINVAL;
 
-	/* 2. 存储与 GEM。 */
+	/* 2. 分配存储，初始化 GEM，再取 DRM、设备引用并挂入会话。 */
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
 		return -ENOMEM;
@@ -172,11 +187,13 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	bo->size = args->size;
 	bo->mapped_size = PAGE_ALIGN(args->size);
 	INIT_LIST_HEAD(&bo->vram_blocks);
+
 	ret = bo_storage_alloc(bo, args->alignment);
 	if (ret) {
 		kfree(bo);
 		return ret;
 	}
+
 	bo->gem.funcs = &bo_funcs;
 	drm_gem_private_object_init(dev->drm, &bo->gem, bo->mapped_size);
 	drm_dev_get(dev->drm);
@@ -184,18 +201,22 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	bo->fpriv = fpriv;
 	list_add_tail(&bo->node, &fpriv->bos);
 
-	/* 3. mmap 偏移。 */
+	/* 3. 为 GEM 分配 mmap 偏移，失败时放下刚取得的列表引用。 */
 	ret = drm_gem_create_mmap_offset(&bo->gem);
 	if (ret)
 		goto drop;
 
-	/* 4. 句柄；其他线程可能在解锁期间关闭刚创建的句柄。 */
+	/*
+	 * 4. 临时引用保证解锁期间对象不被释放。其间其他线程可能
+	 *    已关闭刚创建的句柄，bo_close() 会把 bo->fpriv 清为 NULL。
+	 */
 	drm_gem_object_get(&bo->gem);
 	mutex_unlock(&dev->lock);
 	ret = drm_gem_handle_create(fpriv->file, &bo->gem, &handle);
 	mutex_lock(&dev->lock);
 	if (!ret && !bo->fpriv)
 		ret = -ENOENT;
+
 	if (ret) {
 		if (bo->fpriv)
 			gpgpu_bo_drop(bo);
@@ -204,15 +225,17 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 		mutex_lock(&dev->lock);
 		return ret;
 	}
+
 	drm_gem_object_put(&bo->gem);
 
-	/* 5. 输出。 */
+	/* 5. 句柄有效，填写输出。 */
 	bo->handle = handle;
 	args->handle = handle;
 	args->mapped_size = bo->mapped_size;
 	args->mmap_offset = bo->kind == GPGPU_MEMORY_HOST ?
 		drm_vma_node_offset_addr(&bo->gem.vma_node) : 0;
 	return 0;
+
 drop:
 	gpgpu_bo_drop(bo);
 	return ret;
@@ -249,7 +272,13 @@ void gpgpu_bo_release_all(struct gpgpu_fpriv *fpriv)
 	}
 }
 
-/* 第 2 步：写 DMA 描述符并启动。调用者持 dma_lock。 */
+/*
+ * 第 2 步：写 DMA 描述符并启动，调用者持 dma_lock。
+ *
+ * 先在 irq_lock 下清除上一次的 DMA 完成与错误状态，并重置 completion，
+ * 保证随后等到的是本次的完成中断。dma_wmb() 让 Host 侧源数据先于启动
+ * 对设备可见，再写源、目的、长度，最后写 CTRL 启动。
+ */
 static void copy_start(struct gpgpu_device *dev, bool to_host, u64 host, u64 vram, u32 size)
 {
 	unsigned long flags;
@@ -275,10 +304,18 @@ static void copy_start(struct gpgpu_device *dev, bool to_host, u64 host, u64 vra
  * @fpriv: 会话；调用者持 dev->lock，函数内会暂时释放。
  * @args: ioctl 参数。
  *
- * 1. 检查两端对象与范围，计入使用计数以防等待期间被解绑；
- * 2. 换 dma_lock，写描述符并启动；
- * 3. 等完成中断；超时则无法证明 DMA 已结束，此后禁止 COPY 并保留两端对象；
- * 4. 回到 dev->lock，确认结束后撤销使用计数。
+ * 用设备 DMA 在 Host 对象和 VRAM 对象之间搬运一段数据，并等待完成。
+ * 等待期间不持 dev->lock，同一时刻只允许一个 COPY。
+ *
+ * 1. 检查方向、对象种类与两端范围。两端对象的 users 加一，等待期间
+ *    它们不能被解绑或释放；随后释放 dev->lock；
+ * 2. 取 dma_lock 串行化整个请求。设备已移除、已故障或之前有 DMA 结果
+ *    未知时返回 -EIO，否则写描述符并启动；
+ * 3. 等完成中断。超时则无法证明 DMA 已结束，置 dma_uncertain：此后
+ *    禁止 COPY、解绑与会话回收。完成后 dma_rmb()，保证调用者随后读到
+ *    的是 DMA 写入的数据；
+ * 4. 重新取 dev->lock。只有确认 DMA 已结束时才撤销 users，超时的两端
+ *    对象一直保留。
  */
 int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 {
@@ -288,17 +325,18 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 	bool to_host = args->direction == GPGPU_COPY_D2H;
 	int ret;
 
-	/* 1. 检查与计数。 */
+	/* 1. 检查参数，再计入两端对象的使用计数。 */
 	if (args->direction > GPGPU_COPY_D2H || !host || !vram ||
 	    host->kind != GPGPU_MEMORY_HOST || vram->kind != GPGPU_MEMORY_VRAM ||
 	    !gpgpu_bo_range_ok(host, args->host_offset, args->size) ||
 	    !gpgpu_bo_range_ok(vram, args->vram_offset, args->size))
 		return -EINVAL;
+
 	host->users++;
 	vram->users++;
 	mutex_unlock(&dev->lock);
 
-	/* 2. 启动。 */
+	/* 2. 换成 dma_lock，设备仍可用时启动 DMA。 */
 	mutex_lock(&dev->dma_lock);
 	if (!READ_ONCE(dev->present) || READ_ONCE(dev->dma_uncertain) || READ_ONCE(dev->fatal)) {
 		ret = -EIO;
@@ -307,7 +345,7 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 	copy_start(dev, to_host, host->phys_addr + args->host_offset,
 		   vram->phys_addr + args->vram_offset, args->size);
 
-	/* 3. 等待。 */
+	/* 3. 等完成中断；超时时不能确认 DMA 已结束。 */
 	if (!wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(GPGPU_TIMEOUT_MS))) {
 		WRITE_ONCE(dev->dma_uncertain, true);
 		ret = -ETIMEDOUT;
@@ -318,7 +356,7 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 unlock:
 	mutex_unlock(&dev->dma_lock);
 
-	/* 4. 撤销计数。 */
+	/* 4. 回到 dev->lock；DMA 结果未知时保留使用计数。 */
 	mutex_lock(&dev->lock);
 	if (!dev->dma_uncertain) {
 		host->users--;

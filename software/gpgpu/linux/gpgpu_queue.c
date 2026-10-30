@@ -116,7 +116,11 @@ static int queue_claim_storage(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *ring,
 	return 0;
 }
 
-/* 第 2 步：会话第一次建队列时分配一页 Doorbell，页内入口按会话分配。 */
+/*
+ * 第 2 步：会话第一次建队列时从 Doorbell BAR 分配一页，此后复用这一页。
+ * used 是会话已占用的页内入口位图；入口 0、1 都被占用时返回 -ENOSPC，
+ * 否则取空闲的那一个。
+ */
 static int queue_alloc_doorbell(struct gpgpu_fpriv *fpriv, unsigned long used, u32 *index)
 {
 	struct gpgpu_device *dev = fpriv->dev;
@@ -132,6 +136,7 @@ static int queue_alloc_doorbell(struct gpgpu_fpriv *fpriv, unsigned long used, u
 		set_bit(page, &dev->db_pages);
 		fpriv->db_page = page;
 	}
+
 	*index = (used & 1) ? 1 : 0;
 	return 0;
 }
@@ -177,6 +182,17 @@ static int queue_map_failed(struct gpgpu_queue *q, int ret, u32 status, bool pub
 	return status == GPGPU_MANAGEMENT_NO_SLOT ? -ENOSPC : -EIO;
 }
 
+/*
+ * gpgpu_queue_create() - QUEUE_CREATE：建立一条用户 AQL 队列
+ *
+ * 调用者持 vm_serial 与 dev->lock；第 4 步等待管理结果时会暂时释放
+ * dev->lock。步骤见文件头。
+ *
+ * 队列对象在发送 MAP_QUEUES 前就登记为 UNLOADING + uncertain，并取得
+ * Ring 与进度的使用计数。等待期间即使文件关闭，会话也会因这条
+ * 未确认的队列保留为 orphan，Ring 与进度不会被解绑或释放。确认
+ * 映射成功后才转为 READY。
+ */
 int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *args)
 {
 	struct gpgpu_device *dev = fpriv->dev;
@@ -188,7 +204,11 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	bool published;
 	int ret;
 
-	/* 1. 对象与进度：对象不存在或未绑定视为暂不可用（-EBUSY），格式错误为 -EINVAL。 */
+	/*
+	 * 1. 先回收可回收的旧队列。对象不存在、未绑定，或会话仍有
+	 *    存活队列时返回 -EBUSY（每个 VM 只有一条队列）；格式错误
+	 *    返回 -EINVAL。
+	 */
 	queue_collect(fpriv);
 	if (fpriv->vm.failed || !fpriv->vm.vmid || !ring || !progress || !ring->bound ||
 	    !progress->bound || gpgpu_queue_any_live(fpriv))
@@ -198,16 +218,21 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	ret = queue_claim_storage(fpriv, ring, progress, &used);
 	if (ret)
 		return ret;
+
+	/* MQD 从当前 R 恢复，因此要求 R == W：Ring 中没有未消费的包。 */
 	rptr = le32_to_cpu(READ_ONCE(*(u32 *)(progress->host.cpu + args->rptr_offset)));
 	if (rptr != le32_to_cpu(READ_ONCE(*(u32 *)(progress->host.cpu + args->wptr_offset))))
 		return -EBUSY;
 
-	/* 2. Doorbell。 */
+	/* 2. 首次建队列时为会话分配 Doorbell 页，再选页内空闲入口。 */
 	ret = queue_alloc_doorbell(fpriv, used, &db_index);
 	if (ret)
 		return ret;
 
-	/* 3. 队列对象与 MQD。 */
+	/*
+	 * 3. 分配队列对象与 MQD，登记为“结果未知”，取得 Ring 与
+	 *    进度的使用计数，再填 MQD、把 Ring 置为 INVALID。
+	 */
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
@@ -216,6 +241,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 		kfree(q);
 		return ret;
 	}
+
 	q->fpriv = fpriv;
 	q->ring = ring;
 	q->progress = progress;
@@ -225,12 +251,17 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	q->id = fpriv->next_queue++;
 	q->state = GPGPU_QUEUE_UNLOADING;
 	q->uncertain = true;
+
 	ring->users++;
 	progress->users++;
 	queue_init_mqd(q, args, rptr);
 	list_add_tail(&q->node, &fpriv->queues);
 
-	/* 4. 映射。 */
+	/*
+	 * 4. 经 HIQ 发送 MAP_QUEUES，由 CP 选择空闲用户槽装载 MQD。失败交给
+	 *    queue_map_failed() 决定删除还是保留；等待期间设备若进入故障，
+	 *    队列保留为 FAULTED。
+	 */
 	ret = gpgpu_mgmt_submit(dev, GPGPU_HQD_SLOT_HIQ, GPGPU_MAP_QUEUES, GPGPU_QUEUE_USER_AQL,
 				q->mqd.addr, &status, &published);
 	q->management_status = status;
@@ -240,6 +271,8 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 		q->state = GPGPU_QUEUE_FAULTED;
 		return -EIO;
 	}
+
+	/* 映射已确认：返回队列编号和 Doorbell 的映射令牌与页内偏移。 */
 	q->uncertain = false;
 	q->state = GPGPU_QUEUE_READY;
 	args->queue_id = q->id;
@@ -249,6 +282,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	return 0;
 }
 
+/* 按编号取未卸载的队列，并先读取它所在槽的 GPUVM 故障，供后续报告。 */
 static struct gpgpu_queue *queue_get(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 {
 	struct gpgpu_queue *q = gpgpu_queue_lookup(fpriv, args->queue_id);
@@ -266,6 +300,7 @@ static void queue_report(struct gpgpu_queue *q, struct gpgpu_queue_state *args)
 	args->management_status = q->management_status;
 }
 
+/* QUEUE_QUERY：返回状态、首次错误和最近一次管理结果。 */
 int gpgpu_queue_query(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 {
 	struct gpgpu_queue *q = queue_get(fpriv, args);
@@ -279,9 +314,15 @@ int gpgpu_queue_query(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 /*
  * gpgpu_queue_destroy() - 正常卸载一条队列
  *
- * 1. 结果未知或正在卸载时拒绝；READY 队列必须已排空；
- * 2. 发送 UNMAP_QUEUES；
- * 3. 确认成功：消费旧 IH，放下使用计数，标记 dead；
+ * 调用者持 vm_serial 与 dev->lock；第 2 步等待时会暂时释放 dev->lock。
+ *
+ * 1. 上一次管理结果未知或正在卸载时返回 -EBUSY。READY 队列必须已排空
+ *    （R == W），CP 卸载时不处理未消费的包；FAULTED 队列不要求排空；
+ * 2. 先把队列置为 UNLOADING + uncertain，再经 HIQ 发送 UNMAP_QUEUES。
+ *    等待期间文件关闭时，会话因这条队列保留为 orphan；
+ * 3. 确认成功：先消费旧 IH，让本队列已发布的通知和错误都处理完，
+ *    再放下 Ring 与进度的使用计数并标记 dead，队列对象留待
+ *    queue_collect() 回收；
  *    从未发布：恢复原状态；已发布但 CP 拒绝：队列视为出错；
  *    已发布但结果未知：保持 UNLOADING 与 uncertain，资源全部保留。
  */
@@ -293,16 +334,18 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 	bool published;
 	int ret;
 
-	/* 1. 前提。 */
+	/* 1. 只有结果已知、非卸载中且已排空的队列才能卸载。 */
 	if (!q)
 		return -EINVAL;
 	if (q->uncertain || q->state == GPGPU_QUEUE_UNLOADING)
 		return -EBUSY;
+
+	/* R 由 CP 写回 Host 内存；dma_rmb() 使读到的 R、W 不早于之前的读取。 */
 	dma_rmb();
 	if (q->state == GPGPU_QUEUE_READY && READ_ONCE(*q->rptr) != READ_ONCE(*q->wptr))
 		return -EBUSY;
 
-	/* 2. 卸载。 */
+	/* 2. 记下原状态，从未发布时可以恢复。 */
 	previous = q->state;
 	q->state = GPGPU_QUEUE_UNLOADING;
 	q->uncertain = true;
@@ -310,7 +353,7 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 				q->mqd.addr, &status, &published);
 	q->management_status = status;
 
-	/* 3. 结果。 */
+	/* 3. 分确认成功、从未发布、CP 拒绝、结果未知四种情况收尾。 */
 	if (!ret && status == GPGPU_MANAGEMENT_OK) {
 		gpgpu_ih_drain(dev);
 		q->ring->users--;
@@ -363,6 +406,7 @@ int gpgpu_doorbell_mmap(struct gpgpu_fpriv *fpriv, struct vm_area_struct *vma)
 
 	if (!(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
+
 	mutex_lock(&dev->lock);
 	if (!dev->present) {
 		ret = -ENODEV;
@@ -370,6 +414,8 @@ int gpgpu_doorbell_mmap(struct gpgpu_fpriv *fpriv, struct vm_area_struct *vma)
 	}
 	if (!fpriv->db_page || vma->vm_end - vma->vm_start != PAGE_SIZE)
 		goto out;
+
+	/* 映射为不可缓存的设备页：用户写入要立即到达设备。 */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
 	vm_flags_clear(vma, VM_MAYEXEC);
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
@@ -377,6 +423,7 @@ int gpgpu_doorbell_mmap(struct gpgpu_fpriv *fpriv, struct vm_area_struct *vma)
 	ret = io_remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
 	if (ret)
 		goto out;
+
 	vma->vm_private_data = fpriv;
 	vma->vm_ops = &doorbell_vm_ops;
 	doorbell_vma_open(vma);
