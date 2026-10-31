@@ -227,11 +227,11 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-QTest 与 Linux 全栈结果对应代码版本 `b8bad67`，实际运行的提交在它之后，只改动了文档；`kernel-build.py` 只在准备内核环境时运行，不在这两条路径上。教学汇编器与基础环境引导回归在本说明所在的版本上运行。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
+下列结果对应协议版本 4 的提交 `0f38bff`，在干净的工作树上运行全部入口得到；本说明所在的提交只更新验证记录，不改代码。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
 
-- QTest 11/11，教学汇编器 7/7，基础环境引导回归 6/6。
-- Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0；设备返回的 ABI、GPUVM 状态和客体内核日志检查通过。
-- 两种模式的组件 SHA-256 相同：固件 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，模块 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。
+- QTest 13/13，教学汇编器 7/7，基础环境引导回归 6/6。
+- Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块按该提交的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0；示例输出 `GPGPU DRM ABI=4`，GPUVM 状态和客体内核日志检查通过。
+- 两种模式的组件 SHA-256 相同：固件 `d2415a71ca2c91c34325727c70b49416ebbd2db5ef815684ac2edefd60bb4a53`，模块 `0a42330c1a1bf1c54638841fadaaba22ad3e886b76b652be867cca7f40d496a0`，示例 `93f6ce4409fb16bba77a493b3c440304797dc6db9ab61609c312f21d4f768c49`。
 
 > **[SOURCE]** 本地运行记录：[命令与结果汇总](../../build/gpgpu-validation/runtime-verification.json)、[QTest 输出](../../build/gpgpu-validation/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/bootstrap-check.log)、[全栈输出](../../build/gpgpu-validation/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/core/summary.json)。`build/` 产物不纳入 Git。
 
@@ -466,3 +466,7 @@ MSI-X 和无完成通知；只清错误后使用原映射成功搬运。失败�
 版本 2 的历史核心计算记录为：GPUVM 开启于 `2026-10-28T14:34:47Z` 完成，关闭于 `2026-10-28T14:35:12Z` 完成。两种状态均通过向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种比较 17,953 个结果，退出码为 0；驱动和示例散列一致，未发现客体内核异常。当轮没有运行 SMMUv3、多进程或资源生命周期专项验收。
 
 > **[SOURCE]** 版本 2 的文字记录保存在固定提交 `c9f85990d5ae41b7097201cbe03252ef087ba4c6` 的 [README 第 234～243 行](https://github.com/hxfei-git/gpu-study-qemu/blob/c9f85990d5ae41b7097201cbe03252ef087ba4c6/software/gpgpu/README.md#L234-L243)。原 `core/on/`、`core/off/` 日志未入库且已被版本 3 运行覆盖；现存同路径文件只能证明最新运行，不能重新作为版本 2 的独立证据。
+
+版本 3 的核心计算记录对应代码版本 `b8bad67`：QTest 11/11，教学汇编器 7/7，基础环境引导回归 6/6；Linux 全栈在 GPUVM 开、关两种状态都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0。两种模式的组件 SHA-256 相同：固件 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，模块 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。升级到版本 4 之前，在 `087ea56` 上重跑的 QTest、汇编器和全栈结果与此一致，记录在版本 4 第一个提交的说明中。版本 3 到 4 的差异见 [PROTOCOL_V4.md](./PROTOCOL_V4.md)。
+
+> **[SOURCE]** 版本 3 的本地运行记录移到 `build/gpgpu-validation/v3/`：[命令与结果汇总](../../build/gpgpu-validation/v3/runtime-verification.json)、[QTest 输出](../../build/gpgpu-validation/v3/qtest-build.log)、[全栈输出](../../build/gpgpu-validation/v3/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/v3/core/summary.json)。
