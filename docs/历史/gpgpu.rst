@@ -6,6 +6,14 @@ GPGPU device
    Copyright (c) 2024-2025
    This document is licensed under the GPLv2 (or later).
 
+.. note::
+
+   **[BOUNDARY] 历史设备说明。** 本文保存第一阶段和 CP 队列接入前的设计语境；
+   下文的同步派发、控制窗口与“尚待接入”不代表当前接口。
+   当前入口见 ``../../README.md``，代码与运行记录见
+   ``../../software/gpgpu/README.md``，现行规格见 ``../CP_MEC 第一版规格.md``
+   和 ``../GPUVM 第一版规格.md``。保留原文、原图和许可，不按旧接口恢复代码。
+
 This is an educational GPGPU (General-Purpose Graphics Processing Unit) device
 for learning GPU architecture, driver development, and parallel programming.
 The device implements a simplified SIMT (Single Instruction, Multiple Threads)
@@ -203,11 +211,11 @@ Host 完整读到 Signal 为 ``0`` 后执行 ``dmb sy``，再读取或复制结�
 连续提交验证每轮改变输入，覆盖短暂轮询读到完成和阻塞唤醒后复查的路径。
 
     **[SOURCE]** 固定提交 ``57543dd54b6b046b888277272fa84af81746b1ac``：
-    `hw/riscv/gpgpu-cp.c（274–288 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/riscv/gpgpu-cp.c:274:1>`_
+    `hw/riscv/gpgpu-cp.c（274–288 行） <https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/hw/riscv/gpgpu-cp.c#L274>`_
     将原生 CP 的默认及允许类型设为 ``TYPE_RISCV_CPU_BASE64``；
-    `hw/gpgpu/gpgpu_core.h（72–80 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.h:72:1>`_
+    `hw/gpgpu/gpgpu_core.h（72–80 行） <https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/hw/gpgpu/gpgpu_core.h#L72>`_
     定义计算线程的 32 位状态；
-    `hw/gpgpu/gpgpu_core.c（615–624 行） <vscode://file/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu_core.c:615:1>`_
+    `hw/gpgpu/gpgpu_core.c（615–624 行） <https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/hw/gpgpu/gpgpu_core.c#L615>`_
     在启动时填写各 lane 的 ``a0``。
 
 ``none`` 与 ``smmuv3`` 均使用 ``x-dma-via-socket=on``。B 发送完整设备

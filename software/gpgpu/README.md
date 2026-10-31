@@ -23,7 +23,7 @@
 | FP32 / FP16 / FP8 / FP4 | Floating Point 32 / 16 / 8 / 4-bit | 对应位宽的浮点格式 |
 | BF16 | Brain Floating Point 16-bit | 16 位浮点格式 |
 | ReLU | Rectified Linear Unit | 线性整流函数 |
-| CP | Command Processor | 命令处理器 |
+| CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
 | ACK | Acknowledgment | 确认；本版用于确认已经读取执行结果 |
 | TCG | Tiny Code Generator | QEMU 动态翻译后端 |
 | TAP | Test Anything Protocol | 测试结果输出协议 |
@@ -86,7 +86,7 @@ CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` �
 
 Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
 
-协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](PROTOCOL_V3.md)。
+协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
 
 ## 1. 应用提交与统一访存
 
@@ -205,18 +205,18 @@ make -C software/gpgpu check
 
 `configure` 与 Linux 入口共用 `gpgpu_linux.py` 中的一份配置参数。`build` 和 `test-gpgpu-qtest` 在缺少 `build.ninja` 时自动配置；也可用 `GPGPU_BUILD_DIR=build/verify-qemu` 验证另一份构建，不覆盖默认目录。这个变量不改变 Linux 全栈使用的 `build/arm64-qemu`。
 
-> **[SOURCE]** 本轮整改工作区基于 `c9f8599`。共享参数见 [gpgpu_linux.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>)，配置函数与 Linux 入口分别见[第 161 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:161:1>)、[第 168 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:168:1>)；首次构建的自动配置见 [Makefile.gpgpu](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>) [第 33～46 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>)。
+> **[SOURCE]** 构建和清理后的代码版本为 `38cf573`（起点 `c9f8599`）。共享参数见 [gpgpu_linux.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>)，配置函数与 Linux 入口分别见[第 161 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:161:1>)、[第 168 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:168:1>)；首次构建的自动配置见 [Makefile.gpgpu](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>) [第 33～46 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>)。
 
-本轮构建入口整改的验证结果如下，日志位于 `build/remediation-stage1/`：
+本轮整改的实际验证分两次完成：构建入口调整后保留 `build/remediation-stage1/`，清理课程与上游辅助内容、修正源码暂存后，在新默认目录重新构建并保存 `build/remediation-final/`。最终运行对应代码提交 `38cf573`，其后的本阶段改动只涉及文档。
 
-- 在全新目录 `build/verify-qemu` 配置、构建两个 QEMU 和两个 QTest 程序成功；无需客体内核，也未复用旧构建目录的 Python 环境。
-- 真实 QTest 11/11、汇编器 7/7、基础环境引导回归 6/6。独立配置与首次构建直接使用现有 Make 入口验证，不维护额外的模拟配置测试脚本。
-- 2026-10-31 00:13:59 UTC 完成版本 3 的 Linux 全栈验证。复用已校验的 `6.18.57-0-gpgpu-virt` 开发环境并重编驱动；GPUVM 开、关均完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种模式 3/3，客体退出码均为 0。脚本已检查设备返回的 ABI、GPUVM 状态与客体内核日志。
-- 固件 SHA-256 为 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，与整改前现场重建的基线一致。
+- 全新配置并构建两个 QEMU、两个 QTest 程序和 RV64 固件成功。新默认目录 `build/arm64-qemu` 的 Python 环境由 `/usr/bin/python3` 创建，不再依赖旧项目工作区；原目录改名保留为 `build/arm64-qemu.pre-cleanup`，尚未删除。
+- 最终真实 QTest 为 11/11。汇编器 7/7、基础环境引导回归 6/6 已在整改过程中通过；配置和首次构建直接使用现有 Make 入口验证，不维护额外的模拟配置测试脚本。
+- 最终全栈结果记录的完成时间为 `2026-10-31T05:40:07Z`。复用已校验的 `6.18.57-0-gpgpu-virt` 开发环境并重编驱动；GPUVM 开、关均完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种模式 3/3，客体退出码均为 0。脚本同时检查设备返回的 ABI、GPUVM 状态与客体内核日志。
+- 驱动模块、固件和示例在两种模式下的 SHA-256 一致。固件为 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，与整改前现场重建的基线一致；模块为 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例为 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。
 
-> **[SOURCE]** 本地实际运行记录：全栈[命令与输出](../../build/remediation-stage1/stack.log)、[两种模式汇总](../../build/gpgpu-kernel-gpuvm/core/summary.json)、GPUVM [开启结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/on/result.json)、[关闭结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/off/result.json)。这些 `build/` 产物不纳入 Git。
+> **[SOURCE]** 最终本地实际运行记录：[QTest 命令与输出](../../build/remediation-final/qtest.log)、[全栈命令与输出](../../build/remediation-final/stack.log)、[两种模式汇总](../../build/gpgpu-kernel-gpuvm/core/summary.json)、GPUVM [开启结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/on/result.json)、[关闭结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/off/result.json)。`build/` 产物不纳入 Git，`core/` 随下一次运行更新，不能作为旧协议版本的不可变归档。
 
-**[BOUNDARY]** QTest 和全栈测试在沙箱内均遇到 Unix socket 权限限制，以上通过结果来自沙箱外复跑。客体用户态编译出现 `Clock skew detected` 警告，完整输出已保留；本次未调整客体时钟。现有开发环境可复用，但从零引导所需的旧内核 APK 缺件仍按第 5.1 节单独处理，本次没有重新验证下载 URL。
+**[BOUNDARY]** QTest 和全栈测试在沙箱内均遇到 Unix socket 权限限制，通过结果来自沙箱外复跑。早一轮客体编译出现 `Clock skew detected` 警告，输出保留在 `build/remediation-stage1/stack.log`，本次未调整客体时钟。现有开发环境可复用；从零引导所需的旧内核 APK 缺件仍按第 5.1 节处理，本轮没有重新验证下载 URL 或从零生成开发盘。
 
 以下两段保留 2026-10-30 的历史验证和失败尝试，不代表本轮验收状态。
 
@@ -235,7 +235,7 @@ python3 software/gpgpu/scripts/kernel-build.py --output-dir build/gpgpu-kernel-g
 make -f Makefile.gpgpu test-gpgpu-stack
 ```
 
-引导入口复用 `kernel-build.py` 的 `download_checked()`。固定 ISO 为 Alpine 3.24.2 aarch64；80 个编译依赖的版本、URL 和 SHA-256 保存在 [bootstrap-packages.json](linux/kernel/bootstrap-packages.json)，两个 6.18.57 内核包沿用 [cached-packages.json](linux/kernel/cached-packages.json)。宿主机先验证全部文件，客体仅从本地安装并保留 APK 签名检查；不运行在线升级或恢复旧同步栈。引导脚本只格式化本次新建的暂存盘，已有未通过校验的开发盘不会被覆盖。安装、重启和内核版本检查都成功后，才发布 `environment.json`。
+引导入口复用 `kernel-build.py` 的 `download_checked()`。固定 ISO 为 Alpine 3.24.2 aarch64；80 个编译依赖的版本、URL 和 SHA-256 保存在 [bootstrap-packages.json](./linux/kernel/bootstrap-packages.json)，两个 6.18.57 内核包沿用 [cached-packages.json](./linux/kernel/cached-packages.json)。宿主机先验证全部文件，客体仅从本地安装并保留 APK 签名检查；不运行在线升级或恢复旧同步栈。引导脚本只格式化本次新建的暂存盘，已有未通过校验的开发盘不会被覆盖。安装、重启和内核版本检查都成功后，才发布 `environment.json`。
 
 本机已取得并校验 ISO 与 80 个依赖。镜像移除的两个旧内核包必须从保留同版包的归档或已有缓存补回，文件内容须匹配下列 SHA-256。放置目录为 `build/gpgpu-linux-module/apk-cache/`：
 
@@ -246,25 +246,14 @@ make -f Makefile.gpgpu test-gpgpu-stack
 
 后续内核重建还需要以下材料；网络不能访问时，按清单固定 URL 获取原文件并放到对应位置，不能改版本或校验值：
 
-- `build/gpgpu-kernel-gpuvm/downloads/linux-6.18.tar.xz`、`patch-6.18.57.patch.xz`：URL 与 SHA-512 在 [sources.json](linux/kernel/sources.json)。当前网络不允许访问 `cdn.kernel.org`。
-- `build/gpgpu-kernel-toolchain/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz`：URL 与 SHA-256 在 [cross-toolchain.json](linux/kernel/cross-toolchain.json)。
-- `build/gpgpu-kernel-host-tools/downloads/`：按 [cross-host-dependencies.json](linux/kernel/cross-host-dependencies.json) 的 `file` 字段放置各包；工具链脚本使用同一清单校验。
-- `build/gpgpu-kernel-gpuvm/apk-cache/`：补充包按 [build-dependencies.json](linux/kernel/build-dependencies.json) 的 `cache_name` 放置，URL 与 SHA-256 也在该清单中。
+- `build/gpgpu-kernel-gpuvm/downloads/linux-6.18.tar.xz`、`patch-6.18.57.patch.xz`：URL 与 SHA-512 在 [sources.json](./linux/kernel/sources.json)。当前网络不允许访问 `cdn.kernel.org`。
+- `build/gpgpu-kernel-toolchain/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz`：URL 与 SHA-256 在 [cross-toolchain.json](./linux/kernel/cross-toolchain.json)。
+- `build/gpgpu-kernel-host-tools/downloads/`：按 [cross-host-dependencies.json](./linux/kernel/cross-host-dependencies.json) 的 `file` 字段放置各包；工具链脚本使用同一清单校验。
+- `build/gpgpu-kernel-gpuvm/apk-cache/`：补充包按 [build-dependencies.json](./linux/kernel/build-dependencies.json) 的 `cache_name` 放置，URL 与 SHA-256 也在该清单中。
 
 基础环境的 `environment.json`、`developer.raw`、内核和 initramfs 由引导生成。引导逻辑的缓存与防覆盖回归入口为 `make -C software/gpgpu check-bootstrap`，本次通过 6/6。
 
 2026-10-30 另用已校验 ISO 启动真实 AArch64 客体，离线提交全部 80 个固定依赖包，完成 74 项安装或升级操作，最终为 96 个已安装包，GCC 为 15.2.0。日志保存在 `build/gpgpu-linux-module/bootstrap-package-smoke.log`。该检查使用 ISO 自带的 `6.18.52-0-virt`，仅验证依赖安装；指定的 `6.18.57-0-virt` 开发盘生成与重启验证仍待两个内核包补齐后执行。
-
-以下保留协议版本 2 的历史运行记录。
-
-2026-10-28 已完成版本 2 的全栈构建与核心计算。GPUVM 开启和关闭均通过向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513；每种状态比较 17,953 个结果，客体退出码均为 0。两次运行的驱动与示例散列一致，客体日志未出现内核异常。
-
-> **[SOURCE]** 本次工作区版本 2 的实际产物与运行记录：GPUVM 开启于 `2026-10-28T14:34:47Z` 完成，关闭于 `2026-10-28T14:35:12Z` 完成。各记录包含内核版本、驱动、固件和示例 SHA-256，可核对本次运行产物：
->
-> - 开启：[计算日志](../../build/gpgpu-kernel-gpuvm/core/on/compute.log)、[结果与散列](../../build/gpgpu-kernel-gpuvm/core/on/result.json)。
-> - 关闭：[计算日志](../../build/gpgpu-kernel-gpuvm/core/off/compute.log)、[结果与散列](../../build/gpgpu-kernel-gpuvm/core/off/result.json)。
-
-这些本地 `build/` 产物不纳入 Git。本轮未运行 SMMUv3、多进程、资源生命周期或其他专项验收，历史测试数量不用于证明版本 2。
 
 ## 6. 历史验收记录
 
@@ -273,6 +262,16 @@ make -f Makefile.gpgpu test-gpgpu-stack
 <a id="stage-three-validation"></a>
 
 ### 6.1 第三阶段验收与代码快照（历史）
+
+当时按固定存储 GPUVM 接入 DRM 文件、GEM 对象与 GPUVA 绑定，再让 CP 和执行器按用户 VMID 翻译访问。关闭时先卸载队列，再失效并解除映射，最后回收引用、存储和 VMID。模式 2 使用 DRM render node，仍保留旧模式 0/1 和 RV32 控制页；这些兼容路径和控制页后来在统一访存重构中删除。
+
+```text
+DRM 文件 → GEM 对象与 GPUVA 映射 → 用户 VMID
+  → CP / 执行器翻译访问 → 结果与通知
+  → 卸载队列 → 失效并解除映射 → 回收引用、存储和 VMID
+```
+
+Queue 存活期间冻结映射，不接入 TTM、迁移、换页或抢占。异常保留的 GEM 对象独立持有 DRM 设备引用，直到设备访问停止后再回收。
 
 2026-10-19，本轮实现以子仓库提交
 `c5acaf7a05a6852f94985197c15c2e84953fe991` 为起点，固定实现提交为
@@ -311,6 +310,24 @@ CP 日志为 `build/gpgpu-gpuvm-cp-regression.log`；旧队列日志为
 
 ### 6.2 第二阶段验证状态（历史）
 
+第二阶段以 `57543dd54b6b046b888277272fa84af81746b1ac` 为接入前基线。队列模式使用双进程设备、`IOMMU=none、VMID=0`，Host 经 HSAKMT 风格库申请对象并建 Queue，RV64 CP 处理管理命令和 AQL，RV32 执行器运行 Kernel。当时 Host 参数基址完整保存为 64 位，计算线程的 `a0` 仍指向 32 位参数窗口。
+
+```text
+执行器终态与确认
+  → Signal=0 → 通知槽=事件编号 → IH 记录
+  → AQL Header=INVALID → 新 R
+  → Host 复查结果，按对象寿命卸载和释放
+```
+
+当时的代码落点如下，路径和模式不作为现行接口：
+
+- `include/gpgpu_queue.h` 集中布局、寄存器与错误编号；固件的 `start.S/link.ld` 固定末尾 4 MiB，`memory.c` 保存访问上下文，`management.c` 管理 MQD 绑定与请求配对，`aql.c` 处理派发和收尾。
+- 设备接入 HQD、8 字节 Doorbell、IH、Host 参数窗口与分段执行；IH 使用第四个 MSI-X 向量，原同步路径继续保留。
+- `linux/gpgpu_pci_main.c` 与内存、队列、事件实现共同生成 `gpgpu_pci.ko`，`queue_mode=0/1` 选择互斥路径。设备统一管理显存，用户 Doorbell 按进程独占页面；不能确认访问结束的上下文继续保留。
+- `hsakmt/` 提供设备、内存、队列和事件接口。`tests/queue_helpers.c` 实现取号、Header 发布、Doorbell 与默认等待，`tests/test-queue.c` 覆盖连续计算、并发、等待、错误和对象寿命。
+- 内核材料保存在 `linux/kernel/`，入口为 `scripts/kernel-build.py`。当时精简配置将模块项从 892 减到 78，原 1,286 个内置配置项保留；配置可逐字节重现，启动、PCI、IOMMU、9p、ext4 等依赖另经核对。原生构建出现跨 CPU 同步等待后，按确认方案改用宿主机交叉构建。
+- 目标内核为 `6.18.57-0-gpgpu-virt`，内置 `GPU_BUDDY` 与 `FW_LOADER`。交叉工具链固定为 Arm GNU Toolchain `15.2.Rel1`（GCC `15.2.1`），当时以 16 任务输出到 `build/gpgpu-kernel-cross/`。交叉配置仅两项编译器身份字段不同，功能选项一致；必要工具与 GCC 插件导入 ARM64 客体后原生重编，配置、生成头和 `Module.symvers` 校验不变。独立开发盘为 32 GiB，客体使用 4 个虚拟 CPU、4 GiB 内存；原生构建和发行版环境保留。
+
 2026-10-19，整改前提交 `3217651` 中的 RV64 固件与 Host 接口库已通过编译，汇编检查
 4/4。CP QTest 为 16/16，包含原 8 项、设备边界检查和真实队列固件流程；
 新增的 A57 与 RV64 CP 双向 64 位并发访问检查运行 2000 轮，高低半部同时
@@ -335,13 +352,15 @@ RAM。等待用例在提交前确认主线程和两个等待线程均阻塞在�
 
 > **[SOURCE]** 2026-10-19 实际运行产物：[队列结果](../../build/gpgpu-kernel-cross/remote/none/queue-test.json)、[队列检查与卸载日志](../../build/gpgpu-kernel-cross/remote/none/queue-test.log)、[四种同步组合的八次运行汇总](../../build/gpgpu-kernel-cross/stage1-validation.json)及[内核构建清单](../../build/gpgpu-kernel-cross/kernel-build.json)。这些链接指向本地 `build/` 产物，未纳入 Git；复现构建和测试后生成。
 >
-> 整改后提交 `6325a87` 中的等待与寿命检查见 [tests/test-queue.c](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497) 的 [第 497～539 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497)、[第 817～863 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L817)，非法参数地址见该文件的 [第 609～616 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L609)。固件目录修复见 [linux/guest-queue-test.sh](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8) 的 [第 8～14 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8)。
+> 整改后提交 `6325a87` 中的等待与寿命检查见 [tests/test-queue.c](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497) 的 [第 497～539 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L497-L539)、[第 817～863 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L817-L863)，非法参数地址见该文件的 [第 609～616 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/tests/test-queue.c#L609-L616)。固件目录修复见 [linux/guest-queue-test.sh](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8) 的 [第 8～14 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/guest-queue-test.sh#L8-L14)。
 
-同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
-MQD 及相关引用，尚待修复。上述测试数量是已提交的历史运行记录；复核环境
-仅完成用户态编译和汇编检查，未重跑完整客体验收。证据与复核范围见
-[大纲复核记录](<../../../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)；
-寄存器与协议查阅见 [GPGPU 硬件手册](<../../../QEMU_2026_GPGPU_硬件手册.html>)。
+<a id="stage-two-review"></a>
+
+2026-10-19 规格复核发现：`6325a87` 的驱动读到匹配的管理完成标记后，未检查 `status` 是否属于已定义的 `0～6`。若仍为初值 `0xffff_ffff` 或其他未知值，创建失败分支可能释放 MQD 及关联引用，而设备访问尚未确认结束。当时仅重编用户态、检查汇编器，后续风格整改补验了固件编译，没有重跑完整客体验收；此前通过数仍只代表其原始记录版本。
+
+> **[SOURCE]** 修复前固定提交 `6325a87e4c500f4930c4e0b502a1ec241f83bf26`：[管理结果读取，第 110～129 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/gpgpu_queue.c#L110-L129)、[创建失败回收，第 622～634 行](https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/linux/gpgpu_queue.c#L622-L634)。
+
+该缺口在第三阶段固定提交 `3600ff795dde9069a6e4f1405f6950a61ea75faa` 中修复：未知结果返回协议错误，已发布请求及相关资源继续保留。三个注入场景的实际结果和修复源码见[第 6.1 节](#stage-three-validation)。这段记录替代原大纲中的重复复核摘要。
 
 同日完成 `hw/gpgpu/` 和 `software/` 的中文注释与 Linux 风格整改，
 原实现提交 `3217651` 重写为 `6325a87`。本次用户态与 RV64 固件编译通过，
@@ -354,6 +373,20 @@ MQD 及相关引用，尚待修复。上述测试数量是已提交的历史运�
 下节的 2026-10-08 记录属于第一阶段历史结果。
 
 ### 6.3 第一阶段验证记录（历史）
+
+第一阶段先以 `b34b175` 拆分设备的寄存器路由、中断、DMA、派发和 Doorbell，再按顺序接入软件栈 ABI（`aa04ba5`）、设备软件接口（`1d60077`）、Linux PCI 驱动（`c844be7`）、运行时与编程模型（`642880f`）、客体验证（`7fcd7a1`），最后补齐成果文档。
+
+```text
+ARM64 Linux 应用
+  → libgpgpu：显存分配、DMA 拷贝、Kernel 装载与同步派发
+  → /dev/gpgpu0：ioctl 与 mmap DMA 暂存区
+  → Linux PCI 驱动：BAR0 控制、BAR2 显存、BAR4 保留门铃
+  → QEMU GPGPU：PCI DMA、MSI-X、RV32 解释器与 VRAM
+```
+
+当时只允许一个打开会话，计算和 DMA 请求同步完成，应用使用 32 位 VRAM 偏移，不能把 ARM64 指针交给 Kernel。驱动管理显存并保留首页，`mmap` 仅映射会话的 64 KiB 一致性 DMA 暂存区，大拷贝由运行时分块提交。`a0` 保存参数块的 VRAM 偏移；线程坐标通过 `0x8000_0000` 控制窗口读取，`ebreak` 结束线程。每组最多 1024 个线程、最多 4096 组、总计最多 65536 个线程，设备另设 warp 执行预算；共享存储与组内屏障尚未实现。
+
+2026-10-07 首次验收中，三个示例的 17,953 个输出正确，MSI-X 增量为 kernel=3、DMA=21、error=0，驱动与运行时检查 68/68，卸载重载 2/2；RISC-V 和 ARM64 的 GPGPU QTest 各 21/21，其中评分测试 17/17。以下保留次日系统 IOMMU 接入后的完整回归记录。
 
 2026-10-08 在本仓库 `main` 分支运行。ARM64 Alpine 客体内核为
 `6.18.55-0-virt`，QEMU 使用 TCG。保存的内核配置中
@@ -398,3 +431,13 @@ MSI-X 和无完成通知；只清错误后使用原映射成功搬运。失败�
 复用的原有 SMMUv3 QTest 为 3/3，汇编器检查为 4/4。生产设备、驱动、
 运行时与 ABI 均未修改。本轮未增加跨页布局、只读权限、撤销映射或重新
 映射用例；GPU 内部地址隔离仍未实现。
+
+### 6.4 CP 接入与统一访存重构（历史）
+
+2026-10-11 接入双进程设备与原生 RV32 CP，完成复位、固件装载、启动和同地址替换固件。2026-10-14 接入 CP Host 访存窗口，CP 以普通读写指令经 IOVA 访问 Host RAM；2026-10-17 将原生 CP 迁到 RV64，增加对齐的 8 字节读写，RV32 计算执行器保持独立。详细调用与当时回归见[窗口实现记录](<../../docs/历史/CP_MEC 软件实现、参考与扩展.md#cp-host-window-implementation>)。
+
+2026-10-28 的统一访存重构采用连续 VRAM／Outbound、单一 DRM/GEM 入口、GPUVM 开关与 CSR 启动信息，删除同步路径、旧参数窗口和三模式接口。当时协议版本为 2；2026-10-29 再重构共享定义并升级为版本 3，差异见 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。不再用“统一访存版本 2”指称当前阶段。
+
+版本 2 的历史核心计算记录为：GPUVM 开启于 `2026-10-28T14:34:47Z` 完成，关闭于 `2026-10-28T14:35:12Z` 完成。两种状态均通过向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种比较 17,953 个结果，退出码为 0；驱动和示例散列一致，未发现客体内核异常。当轮没有运行 SMMUv3、多进程或资源生命周期专项验收。
+
+> **[SOURCE]** 版本 2 的文字记录保存在固定提交 `c9f85990d5ae41b7097201cbe03252ef087ba4c6` 的 [README 第 234～243 行](https://github.com/hxfei-git/gpu-study-qemu/blob/c9f85990d5ae41b7097201cbe03252ef087ba4c6/software/gpgpu/README.md#L234-L243)。原 `core/on/`、`core/off/` 日志未入库且已被版本 3 运行覆盖；现存同路径文件只能证明最新运行，不能重新作为版本 2 的独立证据。

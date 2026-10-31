@@ -1,5 +1,26 @@
 # CLAUDE.md
 
+| 缩写 | 英文全称 | 中文含义 |
+| --- | --- | --- |
+| QEMU | Quick Emulator | 仿真与虚拟化工具 |
+| GPGPU / GPU | General-Purpose Computing on Graphics Processing Units / Graphics Processing Unit | GPU 通用计算／图形处理器 |
+| CP | Command Processor | 命令处理器 |
+| CPU | Central Processing Unit | 中央处理器 |
+| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 的 RISC-V 位宽 |
+| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
+| GPUVM | GPU Virtual Memory | GPU 虚拟内存 |
+| AQL | Architected Queuing Language | HSA 队列包格式 |
+| HSA / HSAKMT | Heterogeneous System Architecture / HSA Kernel Mode Thunk | 异构系统架构／HSA 内核接口封装层 |
+| IH | Interrupt Handler | 本实验的完成与错误通知模块 |
+| MQD | Memory Queue Descriptor | 内存队列描述符 |
+| BAR | Base Address Register | PCI 基址寄存器 |
+| PCI | Peripheral Component Interconnect | 外设互连总线 |
+| ABI | Application Binary Interface | 应用二进制接口 |
+| ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
+| IOMMU | Input/Output Memory Management Unit | 输入输出内存管理单元 |
+| TAP | Test Anything Protocol | 测试结果输出协议 |
+| WSL | Windows Subsystem for Linux | Windows 的 Linux 子系统 |
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 @AGENTS.md
@@ -7,7 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 1. 规则来源与父仓库
 
 上面一行导入本仓库的 `AGENTS.md`。C 代码风格、三级注释、测试要求、脚本与验证的精简原则、
-“子系统：具体修改”的提交标题和当前 GPGPU 实验状态都以它为准；本文件只补充
+“子系统：具体修改”的提交标题都以它为准；本文件只补充
 跨文件的软件栈结构和 GPGPU 专用命令。规则要改时，改 `AGENTS.md`，
 不在这里另存一份。
 
@@ -16,18 +37,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 本仓库通常作为 gpu_study 父仓库的子模块，检出在 `4.experiments/gpu-study-qemu`。
 从本目录启动时，Claude Code 会逐级向上加载父仓库根目录的 `CLAUDE.md`，
-并经其中的导入加载父仓库的 `AGENTS.md`。修改本仓库代码时遵循本仓库规则；修改 `../` 下的
-规格、大纲和硬件手册时遵循父仓库规则。单独克隆本仓库时，`../` 下的参考材料不存在。
+并经其中的导入加载父仓库的 `AGENTS.md`。代码和实验文档均在本仓库维护。`docs/` 遵循父仓库写作规则；
+单独克隆本仓库时，父仓库的学习笔记与原课程材料可能不存在。
 
 ## 2. 分支与父仓库同步
 
-作为子模块检出时，本仓库通常处于 detached HEAD，直接提交的新提交不属于任何分支。
-提交前先确认 HEAD 与 `main` 指向同一提交，再运行 `git switch main`；两者不同时，
-切换会改变工作区代码，先向用户说明。
+作为子模块检出时可能处于 detached HEAD。开始修改前先确认分支与工作区；
+本仓库以 `main` 为开发基线，临时任务分支完成后按 `AGENTS.md` 安全快进，
+不得为切分支覆盖未提交修改或强制移动已有分支。
 
-本仓库提交后，父仓库还要另行提交新的子模块指针，并按需同步 `../` 下的文档。
-`software/gpgpu/PROTOCOL_V3.md` 列出协议从版本 2 到版本 3 的差异，用来逐条更新
-父仓库的规格和硬件手册；两边不一致时，协议常量以 `software/gpgpu/include/gpgpu/` 为准。
+代码、规格、大纲、硬件手册与实验进度在本仓库同一版本中维护；提交后父仓库只需
+同步子模块指针及确实受影响的学习引用，不再另改一套实验文档。
+`software/gpgpu/PROTOCOL_V3.md` 用于核对组件升级；协议常量以
+`software/gpgpu/include/gpgpu/` 为准。当前阶段见
+[实验进度](<./docs/实验进度.md>)，运行证据见软件栈说明第 5、6 节。
 
 ## 3. GPGPU 软件栈：从应用到设备的五层调用
 
@@ -81,13 +104,13 @@ make -f Makefile.gpgpu build JOBS=4
 # 设备寄存器与 RV64 CP 队列：先构建固件和 QEMU，再按 TAP 核对全部用例通过
 make -f Makefile.gpgpu test-gpgpu-qtest
 
-# 只运行一个用例：GLib 的 -p 选择用例路径，路径见测试文件末尾的 qtest_add_func
+# 只运行一个用例：先用 -l 查看含架构前缀的路径，再用 GLib 的 -p 选择
 QTEST_QEMU_BINARY=build/arm64-qemu/qemu-system-aarch64 \
 QTEST_GPGPU_REMOTE_BINARY=build/arm64-qemu/qemu-system-riscv64 \
 QTEST_GPGPU_REMOTE_LOG_DIR=build/gpgpu-qtest-logs \
 QTEST_GPGPU_FIRMWARE=build/gpgpu-firmware/gpgpu-cp.bin \
-build/arm64-qemu/tests/qtest/gpgpu-cp-test --tap -p /gpgpu/cp/dispatch
-# 寄存器用例只需要 QTEST_QEMU_BINARY，例如 gpgpu-regs-test --tap -p /gpgpu/regs/irq
+build/arm64-qemu/tests/qtest/gpgpu-cp-test --tap -p /aarch64/gpgpu/cp/dispatch
+# 寄存器用例只需要 QTEST_QEMU_BINARY，例如 -p /aarch64/gpgpu/regs/irq
 
 make -C software/gpgpu                  # 用户库、gpgpu-demo 与三个 RV32 Kernel，输出到 build/gpgpu-stack
 make -C software/gpgpu/firmware         # RV64 CP 固件 build/gpgpu-firmware/gpgpu-cp.bin
@@ -108,6 +131,6 @@ make -C software/gpgpu/linux module                       # 在开发客体中�
   这个变量只影响 QEMU 配置、构建和 QTest，全栈入口仍使用 `build/arm64-qemu`。
 - Linux 全栈所需的内核环境按 `software/gpgpu/README.md` 第 5.1 节，用
   `bootstrap-env.py` 和 `kernel-build.py` 准备。
-- 按 `AGENTS.md` 核对通过数量时，QTest 看 `build/gpgpu-qtest.log` 中的 TAP `ok` 行；
+- 按 `AGENTS.md` 核对运行结果时，QTest 看 `build/gpgpu-qtest.log` 中的 TAP `ok` 行；
   Linux 全栈看 `build/gpgpu-kernel-gpuvm/core/on/`、`core/off/` 下的 `result.json`
   和 `compute.log`，两种状态都通过后才会生成 `core/summary.json`。

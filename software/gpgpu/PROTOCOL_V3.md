@@ -2,6 +2,15 @@
 
 | 缩写 | 英文全称 | 中文含义 |
 | --- | --- | --- |
+| GPGPU | General-Purpose Computing on Graphics Processing Units | GPU 通用计算 |
+| GPU / GPUVM / GPUVA | Graphics Processing Unit / GPU Virtual Memory / GPU Virtual Address | 图形处理器／GPU 虚拟内存／GPU 虚拟地址 |
+| ABI | Application Binary Interface | 应用二进制接口 |
+| AQL | Architected Queuing Language | HSA 队列包格式 |
+| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 使用的 RISC-V 位宽 |
+| CSR | Control and Status Register | 控制与状态寄存器 |
+| MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
+| PCI | Peripheral Component Interconnect | 外设互连总线 |
+| UAPI | User-space Application Programming Interface | 内核向用户态提供的接口 |
 | BAR | Base Address Register | PCI 基址寄存器 |
 | CP | Command Processor | 命令处理器 |
 | DMA | Direct Memory Access | 直接内存访问 |
@@ -13,7 +22,7 @@
 | MSI-X | Message Signaled Interrupts Extended | 扩展消息中断 |
 | VRAM | Video RAM | 设备本地显存 |
 
-本文列出协议从版本 2 到版本 3 的全部差异，供更新父目录的 CP/MEC 规格、GPUVM 规格与硬件手册时逐条核对。设备模型、RV64 CP 固件、Linux 驱动与用户库必须一起更新，混用版本时驱动 probe 或固件握手会失败。
+本文列出协议从版本 2 到版本 3 的全部差异，供更新 [CP/MEC 规格](<../../docs/CP_MEC 第一版规格.md>)、[GPUVM 规格](<../../docs/GPUVM 第一版规格.md>)与[硬件手册](<../../docs/GPGPU_硬件手册.html>)时逐条核对。设备模型、RV64 CP 固件、Linux 驱动与用户库必须一起更新，混用版本时驱动 probe 或固件握手会失败。
 
 协议常量的唯一来源是 `include/gpgpu/`；下文引用的名称都定义在那里。
 
