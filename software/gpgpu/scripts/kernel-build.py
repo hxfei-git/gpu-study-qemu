@@ -287,7 +287,9 @@ def prepare_sources(output):
                 path.unlink()
             subprocess.run(["tar", "-cf", str(archive),
                             "-C", str(stage), tree.name], check=True)
-        # 新源码及归档准备成功后，才替换旧展开目录。
+        # 新源码及归档准备成功后，才替换旧展开目录。替换前先作废标记，
+        # 中途中断时缓存不会被当作有效，下次运行重新准备。
+        marker.unlink(missing_ok=True)
         if source.exists():
             shutil.rmtree(source)
         source.mkdir()

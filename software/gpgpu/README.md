@@ -226,7 +226,7 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-下列结果对应代码版本 `b8bad67`，实际运行的提交在它之后，只改动了文档。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
+QTest 与 Linux 全栈结果对应代码版本 `b8bad67`，实际运行的提交在它之后，只改动了文档；`kernel-build.py` 只在准备内核环境时运行，不在这两条路径上。教学汇编器与基础环境引导回归在本说明所在的版本上运行。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
 
 - QTest 11/11，教学汇编器 7/7，基础环境引导回归 6/6。
 - Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0；设备返回的 ABI、GPUVM 状态和客体内核日志检查通过。
