@@ -201,8 +201,6 @@ clean: recurse-clean
 	-$(quiet-@)test -f build.ninja && $(NINJA) $(NINJAFLAGS) clean-ctlist || :
 	find . \( -name '*.so' -o -name '*.dll' -o \
 		  -name '*.[oda]' -o -name '*.gcno' \) -type f \
-		! -path ./roms/edk2/ArmPkg/Library/GccLto/liblto-aarch64.a \
-		! -path ./roms/edk2/ArmPkg/Library/GccLto/liblto-arm.a \
 		-exec rm {} +
 	rm -f TAGS cscope.* *~ */*~
 	@$(MAKE) -Ctests/qemu-iotests clean
@@ -218,9 +216,7 @@ distclean: clean recurse-distclean
 	-$(quiet-@)test -f build.ninja && $(NINJA) $(NINJAFLAGS) -t clean -g || :
 	rm -f config-host.mak Makefile.prereqs
 	rm -f tests/tcg/*/config-target.mak tests/tcg/config-host.mak
-	rm -f tests/gevico/tcg/*/config-target.mak tests/gevico/tcg/config-host.mak
 	rm -f config.status
-	rm -f roms/seabios/config.mak
 	rm -f qemu-plugins-ld.symbols qemu-plugins-ld64.symbols
 	rm -f *-config-target.h *-config-devices.mak *-config-devices.h
 	rm -rf meson-private meson-logs meson-info compile_commands.json

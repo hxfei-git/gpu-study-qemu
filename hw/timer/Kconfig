@@ -65,6 +65,3 @@ config STELLARIS_GPTM
 
 config AVR_TIMER16
     bool
-
-config G233_PWM
-    bool

@@ -140,16 +140,3 @@ config MIPS_BOSTON_AIA
     default y
     select PCI_EXPRESS
     select PCI_EXPRESS_XILINX
-
-config GEVICO_G233
-    bool
-    default y
-    depends on RISCV32 || RISCV64
-    select RISCV_ACLINT
-    select SIFIVE_PLIC
-    select G233_GPIO
-    select G233_PWM
-    select G233_WDT
-    select G233_SPI
-    select SSI_M25P80
-    select PL011
