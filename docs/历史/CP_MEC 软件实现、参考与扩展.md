@@ -310,7 +310,7 @@ Ring 槽、任务参数和 Signal 的可复用时机分别判断。例如任务�
 
 版本 2 已删除 libgpgpu 的同步计算路径，上传与读回由 DRM COPY 完成；应用统一通过公共队列接口提交。ROCr/HSA 运行时及高层任务接口留待[后续单独评估](<../QEMU GPGPU 实验大纲.md#rocr-runtime-extension>)。创建失败、映射引用与退出时的资源保护见[资源释放与软件清理](#host-resource-lifetime)。
 
-> **[SOURCE]** 子仓库固定版本 `57543dd54b6b046b888277272fa84af81746b1ac`：[software/gpgpu/runtime/gpgpu.h](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.h#L9) 的 [9–43 行](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.h#L9-L43)定义现有上下文、Kernel、三维尺寸和返回值；[gpgpu.c](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.c#L268) 的 [268–348 行](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.c#L268-L348)给出现有尺寸校验、参数复制、同步提交和等待。这里记录历史同步实现；当前队列接口保存在独立的 HSAKMT 风格库中。
+> **[SOURCE]** 子仓库固定版本 `57543dd54b6b046b888277272fa84af81746b1ac`：[software/gpgpu/runtime/gpgpu.h](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.h#L9) 的 [9–39 行](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.h#L9-L39)定义现有上下文、Kernel、三维尺寸和返回值；[gpgpu.c](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.c#L268) 的 [268–348 行](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/software/gpgpu/runtime/gpgpu.c#L268-L348)给出现有尺寸校验、参数复制、同步提交和等待。这里记录历史同步实现；当前队列接口保存在独立的 HSAKMT 风格库中。
 
 ## 2. 队列对象与地址空间
 
