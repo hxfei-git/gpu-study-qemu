@@ -330,17 +330,23 @@ CP 读取描述对象 → 保存代码、参数地址及长度、VMID、HQD 槽�
 ```text
 排空并卸载 Queue → 确认旧用户访问结束
   → CPU 写页表，保证设备可见
-  → 请求按 VMID 全量失效
-  → 设备清理 TLB，阻止旧页表遍历重新填入旧翻译
-  → 驱动取得本次 ACK
+  → 写 VPN 范围和 VM_INV_REQ：绑定、解绑只失效该对象的页，
+    启用、停用上下文失效整个 VMID
+  → 设备检查请求和所选上下文，清除匹配的 TLB 项，
+    阻止旧页表遍历重新填入旧翻译
+  → 驱动读 VM_INV_ACK，确认只含本 VMID 的位
   → 允许新 Queue 使用映射，或释放已撤销映射的引用
 ```
 
-TLB 按 VMID 和 GPU 页号区分缓存项，并保存目标页及权限。失效接口一次只接受一个请求，接受时清旧 ACK，完成后发布本次 ACK；驱动串行等待。失效结束保证后续请求使用更新后的翻译，旧数据请求则必须已由队列卸载协议确认结束。
+**[DESIGN]** TLB 共 64 组、每组 4 路，按 VMID 和 VPN（GPUVA 的 `[31:12]`）区分缓存项，组号为 VPN % 64。每项保存 GPU 物理页和读、写、取指权限，只缓存叶子翻译，不缓存中间表。命中时该路成为最近使用的一路；未命中时遍历页表，成功后先填本组的无效路，四路都有效时替换最久未用的一路，遍历失败不填。例如 VPN 5、69、133、197 都落在第 5 组，依次访问后四路占满；再访问 VPN 261 时替换最早访问的 VPN 5。设备另有命中、未命中和替换三个只读计数，全设备共用、32 位回绕，复位时清零，失效不清零。组相联结构参照 ARM 的通用做法，组数、路数和替换策略是本设备的取值，不代表 MI300X UTCL1/UTCL2 的参数。
 
-失败或结果未知时禁止该上下文继续创建 Queue，保留相关页表、映射和存储。容量和替换算法采用小型仿真实现，不增加精细区间失效或异步更新。
+驱动每次只请求一个 VMID。以失效 VMID 1 中 GPUVA `0x0040_0000～0x0040_2fff` 为例：先写 `VM_INV_VPN_START = 0x400`、`VM_INV_VPN_END = 0x402`，再写 `VM_INV_REQ` 为 VMID 1 的位加 RANGE，设备在这次寄存器写入内清除 VMID 1 中 VPN 落在 `0x400～0x402` 的项，`VM_INV_ACK` 读回 `0x2`。请求含保留位、位图为空、范围非法，或所选上下文仍有激活的队列或在途访问时，设备整体拒绝，不清任何项，ACK 只置 ERROR。失效结束保证后续请求使用更新后的翻译，旧数据请求则必须已由队列卸载协议确认结束。
+
+失败或结果未知时禁止该上下文继续创建 Queue，保留相关页表、映射和存储。本期不增加异步更新。
 
 > **[SOURCE]** 固定 Linux 源码：[amdgpu_vm_cpu.c，第 73～135 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.c#L73-L135)提供 CPU 写表与发布路径；[gmc_v9_0.c，第 776～879 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L776-L879)通过失效请求与 ACK 等待完成。本设备采用 CPU 同步更新，并额外限制为卸载队列后更新，省去运行中页表依赖管理。
+
+> **[SOURCE]** 按 VMID 位图请求、按位确认的参考：固定 Linux 源码 [gmc_v9_0.c，第 707～724 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L707-L724)用 `1 << vmid` 组成 `PER_VMID_INVALIDATE_REQ`；[第 810～875 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L810-L875)写请求寄存器并等待 ACK 中本 VMID 的位；[gc_9_4_3_sh_mask.h，第 10326～10343 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10326-L10343)与[第 10668～10671 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10668-L10671)给出 REQ、ACK 的位域。本设备沿用“VMID 位图请求、按位确认”的关系；RANGE 位、VPN 范围寄存器和同步完成方式是本设备设计，不与 AMD 寄存器逐位兼容。
 
 ### 5.3 结束旧访问和通知后才复用编号
 
@@ -424,9 +430,9 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
 
 用户 VMID 1、2 各自保存页表根和使能状态；管理队列编号为 0；访问域由 CP 显式传递，不按编号推断。关闭 GPUVM 时用户编号仍保留，但不启用这些页表上下文。地址范围和层数固定。共享失效入口提供目标 VMID、忙、ACK 和错误状态。CP 窗口及执行器增加地址域或 VMID，故障入口按源 HQD 保存首次错误信息。
 
-页表根与失效寄存器由 Host 驱动独占，应用不能映射管理寄存器或整个 VRAM BAR。上下文禁用时才能改根，先写完整配置、发布并清旧翻译，再启用；失效忙时拒绝重复请求。
+页表根与失效寄存器由 Host 驱动独占，应用不能映射管理寄存器或整个 VRAM BAR。上下文禁用时才能改根，先写完整配置、发布并清旧翻译，再启用。失效请求在写入时同步完成，没有忙状态；所选上下文仍有激活的队列或在途访问时整体拒绝。
 
-冷复位和整体复位清除 GPUVM 状态；CP 单独复位保留上下文与 TLB，仅清除 CP 访存窗口配置和固件握手，不能据此释放仍可能被执行器访问的存储。BAR0 的 `0x0900～0x09ff` 保存版本、模式、握手、失效和上下文，`0x0a00～0x0aff` 保存故障；完整字段、访问权限及复位行为见[硬件手册第 17 章](<./GPGPU_硬件手册.html#gpuvm-registers>)。
+冷复位和整体复位清除 GPUVM 状态，包括 TLB、三个计数、ACK 与 VPN 范围；CP 单独复位保留上下文、TLB 与计数，仅清除 CP 访存窗口配置和固件握手，不能据此释放仍可能被执行器访问的存储。BAR0 的 `0x0900～0x09ff` 保存版本、模式、握手、失效请求、TLB 计数和上下文，`0x0a00～0x0aff` 保存故障；完整字段、访问权限及复位行为见[硬件手册第 17 章](<./GPGPU_硬件手册.html#gpuvm-registers>)。
 
 ### 8.2 库封装整对象分配、映射与释放
 
@@ -485,7 +491,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 3、32 位地址�
 <a id="gpuvm-confirm-invalidate"></a>
 <a id="gpuvm-scope-live-update"></a>
 
-- **驻留与更新：** 管理 GPU 物理地址直通，两个固定用户 VMID，每 VM 一条 Queue；Queue 销毁后才改映射，CPU 同步写表并等待按 VMID 全量失效。
+- **驻留与更新：** 管理 GPU 物理地址直通，两个固定用户 VMID，每 VM 一条 Queue；Queue 销毁后才改映射，CPU 同步写表并等待失效完成：绑定和解绑按对象的 VPN 范围失效，启用和停用上下文按 VMID 全量失效；TLB 为 64 组 × 4 路。
 
 <a id="gpuvm-confirm-completion"></a>
 <a id="gpuvm-confirm-signal"></a>

@@ -703,6 +703,14 @@ static void test_fault_scope(void)
 #define VM_DATA 0x00402000U
 /* test_gpuvm_system() 把一张 L2 表搬到这个 Host 页，经 SYSTEM 中间项访问。 */
 #define VM_HOST_TABLE (QUEUE_HOST + 0xd000)
+/*
+ * test_gpuvm_tlb() 的数据页：比一组的路数多一页，第 k 页的 GPUVA 比 VM_DATA
+ * 高 k × 64 页，VPN 对组数取模相同，全部落在 VM_DATA 所在的组；第 k 页
+ * 指向 VRAM 中 KERNEL_OUT 之后的第 k 页。
+ */
+#define VM_TLB_PAGES (GPGPU_VM_TLB_WAYS + 1)
+#define VM_TLB_DATA(k) (VM_DATA + (k) * GPGPU_VM_TLB_SETS * GPGPU_VM_PAGE_SIZE)
+#define VM_TLB_OUT(k) (KERNEL_OUT + (k) * GPGPU_VM_PAGE_SIZE)
 
 /*
  * 一页用户映射：va 是 GPUVA，target 是叶子项的地址域，flags 是 SYSTEM 与
@@ -748,8 +756,8 @@ static uint32_t vm_leaf(CPTest *s, uint32_t va, uint32_t *next_table)
 /* 同步失效 VMID 1 的全部 TLB 项并要求确认；调用时槽 2 不能激活。 */
 static void vm_invalidate(CPTest *s)
 {
-	wr(s, GPGPU_REG_VM_INVALIDATE, 1);
-	g_assert_cmpuint(rd(s, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
+	wr(s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1));
+	g_assert_cmphex(rd(s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_VMID(1));
 }
 
 /* 经 HIQ 卸载用户队列 slot 并要求成功；故障队列同样可以卸载。 */
@@ -782,6 +790,10 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 		{ VM_DESC, KERNEL_DESC, GPGPU_VM_READ },
 		{ VM_CODE, KERNEL_CODE, code_flags },
 		{ VM_DATA, KERNEL_OUT, rw },
+		{ VM_TLB_DATA(1), VM_TLB_OUT(1), rw },
+		{ VM_TLB_DATA(2), VM_TLB_OUT(2), rw },
+		{ VM_TLB_DATA(3), VM_TLB_OUT(3), rw },
+		{ VM_TLB_DATA(4), VM_TLB_OUT(4), rw },
 	};
 	uint32_t next_table = VM_ROOT + GPGPU_VM_PAGE_SIZE;
 
@@ -850,15 +862,14 @@ static void test_gpuvm_translation(void)
 	assert_retired(&s, 2, 0, 0);
 
 	/*
-	 * 槽 2 仍激活时，VMID 1 正在使用，失效返回 ERROR；卸载槽 2 后
-	 * 该 VMID 没有激活队列，失效返回 ACK。
+	 * 槽 2 仍激活时，VMID 1 正在使用，失效整体拒绝，ACK 只有 ERROR；
+	 * 卸载槽 2 后该 VMID 没有激活队列，失效完成，ACK 为 VMID 1 的位。
 	 */
-	wr(&s, GPGPU_REG_VM_INVALIDATE, 1);
-	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ERROR);
+	wr(&s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1));
+	g_assert_cmphex(rd(&s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
 	g_assert_cmpuint(queue_manage(&s, 1, GPGPU_UNMAP_QUEUES, GPA(QUEUE_MQD(2))), ==,
 			 GPGPU_MANAGEMENT_OK);
-	wr(&s, GPGPU_REG_VM_INVALIDATE, 1);
-	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
+	vm_invalidate(&s);
 	cp_stop(&s);
 }
 
@@ -957,6 +968,81 @@ static void test_gpuvm_system(void)
 	cp_stop(&s);
 }
 
+/* 依次派发写 VM_TLB_DATA(0..4)；Ring 只有 4 槽，每包完成后再提交下一个。 */
+static void vm_tlb_round(CPTest *s, uint32_t *number)
+{
+	for (unsigned int k = 0; k < VM_TLB_PAGES; k++, (*number)++) {
+		vm_submit(s, *number, k, VM_TLB_DATA(k));
+		wait_host32(s, QUEUE_RPTR(2), *number + 1);
+	}
+}
+
+/*
+ * test_gpuvm_tlb() - 组相联 TLB 的替换、范围失效与整 VMID 失效
+ *
+ * 准备：vm_prepare() 映射的五个数据页 VM_TLB_DATA(0..4) 都落在第 2 组，
+ * 各自指向不同 VRAM 页。参数页 VM_ARGS（VPN 0x102）也在第 2 组；每次派发
+ * 都先读参数页再写数据页，参数页总比数据页更近被使用，不会被替换。
+ *
+ * 期望：
+ * b. 依次写五个数据页，第 2 组装不下全部翻译，EVICTIONS 至少加 1
+ *    （参数页占一路，实际加 2）；
+ * c. 卸载队列后把第 4 页改指新 VRAM 页，只失效这一页：再次写它时结果
+ *    落到新页，MISSES 恰好加 1，说明同组其他翻译仍在 TLB 中；
+ * d. 整 VMID 失效后重复 b 的派发序列，MISSES 增量与 b 相同。
+ * b、d 都从刚映射完队列时开始计量，两次起点的 TLB 内容一致。CP 轮询会
+ * 持续命中，HITS 不作断言。
+ */
+static void test_gpuvm_tlb(void)
+{
+	const uint32_t last = VM_TLB_PAGES - 1;
+	const uint32_t vpn = VM_TLB_DATA(last) / GPGPU_VM_PAGE_SIZE;
+	CPTest s = { 0 };
+	uint32_t number = 0;
+	uint32_t no_alloc = 0;
+	uint32_t misses, evictions, round_misses;
+
+	/* a. 五个数据页已由 vm_prepare() 映射。 */
+	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
+
+	/* b. 依次写五页，核对结果与替换次数。 */
+	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);
+	evictions = rd(&s, GPGPU_REG_VM_TLB_EVICTIONS);
+	vm_tlb_round(&s, &number);
+	round_misses = rd(&s, GPGPU_REG_VM_TLB_MISSES) - misses;
+	for (unsigned int k = 0; k < VM_TLB_PAGES; k++)
+		g_assert_cmphex(qpci_io_readl(s.dev, s.vram, VM_TLB_OUT(k)), ==, 0xaabb0000 + k);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_EVICTIONS) - evictions, >=, 1);
+
+	/*
+	 * c. 第 4 页改指 VM_TLB_OUT(5)，按 VPN 只失效这一页。页已映射，
+	 *    vm_leaf() 只查找叶子项，不会分配新表页。
+	 */
+	queue_unmap(&s, 2);
+	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_TLB_DATA(last), &no_alloc),
+		       VM_TLB_OUT(VM_TLB_PAGES) | GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_VALID);
+	wr(&s, GPGPU_REG_VM_INV_VPN_START, vpn);
+	wr(&s, GPGPU_REG_VM_INV_VPN_END, vpn);
+	wr(&s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE);
+	g_assert_cmphex(rd(&s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_VMID(1));
+	queue_map(&s, 2);
+	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);
+	vm_submit(&s, number, VM_TLB_PAGES, VM_TLB_DATA(last));
+	wait_host32(&s, QUEUE_RPTR(2), ++number);
+	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, VM_TLB_OUT(VM_TLB_PAGES)), ==,
+			0xaabb0000 + VM_TLB_PAGES);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_MISSES) - misses, ==, 1);
+
+	/* d. 整 VMID 失效后从同样的起点重复 b 的序列。 */
+	queue_unmap(&s, 2);
+	vm_invalidate(&s);
+	queue_map(&s, 2);
+	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);
+	vm_tlb_round(&s, &number);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_MISSES) - misses, ==, round_misses);
+	cp_stop(&s);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -966,5 +1052,6 @@ int main(int argc, char **argv)
 	qtest_add_func("/gpgpu/cp/gpuvm-translation", test_gpuvm_translation);
 	qtest_add_func("/gpgpu/cp/gpuvm-exec-fault", test_gpuvm_exec_fault);
 	qtest_add_func("/gpgpu/cp/gpuvm-system", test_gpuvm_system);
+	qtest_add_func("/gpgpu/cp/gpuvm-tlb", test_gpuvm_tlb);
 	return g_test_run();
 }

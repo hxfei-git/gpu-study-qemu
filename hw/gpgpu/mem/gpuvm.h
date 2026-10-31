@@ -16,9 +16,6 @@
 #include "hw/gpgpu/gpgpu.h"
 #include "exec/hwaddr.h"
 
-/* 直接映射 TLB 的项数。 */
-#define GPGPU_VM_TLB_ENTRIES 64
-
 /**
  * struct GPGPUVMContext - 一个用户 VMID 的地址空间
  * @root: 页表根的 GPU 物理地址，页对齐。
@@ -32,16 +29,30 @@ typedef struct GPGPUVMContext {
 } GPGPUVMContext;
 
 /**
- * struct GPGPUVMTlbEntry - TLB 中的一项翻译
- * @pte: 叶子项快照；为 0 表示空项。
- * @page: GPU 虚拟页号。
+ * struct GPGPUVMTlbEntry - TLB 中的一项叶子翻译
+ * @phys: 目标页的 GPU 物理基址，按 4 KiB 对齐；SYSTEM 已换算完毕。
+ * @vpn: GPU 虚拟页号，即 GPUVA / GPGPU_VM_PAGE_SIZE。
  * @vmid: 所属 VMID。
+ * @perms: 叶子项的 R/W/X 位，取值为 GPGPU_VM_PERMS 的子集。
+ * @valid: 本项有效。
  */
 typedef struct GPGPUVMTlbEntry {
-	uint64_t pte;
-	uint32_t page;
+	uint64_t phys;
+	uint32_t vpn;
 	uint32_t vmid;
+	uint32_t perms;
+	bool valid;
 } GPGPUVMTlbEntry;
+
+/**
+ * struct GPGPUVMTlbSet - 组相联 TLB 的一组
+ * @ways: 本组的各路。
+ * @order: 路号从最近使用（MRU）到最久未用（LRU）排列，复位为 {0, 1, 2, 3}。
+ */
+typedef struct GPGPUVMTlbSet {
+	GPGPUVMTlbEntry ways[GPGPU_VM_TLB_WAYS];
+	uint8_t order[GPGPU_VM_TLB_WAYS];
+} GPGPUVMTlbSet;
 
 /**
  * struct GPGPUVMFault - 一个 HQD 槽的首次用户访问故障
@@ -62,16 +73,26 @@ typedef struct GPGPUVMFault {
 /**
  * struct GPGPUVMState - GPUVM 模块状态
  * @firmware: CP 固件本次启动写回的协议版本；0 表示尚未握手。
- * @status: 最近一次同步失效的结果，GPGPU_VM_ACK 或 GPGPU_VM_ERROR。
+ * @inv_ack: VM_INV_ACK：最近一次失效完成的 VMID 位图或 GPGPU_VM_INV_ERROR。
+ * @inv_vpn_start: VM_INV_VPN_START，范围失效的起始 VPN。
+ * @inv_vpn_end: VM_INV_VPN_END，范围失效的结束 VPN（含）。
+ * @hits: TLB 命中次数，32 位回绕，失效不清零。
+ * @misses: TLB 未命中次数，同上。
+ * @evictions: 遍历成功后替换有效项的次数，同上。
  * @contexts: 用户上下文，下标即 VMID；下标 0 不使用。
- * @tlb: 按 (页号 ^ VMID) 取模索引的直接映射缓存。
+ * @sets: 组相联 TLB，下标为组号 VPN % GPGPU_VM_TLB_SETS。
  * @fault: 每个 HQD 槽的首次故障。
  */
 typedef struct GPGPUVMState {
 	uint32_t firmware;
-	uint32_t status;
+	uint32_t inv_ack;
+	uint32_t inv_vpn_start;
+	uint32_t inv_vpn_end;
+	uint32_t hits;
+	uint32_t misses;
+	uint32_t evictions;
 	GPGPUVMContext contexts[GPGPU_VM_USERS + 1];
-	GPGPUVMTlbEntry tlb[GPGPU_VM_TLB_ENTRIES];
+	GPGPUVMTlbSet sets[GPGPU_VM_TLB_SETS];
 	GPGPUVMFault fault[GPGPU_HQD_SLOTS];
 } GPGPUVMState;
 
@@ -127,7 +148,7 @@ bool gpgpu_vm_firmware_handshake(GPGPUState *s, uint32_t version);
 /* CP 复位时清除握手，保留页表、上下文和故障记录。 */
 void gpgpu_vm_firmware_reset(GPGPUState *s);
 
-/* 设备复位时清除全部 GPUVM 状态。 */
+/* 设备复位时清除全部 GPUVM 状态与 TLB 计数，各组顺序恢复为 {0, 1, 2, 3}。 */
 void gpgpu_vm_reset(GPGPUState *s);
 
 #endif /* HW_GPGPU_MEM_GPUVM_H */

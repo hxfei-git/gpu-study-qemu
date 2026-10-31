@@ -256,8 +256,9 @@ static void test_dma_unrouted(void)
  * test_gpuvm_context() - GPUVM 上下文寄存器的写入规则
  *
  * 期望：根须为合法表页才能启用，启用后根只读；没有激活队列和
- * 在途访问时同步失效立即返回 ACK，非法 VMID 返回 ERROR；
- * 整体复位清除上下文；gpuvm=off 时上下文寄存器不可写。
+ * 在途访问时同步失效立即完成，ACK 为所选 VMID 的位；含保留位、位图
+ * 为空或范围起点大于终点的请求整体拒绝，ACK 只有 ERROR；整体复位清除
+ * 上下文、ACK 与 VPN 范围；gpuvm=off 时上下文与失效寄存器不可写。
  */
 static void test_gpuvm_context(void)
 {
@@ -286,23 +287,36 @@ static void test_gpuvm_context(void)
 	g_assert_cmphex(rd(&t, ctx + GPGPU_VM_ROOT_LO), ==, 0x20000);
 
 	/*
-	 * 4. VMID 1 没有激活队列和在途访问，同步失效直接确认；用户 VMID
-	 *    只有 1、2，失效 VMID 3 返回 ERROR。
+	 * 4. VMID 1 没有激活队列和在途访问，同步失效直接完成，ACK 为 VMID 1
+	 *    的位。下面三个请求都整体拒绝，ACK 只有 ERROR：带上保留的
+	 *    VMID 0 位；只有 RANGE、没有 VMID；范围 0x402～0x400 起点大于终点。
 	 */
-	wr(&t, GPGPU_REG_VM_INVALIDATE, 1);
-	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
-	wr(&t, GPGPU_REG_VM_INVALIDATE, 3);
-	g_assert_cmpuint(rd(&t, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ERROR);
+	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1));
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_VMID(1));
+	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(0) | GPGPU_VM_INV_VMID(1));
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
+	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_RANGE);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
+	wr(&t, GPGPU_REG_VM_INV_VPN_START, 0x402);
+	wr(&t, GPGPU_REG_VM_INV_VPN_END, 0x400);
+	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
+	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
 
-	/* 5. 整体复位清除上下文：ENABLE 和根都回到 0。 */
+	/* 5. 整体复位后 ENABLE、根、ACK 与 VPN 范围都回到 0。 */
 	wr(&t, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
 	g_assert_cmpuint(rd(&t, ctx + GPGPU_VM_ENABLE), ==, 0);
 	g_assert_cmphex(rd(&t, ctx + GPGPU_VM_ROOT_LO), ==, 0);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, 0);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_START), ==, 0);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_END), ==, 0);
 	regs_stop(&t);
 
-	/* 6. 以 gpuvm=off 重新启动：写上下文的根锁存 INVALID_CMD。 */
+	/* 6. gpuvm=off 时写上下文的根或失效请求都锁存 INVALID_CMD。 */
 	regs_start(&t, false);
 	wr(&t, ctx + GPGPU_VM_ROOT_LO, 0x20000);
+	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
+	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1));
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 	regs_stop(&t);
 }

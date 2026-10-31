@@ -90,15 +90,37 @@ static int vm_leaf(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 va, bool c
 	return 0;
 }
 
-/* 同步失效本 VM 的 TLB；读不到 ACK 时 VM 进入 failed。调用者持 dev->lock。 */
-static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
+/*
+ * 写一次 VM_INV_REQ 并核对 ACK 恰为本 VMID 的位；设备同步完成，读到的
+ * 就是本次结果。不符时无法确认旧翻译已清除，VM 进入 failed。
+ * 调用者持 dev->lock。
+ */
+static int vm_invalidate_req(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 req)
 {
 	wmb(); /* 经 BAR2 写入的页表项先于失效请求对设备可见。 */
-	gpgpu_wreg(dev, GPGPU_REG_VM_INVALIDATE, vm->vmid);
-	if (gpgpu_rreg(dev, GPGPU_REG_VM_STATUS) == GPGPU_VM_ACK)
+	gpgpu_wreg(dev, GPGPU_REG_VM_INV_REQ, req);
+	if (gpgpu_rreg(dev, GPGPU_REG_VM_INV_ACK) == GPGPU_VM_INV_VMID(vm->vmid))
 		return 0;
 	vm->failed = true;
 	return -EIO;
+}
+
+/* 失效本 VM 的全部 TLB 项，用于启用和停用上下文。 */
+static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
+{
+	return vm_invalidate_req(dev, vm, GPGPU_VM_INV_VMID(vm->vmid));
+}
+
+/*
+ * 只失效 [va, va + size) 覆盖的页，用于绑定和解绑一个对象，不影响同一 VM
+ * 其他对象的翻译。例：va = 0x0040_0000、size = 0x3000 时 VPN 范围为
+ * 0x400～0x402。size 非零。
+ */
+static int vm_invalidate_range(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size)
+{
+	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_START, va / GPGPU_VM_PAGE_SIZE);
+	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_END, (va + size - 1) / GPGPU_VM_PAGE_SIZE);
+	return vm_invalidate_req(dev, vm, GPGPU_VM_INV_VMID(vm->vmid) | GPGPU_VM_INV_RANGE);
 }
 
 /*
@@ -285,7 +307,7 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 		vm->failed = true;
 		return ret;
 	}
-	return vm_invalidate(dev, vm);
+	return vm_invalidate_range(dev, vm, bo->gpu_addr, bo->mapped_size);
 }
 
 /**
@@ -316,7 +338,7 @@ int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 		/* 撤销时不分配表页，vm_set_ptes() 不会失败。 */
 		if (dev->gpuvm) {
 			vm_set_ptes(dev, &fpriv->vm, bo->gpu_addr, bo->mapped_size, 0, 0);
-			ret = vm_invalidate(dev, &fpriv->vm);
+			ret = vm_invalidate_range(dev, &fpriv->vm, bo->gpu_addr, bo->mapped_size);
 			if (ret)
 				return ret;
 		}

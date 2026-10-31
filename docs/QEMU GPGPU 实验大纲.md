@@ -164,7 +164,7 @@ GPU 物理空间分为 `[0, vram_size)` 的 VRAM、`[vram_size, 0x8000_0000)` �
 
 #### 2.3.2 DRM/GEM 与独立绑定引用
 
-两种状态都只开放 DRM render node。应用对象提供 `cpu` 与 `gpu_address`；MAP 返回最终设备地址，两种状态都建立绑定引用。开启 GPUVM 时，三级 4 KiB 页表与同步 TLB 失效继续生效，可分配区间统一为 `[0x1000, 0xffff_f000)`；关闭时不创建页表，非零固定 GPUVA 请求不支持。
+两种状态都只开放 DRM render node。应用对象提供 `cpu` 与 `gpu_address`；MAP 返回最终设备地址，两种状态都建立绑定引用。开启 GPUVM 时，三级 4 KiB 页表继续生效，TLB 为 64 组 × 4 路组相联，修改映射后按 VMID 或对象的 VPN 范围同步失效；可分配区间统一为 `[0x1000, 0xffff_f000)`；关闭时不创建页表，非零固定 GPUVA 请求不支持。
 
 Queue 存活期间冻结绑定。关闭 GEM handle、解除 GPU 绑定和结束 CPU mmap 分别处理，最后引用结束后才回收存储；管理完成结果未知或访问未确认结束时继续保留。关闭 GPUVM 后共享物理空间，不提供进程页权限隔离，也不增加进程独占限制。
 

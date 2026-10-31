@@ -313,10 +313,20 @@ enum GpgpuDispatchError {
 #define GPGPU_REG_VM_MODE 0x0904
 /* CP 启动时写回 GPGPU_PROTOCOL_VERSION 完成握手；Host 只读。 */
 #define GPGPU_REG_VM_FIRMWARE 0x0908
-/* 写用户 VMID 触发该 VM 的同步 TLB 失效。 */
-#define GPGPU_REG_VM_INVALIDATE 0x0910
-/* 只读：最近一次失效的 BUSY/ACK/ERROR。 */
-#define GPGPU_REG_VM_STATUS 0x0914
+/* 写触发同步失效：GPGPU_VM_INV_VMID() 位图，可加 GPGPU_VM_INV_RANGE；读为 0。 */
+#define GPGPU_REG_VM_INV_REQ 0x0910
+/* 只读：最近一次失效完成的 VMID 位图，或拒绝时的 GPGPU_VM_INV_ERROR。 */
+#define GPGPU_REG_VM_INV_ACK 0x0914
+/* 范围失效的起始 VPN（GPUVA / GPGPU_VM_PAGE_SIZE）。 */
+#define GPGPU_REG_VM_INV_VPN_START 0x0918
+/* 范围失效的结束 VPN，闭区间。 */
+#define GPGPU_REG_VM_INV_VPN_END 0x091c
+/* 只读：TLB 命中次数。三个计数全设备共用，32 位回绕，失效不清零。 */
+#define GPGPU_REG_VM_TLB_HITS 0x0920
+/* 只读：TLB 未命中次数，每次未命中随后遍历一次页表。 */
+#define GPGPU_REG_VM_TLB_MISSES 0x0924
+/* 只读：遍历成功后替换有效项的次数。 */
+#define GPGPU_REG_VM_TLB_EVICTIONS 0x0928
 /* 用户 VMID 的上下文寄存器组，每组 0x20 字节。 */
 #define GPGPU_REG_VM_CONTEXT(vmid) (0x0940 + (vmid) * 0x20)
 /* 上下文内：页表根 GPU 物理地址低 32 位，按页对齐。 */
@@ -326,12 +336,20 @@ enum GpgpuDispatchError {
 /* 上下文内：1 启用；启用后根只读。 */
 #define GPGPU_VM_ENABLE 0x08
 
-/* VM_STATUS：失效进行中。 */
-#define GPGPU_VM_BUSY 1U
-/* VM_STATUS：失效已完成。 */
-#define GPGPU_VM_ACK 2U
-/* VM_STATUS：VMID 非法，或该 VM 仍有活跃队列或在途访问。 */
-#define GPGPU_VM_ERROR 4U
+/* VM_INV_REQ / VM_INV_ACK：用户 VMID（1 或 2）对应的位。 */
+#define GPGPU_VM_INV_VMID(vmid) (1U << (vmid))
+/* VM_INV_REQ：只失效 VPN 落在 [VPN_START, VPN_END] 内的项。 */
+#define GPGPU_VM_INV_RANGE (1U << 16)
+/*
+ * VM_INV_ACK：请求被整体拒绝，没有清除任何项。原因是含保留位、
+ * 位图为空、范围非法，或被选 VMID 仍有激活的队列或在途访问。
+ */
+#define GPGPU_VM_INV_ERROR (1U << 31)
+
+/* TLB 组数，组号 = VPN % GPGPU_VM_TLB_SETS；计数寄存器的取值依赖这一组织。 */
+#define GPGPU_VM_TLB_SETS 64U
+/* 每组路数，组内按最近最少使用替换。 */
+#define GPGPU_VM_TLB_WAYS 4U
 
 /* ---- 0xa00 GPUVM 故障：每 HQD 槽保存首次用户访问故障 ---- */
 
