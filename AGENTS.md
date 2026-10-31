@@ -15,17 +15,16 @@ GPGPU 测试位于 `tests/qtest/gpgpu-regs-test.c` 与 `tests/qtest/gpgpu-cp-tes
 
 ## 构建、测试与开发命令
 
-在仓库根目录运行命令。按 `README.md` 安装 QEMU 构建依赖、
-RISC-V 裸机编译器 `riscv64-unknown-elf-gcc`、Rust 和 `bindgen-cli`。
+在仓库根目录运行命令。构建需要 QEMU 的宿主机依赖、
+`libjson-c-dev`、`libcmocka-dev` 和固件使用的 `riscv64-unknown-elf-gcc`；
+GPGPU 不需要 Rust 和 `bindgen-cli`。
 
-- `make -f Makefile.camp configure`：在 `build/` 配置 RISC-V 系统和用户态模拟及 Rust 支持。
-- `make -f Makefile.camp build JOBS=4`：使用四个并行任务编译。
-- `make -f Makefile.camp test-cpu`：通过 TCG 运行指令测试。
-- `make -f Makefile.camp test-soc`：运行 G233 外设 QTest。
-- `make -f Makefile.camp test-gpgpu-qtest`：运行 GPGPU 寄存器与 CP 队列 QTest。
-- `make -f Makefile.camp test-rust`：运行 Rust 单元和设备测试。
-- `make -f Makefile.camp test`：运行全部实验测试。
-- `build/qemu-system-riscv64 -machine help`：列出可用机器类型。
+- `make -f Makefile.gpgpu configure`：在 `build/arm64-qemu/` 配置 aarch64 Host 与 riscv64 CP，不需要客体内核。
+- `make -f Makefile.gpgpu build JOBS=4`：构建两个 QEMU、两个 QTest 程序和 RV64 CP 固件；首次构建自动配置。
+- `make -f Makefile.gpgpu test-gpgpu-qtest`：运行 GPGPU 寄存器与 CP 队列 QTest。
+- `make -f Makefile.gpgpu test-gpgpu-stack`：在 Linux 客体中验证 GPUVM 开、关两种模式，需要先准备客体环境。
+- `make -C software/gpgpu check-configure`：运行独立 QEMU 配置入口的回归，不需要客体内核或网络。
+- `build/arm64-qemu/qemu-system-riscv64 -machine help`：列出可用机器类型。
 
 ## 代码修改与语言约束
 
@@ -395,8 +394,8 @@ VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
 未知结果保留 3/3，内核无告警。旧队列和四种同步组合也已回归。
 固定实现提交、复现命令和实际日志见[软件栈说明](software/gpgpu/README.md#stage-three-validation)。
 
-运行 `make -f Makefile.camp test-gpgpu-stack` 验证 ARM64 Linux 软件栈，
-运行 `make -f Makefile.camp test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列
+运行 `make -f Makefile.gpgpu test-gpgpu-stack` 验证 ARM64 Linux 软件栈，
+运行 `make -f Makefile.gpgpu test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列
 （11 项），运行 `make -C software/gpgpu check` 验证 RV32 汇编器；
 Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
 核对测试数量与日志，不能仅凭评分脚本退出状态判断全部通过。

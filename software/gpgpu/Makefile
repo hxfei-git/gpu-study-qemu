@@ -18,7 +18,7 @@ LIB_SOURCES = $(wildcard lib/kmt/*.c lib/rt/*.c)
 LIB_OBJECTS = $(patsubst lib/%.c,$(BUILD_DIR)/lib/%.o,$(LIB_SOURCES))
 LIB_HEADERS = $(wildcard lib/include/*.h lib/kmt/*.h include/gpgpu/*.h include/gpgpu/uapi/*.h)
 
-.PHONY: all kernels firmware check check-bootstrap clean
+.PHONY: all kernels firmware check check-bootstrap check-configure clean
 all: $(BUILD_DIR)/libgpgpu.a $(BUILD_DIR)/gpgpu-demo
 kernels: $(KERNEL_HEADERS) $(KERNEL_BINARIES)
 
@@ -49,6 +49,10 @@ check:
 # 基础环境的缓存与磁盘保护回归，不需要设备或网络。
 check-bootstrap:
 	$(PYTHON) scripts/test_bootstrap_env.py
+
+# QEMU 配置入口回归，使用模拟子进程，不需要客体内核或网络。
+check-configure:
+	$(PYTHON) scripts/test_gpgpu_linux.py
 
 clean:
 	rm -rf $(BUILD_DIR)/lib $(BUILD_DIR)/libgpgpu.a $(BUILD_DIR)/gpgpu-demo
