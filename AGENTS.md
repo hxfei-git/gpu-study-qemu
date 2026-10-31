@@ -1,29 +1,54 @@
 # 仓库约束
 
+| 缩写 | 英文全称 | 中文含义 |
+| --- | --- | --- |
+| QEMU | Quick Emulator | 仿真与虚拟化工具 |
+| GPGPU / GPU | General-Purpose Computing on Graphics Processing Units / Graphics Processing Unit | GPU 通用计算／图形处理器 |
+| CPU | Central Processing Unit | 中央处理器 |
+| CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
+| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 的 RISC-V 位宽 |
+| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
+| GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
+| HSA / HSAKMT | Heterogeneous System Architecture / HSA Kernel Mode Thunk | 异构系统架构／HSA 内核接口封装层 |
+| AQL | Architected Queuing Language | HSA 队列包格式 |
+| IH | Interrupt Handler | 本实验的完成与错误通知模块 |
+| API / UAPI | Application Programming Interface / User-space API | 应用编程接口／内核向用户态提供的接口 |
+| ABI | Application Binary Interface | 应用二进制接口 |
+| MMIO | Memory-Mapped I/O | 内存映射输入输出 |
+| PCI / PCIe | Peripheral Component Interconnect / PCI Express | 外设互连／高速外设互连总线 |
+| DMA | Direct Memory Access | 直接内存访问 |
+| VRAM | Video RAM | 设备显存 |
+| ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
+| TAP | Test Anything Protocol | 测试结果输出协议 |
+| SPDX | Software Package Data Exchange | 软件许可证标识规范 |
+| LF | Line Feed | 换行符 |
+| VS Code | Visual Studio Code | 本项目使用的编辑器 |
+| WSL | Windows Subsystem for Linux | Windows 的 Linux 子系统 |
+| URI | Uniform Resource Identifier | 统一资源标识符 |
+
 ## 项目结构与模块划分
 
-QEMU Camp 2026 包含 RISC-V CPU、SoC、GPGPU 和 Rust 实验。
-指令模拟位于 `target/riscv/`，G233 板级实现为 `hw/riscv/g233.c`，
-设备模型位于 `hw/`，头文件位于 `include/`。
-GPGPU 实现在 `hw/gpgpu/`，Rust 设备实现在 `rust/hw/`。
+本仓库维护 QEMU GPGPU 教学设备、配套软件和实验文档。主要修改范围为
+`hw/gpgpu/`、`hw/riscv/gpgpu-cp.c`、`software/gpgpu/`、`tests/qtest/gpgpu-*.c`
+和 `docs/`；其余目录保留 QEMU 的基础功能，不再承担训练营的其他实验。
 
-实验测试位于 `tests/gevico/tcg/` 和 `tests/gevico/qtest/`；
-GPGPU 测试位于 `tests/qtest/gpgpu-regs-test.c` 与 `tests/qtest/gpgpu-cp-test.c`。
-其他测试位于 `tests/unit/` 和 `tests/functional/`。
-构建与内部实现说明见 `README.md`、`README_zh.md` 和 `docs/devel/`。
-固件位于 `pc-bios/`，构建产物统一放在 `build/`。
+设备模型按 `cp/`、`compute/`、`mem/` 和 `irq/` 分模块，软件栈沿
+应用 → 运行时 → HSAKMT 风格薄层 → DRM 驱动 → 设备与固件调用。
+共享协议头位于 `software/gpgpu/include/gpgpu/`，不是顶层 `include/`。
+各层入口见[软件栈第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)。
+构建与运行产物统一放在 `build/`，不纳入 Git。
 
 ## 构建、测试与开发命令
 
-在仓库根目录运行命令。构建需要 QEMU 的宿主机依赖、
-`libjson-c-dev`、`libcmocka-dev` 和固件使用的 `riscv64-unknown-elf-gcc`；
-GPGPU 不需要 Rust 和 `bindgen-cli`。
+命令在仓库根目录运行。依赖和快速开始见 [README](./README.md)，
+单个 QTest 的选择方法与双进程运行方式见 [CLAUDE.md](./CLAUDE.md)。
 
-- `make -f Makefile.gpgpu configure`：在 `build/arm64-qemu/` 配置 aarch64 Host 与 riscv64 CP，不需要客体内核。
-- `make -f Makefile.gpgpu build JOBS=4`：构建两个 QEMU、两个 QTest 程序和 RV64 CP 固件；首次构建自动配置。
-- `make -f Makefile.gpgpu test-gpgpu-qtest`：运行 GPGPU 寄存器与 CP 队列 QTest。
-- `make -f Makefile.gpgpu test-gpgpu-stack`：在 Linux 客体中验证 GPUVM 开、关两种模式，需要先准备客体环境。
-- `build/arm64-qemu/qemu-system-riscv64 -machine help`：列出可用机器类型。
+- `make -f Makefile.gpgpu configure`：独立配置两个 QEMU，不需要客体内核。
+- `make -f Makefile.gpgpu build JOBS=4`：构建 QEMU、QTest 和 RV64 固件；首次自动配置。
+- `make -f Makefile.gpgpu test-gpgpu-qtest`：运行寄存器与真实 CP 固件回归，核对 TAP。
+- `make -f Makefile.gpgpu test-gpgpu-stack`：在开发客体运行 GPUVM 开、关的计算示例。
+- `make -C software/gpgpu all check`：构建用户库与示例，运行教学汇编器回归。
+- `make -C software/gpgpu check-bootstrap`：验证基础环境缓存与已有磁盘保护。
 
 ## 脚本、校验与验证的精简
 
@@ -67,7 +92,7 @@ GPGPU 不需要 Rust 和 `bindgen-cli`。
 `hw/gpgpu/` 和 `software/` 下的自有 C 代码采用 Linux 风格，以目录内的
 `.editorconfig` 和 `.clang-format` 为准：使用 8 列制表符，函数左花括号另起一行，
 结构体每行只声明一个成员，每行尽量不超过 100 列，续行与左括号对齐。
-其他目录遵循 `.editorconfig` 和 `docs/devel/style.rst`：C 使用四个空格缩进，
+其他目录遵循 `.editorconfig` 和 [QEMU 上游风格说明](https://www.qemu.org/docs/master/devel/style.html)：C 使用四个空格缩进，
 每行尽量不超过 80 列。缩进和列宽按目录区分，其余规则对全部新增 C 代码适用。
 Makefile 配方使用制表符，文件使用 LF 换行。固定版本的外部内核补丁、配置和
 打包文件保持原貌，不参与批量格式化。
@@ -325,102 +350,52 @@ static uint32_t ring_read_rptr(GPGPUState *s, const GPGPURing *ring, uint64_t *r
 用 `scripts/checkpatch.pl --branch HEAD^..HEAD` 检查最新提交。`hw/gpgpu/` 和
 `software/` 使用 Linux 的 `checkpatch.pl` 和 `scripts/kernel-doc -none`
 核对风格及结构体说明；QEMU 检查器的四空格规则不适用于这两个目录。
-Rust 格式检查使用 `make -C build rustfmt`，需要 nightly rustfmt；
-Clippy 的 Meson 开发环境配置见 `docs/devel/rust.rst`。
 工具检查通过后，再按本节各小节逐项核对新增代码。
 
 ## 测试要求
 
-使用 TCG 裸机测试、基于 GLib 的 QTest/QOS 测试和原生 Rust 单元测试。
-指令测试命名为 `test-insn-*.c`，外设测试命名为 `test-*.c`，
-Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 Makefile 列表。
-只覆盖修改涉及的核心行为；实验未规定覆盖率百分比。
-运行受影响的测试集，并核对通过数量和日志：评分脚本与 CI 可能在有失败项时仍返回成功。
+优先运行受影响的现有入口，不因整理文档增加测试。QTest 同时核对退出状态、
+TAP 计划与结果，不固定通过数；Linux 全栈核对实际比较结果和内核日志。
+已运行的命令、结果及边界只记录在软件栈说明相应节，不能把未运行写成通过。
 
 ## 提交与拉取请求要求
 
-已有历史包含普通描述及 `ci:`、`tests/gevico:` 等前缀。
-后续提交标题优先采用“子系统：具体修改”的中文形式，例如“测试：修复 SPI 片选”。
-正文解释修改原因；向上游提交时添加 `Signed-off-by`。
-拉取请求说明修改行为，关联问题，并列出测试命令和通过数量。
-符合条件的 `main` 分支推送会触发实验 CI；请求审阅前先完成本地验证。
+提交标题采用“子系统：具体修改”的中文形式，例如“设备：修复 Doorbell 访问宽度”。
+正文解释原因和影响；向上游提交时添加 `Signed-off-by`。
+拉取请求说明行为变化、关联问题与实际验证，不再引用训练营评分或自动 CI。
 
-## 智能体交互要求
+本仓库以 `main` 为开发基线，`hxfei-qemu` 仅保留早期历史。整理任务可在临时分支
+执行，完成后在无分叉且工作区干净时快进 `main`；不得覆盖用户未提交修改或改写历史。
+作为父仓库子模块时，先在本仓库提交代码与实验文档，再在父仓库提交子模块指针。
+推送与远端设置修改需要单独授权。
 
-用连贯文字解释概念。避免用对比表，尤其不要以职责表或字段映射表代替概念说明。
+## 文档与交互
 
-解释 QEMU 概念或修改实验代码时，查阅父目录中的参考材料。
-以下路径相对于仓库根目录：
+用连贯文字解释概念，不用职责表代替调用关系。实验文档位于本仓库 `docs/`，
+修改前先阅读相关规格与软件栈说明。原课程资料只在父仓库保存：
+`../QEMU_2026_讲义.html` 和 `../QEMU_2026_实验.html`；单独克隆时可能不存在。
 
-- `../00_QEMU GPGPU 四阶段实验大纲.md`
-- `../QEMU_2026_GPGPU_适配.html`
-- `../QEMU_2026_实验.html`
-- `../QEMU_2026_讲义.html`
+作为 `gpu_study` 子模块时，中文文档遵循父仓库 `AGENTS.md` 与《文档的常见问题》
+中的写作、证据和自然化要求。文档标题后紧接缩写表，先讲任务和关系再给源码，
+保留 `[SOURCE]`、`[SPEC]`、`[INFERENCE]`、`[BOUNDARY]`、`[DESIGN]` 的区别。
+历史分析绑定固定提交，不把旧文件不存在当成需要恢复兼容接口。
 
-若 `00_QEMU` 大纲不存在，使用 `../QEMU GPGPU 实验大纲.md`。
+预览环境为 Windows VS Code 连接 WSL。当前本地源码定位使用
+`vscode://vscode-remote/wsl+Ubuntu/绝对路径:行:列`，中文和空格做 URL 编码；
+不得追加本地 `#L…`。历史源码用固定提交的 GitHub 链接和真实行号。
+普通文档使用相对链接，含空格或中文时沿用 `[文字](<./路径>)` 写法。
+交付时区分路径、行号检查与实际预览点击，不以解析通过代替跳转验证。
 
-## 当前 GPGPU 实验
+## 信息归属
 
-根据用户反馈，第一阶段已完成，并已搭配 A57、支持 SMMUv3 系统 IOMMU。
-第二阶段的设备队列入口、RV64 CP 固件、Linux 驱动和 HSAKMT 风格接口库
-已在固定提交 `6325a87e4c500f4930c4e0b502a1ec241f83bf26` 接入。
-实验计划统一维护在[QEMU GPGPU 四阶段实验大纲](<../QEMU GPGPU 实验大纲.md>)；
-已确认行为见[CP/MEC 第一版规格](<../CP_MEC 第一版规格.md>)，寄存器及协议查阅
-见独立的 [GPGPU 硬件手册](<../QEMU_2026_GPGPU_硬件手册.html>)。
-
-当前执行模型是 RV64 原生 CP 运行裸机固件、RV32 计算执行器运行应用 Kernel。
-旧物理队列模式使用双进程设备、`IOMMU=none、VMID=0`；GPUVM 模式支持
-`none/smmuv3`，用户 VMID 为 1、2，每 VM 一条 Queue，全设备两个用户队列名额。
-CP Host 窗口支持对齐的 1/2/4/8 字节访问；计算线程通过
-`0x9000_0000～0x9000_ffff` 的只读窗口读取 Host 参数，`a0` 仍为 32 位。
-同步路径的参数继续位于 VRAM。末尾 4 MiB VRAM 固定供固件使用，
-驱动用 `gpu_buddy` 管理前 60 MiB，并保留首个页。
-
-HQD、8 字节 Doorbell、IH、分段执行器及状态确认均已接入。
-成功路径依次发布 Signal、通知槽、IH 记录、`INVALID` Header 和消费进度；
-默认等待先主动检查约 `200 μs`，再阻塞并复查 Signal，支持多个等待者。
-错误保留首次记录，未知是否停止访问的对象继续保留；抢占、运行中
-复位恢复、共享内存与组内屏障、完整 ROCr 运行时仍属后续范围。
-
-2026-10-19 已提交的验收记录包含 CP QTest 16/16、Linux 队列 5/5、
-设备卸载 1/1，以及单／双进程与 `none/smmuv3` 四种同步组合回归。
-每种同步组合包含装卸载 5/5、三个示例的 17,953 个输出值、运行时检查
-68/68 和卸载重载 2/2。日志位置与复现入口见
-[软件栈说明](software/gpgpu/README.md#62-第二阶段验证状态历史)。
-
-同日规格复核发现管理完成后的未知结果码未校验，创建失败分支可能提前释放
-MQD 及相关引用。本轮已修复，并通过三个独立注入场景核对异常保留和设备停止后
-的安全回收。修复前证据及当前验证入口统一见
-[大纲复核记录](<../QEMU GPGPU 实验大纲.md#stage-two-spec-review>)。
-
-`hxfei-git/gpu-study-qemu` 的开发统一使用 `main` 分支，
-`hxfei-qemu` 保留早期开发历史。软件栈位于 `software/gpgpu/`；
-修改接口前阅读其中的 `README.md` 和 `WORK_ITEMS.md`。
-设备、固件、驱动与用户库共用的协议头集中在 `include/gpgpu/`：寄存器为
-`gpgpu_regs.h`，内存对象为 `gpgpu_queue_abi.h`，DRM 接口为 `uapi/gpgpu_drm.h`；
-协议当前为版本 3，与版本 2 的差异见 `software/gpgpu/PROTOCOL_V3.md`。
-用户库位于 `lib/`：`lib/kmt/` 是 HSAKMT 风格薄层，`lib/rt/` 是装载 Kernel、
-组包并等待的小运行时。驱动只提供 DRM render node，GPUVM 开关由设备属性
-`-global gpgpu.gpuvm=on|off` 决定；旧的 `queue_mode` 参数与 `/dev/gpgpu0`
-已删除。各层代码结构见软件栈 README 第 0 节。
-
-第三阶段已实现 DRM/GEM 固定存储、32 位 GPUVA、三级 4 KiB 页表、两个用户
-VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
-`0x8000_0000～0x8000_0fff`；先准备全部对象，再建 Queue，队列存活期间冻结映射。
-不接入 TTM、迁移、驱逐、换页或运行中恢复。CPU 映射和 GEM 对象独立保护存储与
-设备寿命；未知完成结果或失效未确认时保留资源。GPUVM 内核输出独立放在
-`build/gpgpu-kernel-gpuvm/`，保留原环境。
-
-第三阶段 CP 检查 18/18；GPUVM 在 `none/smmuv3` 下各 5/5、卸载各 1/1；
-未知结果保留 3/3，内核无告警。旧队列和四种同步组合也已回归。
-固定实现提交、复现命令和实际日志见[软件栈说明](software/gpgpu/README.md#stage-three-validation)。
-
-运行 `make -f Makefile.gpgpu test-gpgpu-stack` 验证 ARM64 Linux 软件栈，
-运行 `make -f Makefile.gpgpu test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列，
-运行 `make -C software/gpgpu check` 验证 RV32 汇编器；
-Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
-核对测试数量与日志，不能仅凭评分脚本退出状态判断全部通过。
-
-2026-10-07 的 17,953 个示例输出值、68 项运行时检查及两种架构各 21 项
-设备 QTest 属于第一阶段历史验收。解释器支持 BF16、FP8 和 FP4 转换，
-尚未实现 FP16 转换；设备不支持迁移。
+- 当前阶段、任务、下一步与阻塞项只写在 [docs/实验进度.md](<./docs/实验进度.md>)，
+  使用定性状态，不复制测试数字。
+- 当前代码版本的构建、验证结果和日志只写在
+  [software/gpgpu/README.md 第 5 节](<./software/gpgpu/README.md#5-构建运行与本次结果>)；
+  历史工作与验收放第 6 节。
+- 阶段依赖、范围和完成标准在[实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)；
+  已确认设计在 CP/MEC 与 GPUVM 规格，确认过程只保留 CP/MEC 规格第 9 节。
+- 寄存器、位域、访问权限和复位值在[硬件手册](<./docs/GPGPU_硬件手册.html>)；
+  组件升级差异在 [PROTOCOL_V3.md](<./software/gpgpu/PROTOCOL_V3.md>)。
+- 学习进度与个人安排由父仓库《学习与实验进度》维护。
+  其他位置只放链接，不再保存第二份进度或确认摘要。
