@@ -44,6 +44,7 @@
 | MMU    | Memory Management Unit                                 | 内存管理单元                                     |
 | VMID   | Virtual Memory Identifier                              | 设备虚拟地址空间标识                             |
 | TLB    | Translation Lookaside Buffer                           | 地址翻译缓存                                     |
+| VPN    | Virtual Page Number                                    | 虚拟页号，即 GPUVA 除以 4 KiB                    |
 | ReLU   | Rectified Linear Unit                                  | 修正线性单元；本实验的计算示例之一               |
 | CSR | Control and Status Register | 控制与状态寄存器 |
 | PTE | Page Table Entry | 页表项 |
@@ -83,13 +84,13 @@
 
 ### 2.1 第一阶段：跑通应用到设备的计算流程
 
-**[BOUNDARY]** 本节保留该阶段当时的安排与完成条件。旧同步接口、专项测试与固定数量已退出当前执行要求；版本 3 的实现与唯一核心计算入口统一见[第三阶段](#stage-three-vmid)。
+**[BOUNDARY]** 本节保留该阶段当时的安排与完成条件。旧同步接口、专项测试与固定数量已退出当前执行要求；当前协议版本的实现与唯一核心计算入口统一见[第三阶段](#stage-three-vmid)。
 
 第一阶段建立 Linux 驱动、用户态运行时、代码加载和参数传递，让计算 kernel 接收输入、执行并返回可核对的结果。A57、PCI / BAR、VRAM、DMA、SMMUv3、MSI-X、RV32 计算解释器及已有计算示例继续作为后续阶段的基础。新增 CP 队列路径时，保留原同步路径的回归验证。
 
 ### 2.2 第二阶段：用户 AQL Queue、Doorbell、CP 与 Signal
 
-**[BOUNDARY]** 本节保留该阶段当时的安排与完成条件。旧同步接口、专项测试与固定数量已退出当前执行要求；版本 3 的实现与唯一核心计算入口统一见[第三阶段](#stage-three-vmid)。
+**[BOUNDARY]** 本节保留该阶段当时的安排与完成条件。旧同步接口、专项测试与固定数量已退出当前执行要求；当前协议版本的实现与唯一核心计算入口统一见[第三阶段](#stage-three-vmid)。
 
 本阶段要让应用连续发布任务，由设备独立推进计算，再通过 Signal 等待结果。用户态向上实现到 HSAKMT 风格接口库，封装驱动的设备、内存、队列和事件能力；实验程序等调用方组织命令包，CP 固件负责读取、解析和派发。ROCr/HSA 运行时及高层任务接口留待后续评估。
 
@@ -172,7 +173,7 @@ Queue 存活期间冻结绑定。关闭 GEM handle、解除 GPU 绑定和结束 
 
 每 Warp 保存 Block 编号、Block 尺寸与 Grid 中 Block 数量，每 Lane 保存线程坐标。新 Warp 创建时初始化，分段继续执行时保留；通过 `0xCC0～0xCCB` 的只读 CSR 读取，`mhartid` 保留 `0xF14`。只支持 `CSRRS` 且 `rs1=x0` 的读取，未知 CSR 和写入请求返回指令错误。
 
-`a0=kernarg_address`，不再设置参数窗口。控制页与参数窗口的保留规则删除；GPUVM 开启时 `0x8000_0000` 和 `0x9000_0000` 都可正常映射。16 字节描述符的最后字段保存 Kernel ABI 版本 3，AQL 仍为 64 字节，设备／固件、DRM 与 GPUVM 协议同步升级，拒绝旧组件。
+`a0=kernarg_address`，不再设置参数窗口。控制页与参数窗口的保留规则删除；GPUVM 开启时 `0x8000_0000` 和 `0x9000_0000` 都可正常映射。16 字节描述符的最后字段保存 Kernel ABI 版本（当前为 4），AQL 仍为 64 字节，设备／固件、DRM 与 GPUVM 协议同步升级，拒绝旧组件。
 
 #### 2.3.4 公共队列组件与旧代码清理
 

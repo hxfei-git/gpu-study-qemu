@@ -15,7 +15,7 @@
 #define GPGPU_VERSION_H
 
 /* 协议版本。 */
-#define GPGPU_PROTOCOL_VERSION 3U
+#define GPGPU_PROTOCOL_VERSION 4U
 /* BAR0 DEV_VERSION 读回的值：高 16 位为协议版本，低 16 位为修订号。 */
 #define GPGPU_DEV_VERSION_VALUE (GPGPU_PROTOCOL_VERSION << 16)
 /* Kernel 描述对象 kernel_abi_version 字段要求的值。 */

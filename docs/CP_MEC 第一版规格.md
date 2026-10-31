@@ -57,9 +57,9 @@
 
 本文集中保存本实验已经确认的架构、行为与接口约束。寄存器名称参考 AMD，实验语义以本文的 `[DESIGN]` 为准，不声明兼容 AMD 的完整硬件协议。
 
-**[DESIGN]** 2026-10-29 起，当前接口为协议版本 3。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
+**[DESIGN]** 当前接口为协议版本 4。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
 
-设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。版本差异见 [PROTOCOL_V3.md](<../software/gpgpu/PROTOCOL_V3.md>)；协议常量以共享头文件为准。
+设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 3 的差异见 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
 
 <a id="spec-overview"></a>
 
@@ -389,7 +389,7 @@ Host IOVA 0x4100_0000 → Ring 的 GPU 物理地址 0xc100_0000
   → CP 按用户域读取 Ring → 公共物理入口 → Host IOVA 0x4100_0000
 ```
 
-**[DESIGN]** 协议字段仍按原宽度保存字节地址，两个 32 位寄存器分别保存低、高位，不预先右移压缩。版本 3 的 GPU 存储地址限定为 32 位，64 位字段的高 32 位须为零；地址加长度等计算用 64 位，先校验再缩窄。
+**[DESIGN]** 协议字段仍按原宽度保存字节地址，两个 32 位寄存器分别保存低、高位，不预先右移压缩。当前协议的 GPU 存储地址限定为 32 位，64 位字段的高 32 位须为零；地址加长度等计算用 64 位，先校验再缩窄。
 
 用户 Ring、进度、描述对象、参数、Signal 和通知槽使用 GPUVA 或 GPU 物理地址，取决于设备 `gpuvm` 属性。管理 Ring、MQD、管理完成区、IH 与 COPY 物理端点一律保存 GPU 物理地址。`dma_addr_t` 只供驱动的 DMA API 使用，不能直接填入这些设备字段。Host CPU 指针也不写入 GPU 地址字段。
 
@@ -723,7 +723,7 @@ BAR 写入、DMA 写入、计算解释器写入和冷复位清零都应使对应
 
 ### 3.2 配置并激活 KIQ 后解除复位
 
-版本 3 先在 CP 保持复位、没有活跃 HQD 或在途访问时读回核对 Outbound 布局，再写 CONTROL 并读取确认状态；随后按下列顺序配置 IH、KIQ 和固件。两种 GPUVM 状态都必须核对设备版本与固件握手值为 3。
+驱动先在 CP 保持复位、没有活跃 HQD 或在途访问时读回核对 Outbound 布局，再写 CONTROL 并读取确认状态；随后按下列顺序配置 IH、KIQ 和固件。两种 GPUVM 状态都必须核对设备版本与固件握手值为 3。
 
 **[DESIGN]** 队列模式在固件启动流程中配置 KIQ，顺序如下：
 
@@ -1599,7 +1599,7 @@ CP 已取得 Dispatch，接下来读取 16 字节描述对象、核对 Kernel AB
 
 ```text
 Dispatch → kernel_object → 用户域读取描述对象
-  → 检查 kernel_abi_version = 3、代码与参数范围及对齐
+  → 检查 kernel_abi_version = 4、代码与参数范围及对齐
   → 保存 gpuvm_enabled、VMID、HQD 槽、代码和参数地址、长度与工作规模
   → 新建 Warp：填写一次共享启动状态，再填写各 Lane 线程坐标
   → 初始化 PC、mhartid，并令各有效 Lane 的 a0 = kernarg_address
@@ -1614,7 +1614,7 @@ Dispatch → kernel_object → 用户域读取描述对象
 偏移 0x00：code_entry          代码入口的 GPU 地址
 偏移 0x04：code_size           代码区域的字节长度
 偏移 0x08：kernarg_size        参数块的字节长度
-偏移 0x0c：kernel_abi_version  固定为 3
+偏移 0x0c：kernel_abi_version  固定为 4
 ```
 
 CP 拒绝旧值 0 和所有不支持的 ABI。代码入口按 4 字节对齐，代码长度非零且为 4 字节整数倍；使用宽整数检查地址加长度，执行器每次取指仍受声明代码范围约束。描述对象可供同一 Kernel 的多次提交复用，AQL 包仍为 64 字节。
@@ -2139,7 +2139,7 @@ Host 通过 W 判断记录是否已经完整发布，不要求整条 32 字节�
 
 #### 7.1.5 中断确认与 Signal 通知
 
-版本 3 的 IRQ bit 0、1、2 分别为 DMA_DONE、ERROR、IH，MSI-X 向量分别为 0、1、2。IH 使用 `bit 2` 和向量 2：
+版本 3 起，IRQ bit 0、1、2 分别为 DMA_DONE、ERROR、IH，MSI-X 向量分别为 0、1、2。IH 使用 `bit 2` 和向量 2：
 
 ```text
 IRQ_ENABLE.bit2   允许 IH 中断

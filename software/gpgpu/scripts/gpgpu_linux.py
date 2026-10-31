@@ -384,6 +384,12 @@ def prepare_firmware(output):
 EXPECTED_VALUES = [("17003", "17003"), ("437", "437"), ("513", "513")]
 
 
+def protocol_version():
+    """读取协议头中唯一的协议版本号，示例经 INFO 报告的 DRM 版本由它派生。"""
+    header = (STACK / "include/gpgpu/gpgpu_version.h").read_text()
+    return re.search(r"^#define GPGPU_PROTOCOL_VERSION (\d+)U$", header, re.M).group(1)
+
+
 def check_compute_log(log, mode):
     """核对示例输出：数值比较、资源回收与设备报告的地址模式。"""
     values = re.findall(r"^.*: (\d+)/(\d+) values PASS$", log, re.M)
@@ -391,7 +397,7 @@ def check_compute_log(log, mode):
         raise RuntimeError("三个示例的数值比较结果不完整")
     if not re.search(r"^GPGPU demos: 3/3 PASS$", log, re.M):
         raise RuntimeError("示例未正常完成回收")
-    if f"GPGPU DRM ABI=3 GPUVM={mode}" not in log:
+    if f"GPGPU DRM ABI={protocol_version()} GPUVM={mode}" not in log:
         raise RuntimeError("设备返回的地址模式或接口版本与本次运行不符")
     return values
 

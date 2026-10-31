@@ -34,7 +34,7 @@
 
 - [实验进度](<./docs/实验进度.md>)、[四阶段实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)
 - [CP/MEC 第一版规格](<./docs/CP_MEC 第一版规格.md>)、[GPUVM 第一版规格](<./docs/GPUVM 第一版规格.md>)
-- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V3.md>)
+- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V4.md>)
 - [软件栈说明](<./software/gpgpu/README.md>)
 - 历史参考，按各自注明的版本阅读：[GPGPU 适配笔记](<./docs/GPGPU_适配.html>)、[CP/MEC 软件实现、参考与扩展](<./docs/历史/CP_MEC 软件实现、参考与扩展.md>)、[旧设备说明](<./docs/历史/gpgpu.rst>)
 

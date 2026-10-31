@@ -88,7 +88,7 @@ static uint32_t take_errors(RegsTest *t)
 /*
  * test_identity() - 身份寄存器与复位状态
  *
- * 期望：设备号、协议版本 3 对应的 DEV_VERSION、64 MiB VRAM 容量和 GPUVM
+ * 期望：设备号、当前协议版本对应的 DEV_VERSION、64 MiB VRAM 容量和 GPUVM
  * 协议版本都符合头文件定义；VM_MODE 反映 gpuvm 属性；复位后设备 READY、
  * 没有错误。进程内设备没有连接 CP，CP_CTRL 读作 0。
  */

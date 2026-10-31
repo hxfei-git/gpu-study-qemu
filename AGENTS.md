@@ -436,6 +436,6 @@ TAP 计划与结果，不固定通过数；Linux 全栈核对实际比较结果�
   后再细化近期任务，不预先固定全部目标；已确认设计在 CP/MEC 与 GPUVM 规格，
   确认过程只保留 CP/MEC 规格第 9 节。
 - 寄存器、位域、访问权限和复位值在[硬件手册](<./docs/GPGPU_硬件手册.html>)；
-  组件升级差异在 [PROTOCOL_V3.md](<./software/gpgpu/PROTOCOL_V3.md>)，协议常量以
+  组件升级差异在 [PROTOCOL_V4.md](<./software/gpgpu/PROTOCOL_V4.md>)，协议常量以
   `software/gpgpu/include/gpgpu/` 为准。
 - 学习进度与个人安排不在本仓库记录。

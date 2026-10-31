@@ -51,6 +51,7 @@
 | GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
 | VM | Virtual Memory | 本文指一个文件持有的 GPU 地址空间 |
 | TLB | Translation Lookaside Buffer | 地址翻译缓存 |
+| VPN | Virtual Page Number | 虚拟页号，即 GPUVA 除以 4 KiB |
 | PTE / PDE | Page Table Entry / Page Directory Entry | 页表叶子项／页目录项 |
 | TTM | Translation Table Maps | 图形对象存储位置与迁移管理框架 |
 | VMA | Virtual Memory Area | CPU 进程的虚拟内存映射区域 |
@@ -89,7 +90,7 @@ CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` �
 
 Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
 
-协议当前为版本 3，与版本 2 的差异见 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
+协议当前为版本 4，与版本 3 的差异见 [PROTOCOL_V4.md](./PROTOCOL_V4.md)；更早的版本 2 到 3 的差异见 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
 
 ## 1. 应用提交与统一访存
 
@@ -158,7 +159,7 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 `csrr` 汇编为 `CSRRS rd, csr, x0`。执行器仅接受此只读形式；`rd=x0` 也先检查 CSR 是否有效。未知 CSR、写入及其他未支持形式均返回指令错误。汇编器接受数字与 `.equ` 常量，并检查 CSR 编号范围。
 
-`a0` 直接保存 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数读取按普通内存处理。16 字节 Kernel 描述符在偏移 `0x0c` 保存 `kernel_abi_version=3`，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 3，组件必须一起更新。
+`a0` 直接保存 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数读取按普通内存处理。16 字节 Kernel 描述符在偏移 `0x0c` 保存 `kernel_abi_version=4`，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 4，组件必须一起更新。
 
 ## 4. 公共库与三个计算示例
 
