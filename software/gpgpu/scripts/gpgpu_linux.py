@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""ARM64 驱动客体的模块编译、交互运行与核心验收。
+"""GPGPU QEMU 配置、ARM64 驱动客体的模块编译与运行验证。
 
 子命令：
+  configure   配置两个 QEMU 目标，不需要客体内核
   module      在已保存的开发客体中重编驱动模块
   run         启动远端 CP 设备与开发客体，进入交互 shell
   stack-test  GPUVM 开、关各运行一次三个计算示例，并核对结果
 
-所有子命令都需要先用 kernel-build.py 准备好内核环境。
+configure 不依赖客体内核。
+其他子命令先用 kernel-build.py 准备内核环境。
 """
 
 import argparse
@@ -38,6 +40,13 @@ ROOT = STACK.parents[1]
 QEMU_DIRECTORY = ROOT / "build" / "arm64-qemu"
 QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-aarch64"
 DEVICE_QEMU_BINARY = QEMU_DIRECTORY / "qemu-system-riscv64"
+# 独立配置入口与 Linux 运行入口共用的 QEMU 配置参数。
+QEMU_CONFIGURE_ARGS = (
+    "--target-list=aarch64-softmmu,riscv64-softmmu",
+    "--disable-rust", "--disable-docs", "--disable-tools",
+    "--disable-guest-agent", "--enable-download",
+    "--extra-cflags=-O0 -g0", "--enable-vfio-user-server",
+)
 # 模块清单 module-test.json 中登记的运行文件。
 RUNTIME_FILES = ("gpgpu_pci.ko", "vmlinuz-virt")
 BUILD_RECORDS = ("kernel-release", "kernel-config", "kernel-Module.symvers",
@@ -149,17 +158,19 @@ def qemu_configured():
             "#define CONFIG_GPGPU_CP 1" in config)
 
 
+def configure_qemu(directory, log=None):
+    """配置两个 QEMU；log 为空时输出到终端。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    subprocess.run([str(ROOT / "configure"), *QEMU_CONFIGURE_ARGS],
+                   cwd=directory, stdout=log, stderr=log, check=True)
+
+
 def ensure_qemu(output):
     """1. 构建目录缺少所需目标时重新配置；2. 构建 Host 与远端 CP 两个 QEMU。"""
     QEMU_DIRECTORY.mkdir(parents=True, exist_ok=True)
     with (output / "qemu-build.log").open("w") as log:
         if not qemu_configured():
-            subprocess.run([
-                str(ROOT / "configure"), "--target-list=aarch64-softmmu,riscv64-softmmu",
-                "--disable-rust", "--disable-docs", "--disable-tools",
-                "--disable-guest-agent", "--enable-download",
-                "--extra-cflags=-O0 -g0", "--enable-vfio-user-server",
-            ], cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
+            configure_qemu(QEMU_DIRECTORY, log)
         subprocess.run(["ninja", "-j4", "qemu-system-aarch64", "qemu-system-riscv64"],
                        cwd=QEMU_DIRECTORY, stdout=log, stderr=log, check=True)
     subprocess.run([str(QEMU_BINARY), "-device", "gpgpu,help"],
@@ -455,10 +466,14 @@ def run_interactive(output, device_qemu, iommu, gpuvm):
 
 
 def main():
-    """解析子命令，持输出目录锁后按需重编模块，再执行验收或交互运行。"""
+    """独立配置 QEMU，或在准备好的客体环境中运行。"""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("module", "run", "stack-test"))
+    parser.add_argument("command",
+                        choices=("configure", "module", "run", "stack-test"))
+    parser.add_argument("--qemu-dir", type=Path,
+                        help="仅 configure：QEMU 构建目录，"
+                             "默认 build/arm64-qemu")
     parser.add_argument("--output-dir", type=Path,
                         default=ROOT / "build/gpgpu-kernel-gpuvm")
     parser.add_argument("--device-qemu", type=Path, default=DEVICE_QEMU_BINARY)
@@ -467,6 +482,11 @@ def main():
     parser.add_argument("--gpuvm", choices=("on", "off"), default="on",
                         help="交互运行的设备属性；核心计算自动运行两种状态")
     args = parser.parse_args()
+    if args.command == "configure":
+        configure_qemu((args.qemu_dir or QEMU_DIRECTORY).resolve())
+        return
+    if args.qemu_dir is not None:
+        parser.error("--qemu-dir 只用于 configure 子命令")
     if args.command == "stack-test" and (args.iommu != "none" or args.gpuvm != "on"):
         parser.error("stack-test 固定运行 IOMMU=none、GPUVM=on/off")
     output = args.output_dir.resolve()

@@ -74,8 +74,12 @@ hw/gpgpu/ + firmware/   QEMU 设备模型与 RV64 CP 裸机固件；RV32 执行�
 以下命令在本仓库根目录运行：
 
 ```sh
-# 设备寄存器 6 项、RV64 CP 队列 5 项：先构建固件，再在 build/arm64-qemu 中运行 ninja，按 TAP 核对 11/11
-make -f Makefile.camp test-gpgpu-qtest
+# 配置并构建 aarch64 Host、riscv64 CP 与 QTest，不需要客体内核环境
+make -f Makefile.gpgpu configure
+make -f Makefile.gpgpu build JOBS=4
+
+# 设备寄存器 6 项、RV64 CP 队列 5 项：先构建固件和 QEMU，再按 TAP 核对 11/11
+make -f Makefile.gpgpu test-gpgpu-qtest
 
 # 只运行一个用例：GLib 的 -p 选择用例路径，路径见测试文件末尾的 qtest_add_func
 QTEST_QEMU_BINARY=build/arm64-qemu/qemu-system-aarch64 \
@@ -89,20 +93,20 @@ make -C software/gpgpu                  # 用户库、gpgpu-demo 与三个 RV32 
 make -C software/gpgpu/firmware         # RV64 CP 固件 build/gpgpu-firmware/gpgpu-cp.bin
 make -C software/gpgpu check            # RV32 教学汇编器回归
 make -C software/gpgpu check-bootstrap  # 基础环境引导脚本回归
+make -C software/gpgpu check-configure  # 独立 QEMU 配置入口回归，不启动客体
 
 # Linux 全栈：GPUVM 开、关各运行一次三个计算示例；缺少内核环境时在检查阶段退出
-make -f Makefile.camp test-gpgpu-stack
+make -f Makefile.gpgpu test-gpgpu-stack
 make -C software/gpgpu/linux run IOMMU=smmuv3 GPUVM=off   # 启动客体并进入交互 shell
 make -C software/gpgpu/linux module                       # 在开发客体中重编驱动模块
 ```
 
-- `make -f Makefile.camp configure`、`build` 和 `test` 只面向课程的 RISC-V CPU、
-  SoC 与 Rust 实验，产物在 `build/`，不包含 GPGPU 需要的 aarch64 目标。
-- `test-gpgpu-qtest` 只在已配置的 `build/arm64-qemu` 中运行 ninja，不负责配置。
-  `build/arm64-qemu` 由 `software/gpgpu/scripts/gpgpu_linux.py` 的 `ensure_qemu()`
-  配置，目标为 `aarch64-softmmu,riscv64-softmmu`，并启用 `--enable-vfio-user-server`。
-  `gpgpu_linux.py` 调用 `ensure_qemu()` 前会先检查内核环境；全新检出且尚无内核环境时，
-  照 `ensure_qemu()` 中的完整参数手动运行 configure。
+- `configure` 通过 `gpgpu_linux.py configure` 配置两个系统模拟目标，并启用
+  `--enable-vfio-user-server`。配置参数只在脚本中维护，独立配置和 Linux 运行入口共用。
+- `build` 和 `test-gpgpu-qtest` 在缺少 `build.ninja` 时自动调用配置入口，
+  不需要客体内核。默认目录是 `build/arm64-qemu`；可用
+  `GPGPU_BUILD_DIR=build/verify-qemu` 验证另一份构建，不覆盖已有目录。
+  这个变量只影响 QEMU 配置、构建和 QTest，全栈入口仍使用 `build/arm64-qemu`。
 - Linux 全栈所需的内核环境按 `software/gpgpu/README.md` 第 5.1 节，用
   `bootstrap-env.py` 和 `kernel-build.py` 准备。
 - 按 `AGENTS.md` 核对通过数量时，QTest 看 `build/gpgpu-qtest.log` 中的 TAP `ok` 行；
