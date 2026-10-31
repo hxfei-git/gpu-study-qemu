@@ -4,27 +4,19 @@
 | --- | --- | --- |
 | QEMU | Quick Emulator | 仿真与虚拟化工具 |
 | GPGPU / GPU | General-Purpose Computing on Graphics Processing Units / Graphics Processing Unit | GPU 通用计算／图形处理器 |
-| CPU | Central Processing Unit | 中央处理器 |
 | CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
-| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 的 RISC-V 位宽 |
-| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
 | GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
-| HSA / HSAKMT | Heterogeneous System Architecture / HSA Kernel Mode Thunk | 异构系统架构／HSA 内核接口封装层 |
-| AQL | Architected Queuing Language | HSA 队列包格式 |
 | IH | Interrupt Handler | 本实验的完成与错误通知模块 |
-| API / UAPI | Application Programming Interface / User-space API | 应用编程接口／内核向用户态提供的接口 |
-| ABI | Application Binary Interface | 应用二进制接口 |
-| MMIO | Memory-Mapped I/O | 内存映射输入输出 |
-| PCI / PCIe | Peripheral Component Interconnect / PCI Express | 外设互连／高速外设互连总线 |
-| DMA | Direct Memory Access | 直接内存访问 |
-| VRAM | Video RAM | 设备显存 |
-| ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
+| AMDGPU | AMD GPU Linux Kernel Driver | AMD GPU Linux 内核驱动 |
+| ROCr | ROCm Runtime | ROCm 的异构计算运行时 |
 | TAP | Test Anything Protocol | 测试结果输出协议 |
 | SPDX | Software Package Data Exchange | 软件许可证标识规范 |
 | LF | Line Feed | 换行符 |
 | VS Code | Visual Studio Code | 本项目使用的编辑器 |
 | WSL | Windows Subsystem for Linux | Windows 的 Linux 子系统 |
-| URI | Uniform Resource Identifier | 统一资源标识符 |
+| URI / URL | Uniform Resource Identifier / Uniform Resource Locator | 统一资源标识符／统一资源定位符 |
+| CI | Continuous Integration | 持续集成 |
+| ASCII | American Standard Code for Information Interchange | 美国信息交换标准代码 |
 
 ## 项目结构与模块划分
 
@@ -32,23 +24,13 @@
 `hw/gpgpu/`、`hw/riscv/gpgpu-cp.c`、`software/gpgpu/`、`tests/qtest/gpgpu-*.c`
 和 `docs/`；其余目录保留 QEMU 的基础功能，不再承担训练营的其他实验。
 
-设备模型按 `cp/`、`compute/`、`mem/` 和 `irq/` 分模块，软件栈沿
-应用 → 运行时 → HSAKMT 风格薄层 → DRM 驱动 → 设备与固件调用。
-共享协议头位于 `software/gpgpu/include/gpgpu/`，不是顶层 `include/`。
-各层入口见[软件栈第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)。
+代码分层、模块划分和共享协议头位置见[软件栈第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)。
 构建与运行产物统一放在 `build/`，不纳入 Git。
 
 ## 构建、测试与开发命令
 
-命令在仓库根目录运行。依赖和快速开始见 [README](./README.md)，
-单个 QTest 的选择方法与双进程运行方式见 [CLAUDE.md](./CLAUDE.md)。
-
-- `make -f Makefile.gpgpu configure`：独立配置两个 QEMU，不需要客体内核。
-- `make -f Makefile.gpgpu build JOBS=4`：构建 QEMU、QTest 和 RV64 固件；首次自动配置。
-- `make -f Makefile.gpgpu test-gpgpu-qtest`：运行寄存器与真实 CP 固件回归，核对 TAP。
-- `make -f Makefile.gpgpu test-gpgpu-stack`：在开发客体运行 GPUVM 开、关的计算示例。
-- `make -C software/gpgpu all check`：构建用户库与示例，运行教学汇编器回归。
-- `make -C software/gpgpu check-bootstrap`：验证基础环境缓存与已有磁盘保护。
+依赖、构建与测试命令、单个 QTest 用例的运行方式和当前验证结果，只写在
+[软件栈说明第 5 节](<./software/gpgpu/README.md#build-and-validation>)。
 
 ## 脚本、校验与验证的精简
 
@@ -366,42 +348,94 @@ TAP 计划与结果，不固定通过数；Linux 全栈核对实际比较结果�
 
 本仓库以 `main` 为开发基线，`hxfei-qemu` 仅保留早期历史。整理任务可在临时分支
 执行，完成后在无分叉且工作区干净时快进 `main`；不得覆盖用户未提交修改或改写历史。
-作为父仓库子模块时，先在本仓库提交代码与实验文档，再在父仓库提交子模块指针。
-推送与远端设置修改需要单独授权。
+本仓库独立提交和推送，不需要同步修改父仓库；父仓库是否更新子模块指针，由父仓库
+按需决定。推送与远端设置修改需要单独授权。
 
 ## 文档与交互
 
-用连贯文字解释概念，不用职责表代替调用关系。实验文档位于本仓库 `docs/`，
-修改前先阅读相关规格与软件栈说明。原课程资料保存在 `docs/课程资料/`：
-`QEMU_2026_讲义.html` 和 `QEMU_2026_实验.html`。保留课程原文与许可，
-按当时版本阅读；当前实现仍以规格和软件栈说明为准。
+本仓库的中文文档按本节维护，不依赖其他仓库的写作规则。作为 `gpu_study` 子模块
+检出时，父仓库规则只约束学习笔记；本仓库内的代码和文档以本文件为准。
 
-作为 `gpu_study` 子模块时，中文文档遵循父仓库 `AGENTS.md` 与《文档的常见问题》
-中的写作、证据和自然化要求，缩写表与 humanizer-zh 检查的适用范围也以父仓库为准。
-长期维护、反复查阅的规格、设计说明、协议、手册、大纲与项目说明等属于正式文档。
-临时草稿、会话计划、一次性的交接与执行记录，以及临时排查结果默认不强制这两项，
-整理为正式文档时再补齐；用户明确要求时，按用户要求执行。
-文档性质按实际用途判断，不以目录、文件后缀、是否已保存为文件或是否已提交 Git 为依据。
+实验文档位于 `docs/`，修改前先阅读相关规格与软件栈说明。原课程资料保存在
+`docs/课程资料/`：`QEMU_2026_讲义.html` 和 `QEMU_2026_实验.html`。保留课程原文与
+许可，按当时版本阅读；当前实现仍以规格和软件栈说明为准。
 
-先讲任务和关系，再给源码；保留 `[SOURCE]`、`[SPEC]`、`[INFERENCE]`、`[BOUNDARY]`、`[DESIGN]` 的区别。
-历史分析绑定固定提交，不把旧文件不存在当成需要恢复兼容接口。
+### 适用范围
 
-预览环境为 Windows VS Code 连接 WSL。当前本地源码定位使用
-`vscode://vscode-remote/wsl+Ubuntu/绝对路径:行:列`，中文和空格做 URL 编码；
-不得追加本地 `#L…`。历史源码用固定提交的 GitHub 链接和真实行号。
-普通文档使用相对链接，含空格或中文时沿用 `[文字](<./路径>)` 写法。
-交付时区分路径、行号检查与实际预览点击，不以解析通过代替跳转验证。
+规格、设计说明、协议、手册、大纲、项目说明和软件栈说明等长期维护、反复查阅的文档
+属于正式文档，要求缩写表和自然化检查。临时草稿、会话计划、一次性的交接与执行记录、
+临时排查结果默认不要求这两项，整理为正式文档时再补齐；用户明确要求时按要求执行。
+文档性质按实际用途判断，不看目录、文件后缀或是否已提交。
+
+### 现状写法与单一来源
+
+- 文档写现状、约定和结论，不写“某天做了什么”的过程叙述。日期只在本身就是事实时
+  保留，例如固定版本、规范封面日期，或结果文件里的完成时间；变更经过和原因写在提交说明里。
+- 每件事只在一个文档中维护，归属见下文“信息归属”。其他文档只放链接，不复述内容、
+  数量或结论，修改时只改一处。被多处引用的章节使用固定的 ASCII 锚点，改标题时链接不受影响。
+
+### 结构与讲解
+
+- 标题后紧接缩写表，三列为“缩写、英文全称、中文含义”，只收本文用到的技术缩写，
+  随正文更新；没有缩写时不建空表。全文一个 `#` 标题，`##` 为编号章节，`###` 为短小节。
+- 先交代当前任务：谁在做什么、已有什么、要得到什么；再给完整的关系图或执行路径，
+  沿图解释字段、数值和分支。概览不依赖后文才讲的取值和配置细节。
+- 用连贯文字和同一个具体例子讲清对象如何配合，不用职责表或字段对照表代替调用关系；
+  参数、缩写等需要集中查阅的信息可以用表。贯穿主线的结构体，先给只含核心成员的简化定义。
+- 追问暴露的缺失前提补到第一次需要它的位置，不堆在当前段落末尾；跨节移动内容后，
+  同步更新大纲、锚点与引用。
+- 图示优先用 `text` 或 Mermaid，图前写例子条件，图后解释关键关系；除非用户要求，
+  不生成新图片。代码块标注语言。
+- 标题直接写出对象、动作或结果，问句标题只用于易混淆点。改标题时保留编号和层级，
+  同步更新锚点和链接。
+- 超过 4 位的十六进制数在正文、示例和自绘图中从右向左每 4 位加下划线，
+  如 `0x8000_1234`；源码、命令、日志和规范原文保持原样。
+
+### 证据与源码
+
+- 用 `[SOURCE]`、`[SPEC]`、`[INFERENCE]`、`[BOUNDARY]`、`[DESIGN]` 区分事实、推断、
+  边界与设计。`[SOURCE]`、`[SPEC]` 的引导文字放在 `>` 引用块中，写明文件路径、固定版本
+  和真实行号，或规范名称、版本、章节与页码；原始源码仍用普通代码块。
+- 正文先讲清概念和过程，源码只用来验证。摘录保留读懂结论所需的函数名、入参、外围分支
+  和调用关系；不连续的片段分块，并说明先后关系；英文注释和错误信息后附中文翻译。
+  不把教学伪代码写成源码。
+- 教学设备是自定义实现。引用 AMDGPU、ROCr 或 MI300 资料作对照时，注明固定版本和
+  适用范围，不把本设备的简化写成 MI300X 的硬件结论。
+- 历史分析绑定固定提交，不把旧文件不存在当成需要恢复兼容接口。历史提交号依赖远端
+  分支 `archive/main-before-contributors-cleanup-20261031`，不要删除该分支，原因见
+  软件栈说明第 6 节开头。
+
+### 链接
+
+预览环境为 Windows VS Code 连接 WSL。本地源码定位使用
+`vscode://vscode-remote/wsl+Ubuntu/绝对路径:行:列`，中文和空格做 URL 编码，不追加
+`#L…`；文件名和每段行号都做成链接，范围链接定位到起始行。指向父仓库 `2.源码/` 的
+本地链接只在作为子模块检出时可用。历史源码用固定提交的 GitHub 链接和真实行号。
+普通文档使用相对链接，含空格或中文时写成 `[文字](<./路径>)`。交付时区分路径、
+行号检查与实际预览点击，不以解析通过代替跳转验证。
+
+### 自然化检查
+
+新建、补充、改写或审阅正式中文文档，包括只改一个段落，都要用 humanizer-zh
+（上游 op7418/Humanizer-zh 提交 `f4518a8`）做最终检查：先完成事实、结构、证据和格式，
+再检查本次改动的自然语言；保留技术事实、数字、术语、代码、链接和标题层级，删除空泛
+开场、重复总结和套话。技能缺失时告知用户，并按同样原则人工检查。
 
 ## 信息归属
 
-- 当前阶段、任务、下一步与阻塞项只写在 [docs/实验进度.md](<./docs/实验进度.md>)，
-  使用定性状态，不复制测试数字。
-- 当前代码版本的构建、验证结果和日志只写在
-  [software/gpgpu/README.md 第 5 节](<./software/gpgpu/README.md#5-构建运行与本次结果>)；
-  历史工作与验收放第 6 节。
-- 阶段依赖、范围和完成标准在[实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)；
-  已确认设计在 CP/MEC 与 GPUVM 规格，确认过程只保留 CP/MEC 规格第 9 节。
+每类信息只在下列一处维护，其他文档只链接，不复制内容。
+
+- 项目定位、文档入口与许可在 [README](./README.md)。
+- 代码分层、模块与协议头位置在
+  [软件栈说明第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)；依赖、构建与测试命令、
+  当前代码版本的验证结果、日志位置和本地材料状态在
+  [第 5 节](<./software/gpgpu/README.md#build-and-validation>)；历史工作与验收在第 6 节。
+- 当前阶段、近期任务、下一步与阻塞项在 [docs/实验进度.md](<./docs/实验进度.md>)，
+  使用定性状态，不复制测试数字和材料清单。
+- 阶段依赖、范围和完成标准在[实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)，进入当前阶段
+  后再细化近期任务，不预先固定全部目标；已确认设计在 CP/MEC 与 GPUVM 规格，
+  确认过程只保留 CP/MEC 规格第 9 节。
 - 寄存器、位域、访问权限和复位值在[硬件手册](<./docs/GPGPU_硬件手册.html>)；
-  组件升级差异在 [PROTOCOL_V3.md](<./software/gpgpu/PROTOCOL_V3.md>)。
-- 学习进度与个人安排由父仓库《学习与实验进度》维护。
-  其他位置只放链接，不再保存第二份进度或确认摘要。
+  组件升级差异在 [PROTOCOL_V3.md](<./software/gpgpu/PROTOCOL_V3.md>)，协议常量以
+  `software/gpgpu/include/gpgpu/` 为准。
+- 学习进度与个人安排不在本仓库记录。

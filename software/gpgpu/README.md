@@ -29,9 +29,10 @@
 | TAP | Test Anything Protocol | 测试结果输出协议 |
 | TLS | Transport Layer Security | 传输层安全协议 |
 | JSON | JavaScript Object Notation | JavaScript 对象表示法 |
+| URL | Uniform Resource Locator | 统一资源定位符 |
 | ISO | International Organization for Standardization | 此处指 ISO 9660 光盘镜像 |
 | APK | Alpine Linux Package | Alpine 软件包 |
-| SHA-256 | Secure Hash Algorithm 256-bit | 256 位安全散列算法 |
+| SHA-256 / SHA-512 | Secure Hash Algorithm 256-bit / 512-bit | 256／512 位安全散列算法 |
 | BDF | Bus, Device, Function | PCI 总线、设备、功能号 |
 | HSA | Heterogeneous System Architecture | 异构系统架构 |
 | ROCr | ROCm Runtime | ROCm 的异构计算运行时 |
@@ -71,6 +72,8 @@ linux/                      DRM 驱动：GEM 对象、页表、管理队列、IH
   │ BAR0 寄存器、内存中的 MQD/Ring/Signal（include/gpgpu/*.h）
 hw/gpgpu/ + firmware/       QEMU 设备模型与 RV64 CP 固件
 ```
+
+协议头位于 `software/gpgpu/include/gpgpu/`，不是 QEMU 顶层的 `include/`。各组件都以 `gpgpu/...` 的形式包含这些头文件：QEMU 由顶层 `meson.build` 用 `-iquote` 把 `software/gpgpu/include` 加入搜索路径；固件、驱动和用户库的 Makefile 用 `-I` 指向同一位置。
 
 协议头按内容拆分：`gpgpu_regs.h` 是 BAR0 寄存器，`gpgpu_cp_map.h` 是 CP 私有地址空间，`gpgpu_queue_abi.h` 是 MQD、管理命令、AQL 包、Kernel 描述对象与 Signal，`gpgpu_ih_abi.h` 是 IH 记录，`gpgpu_vm_abi.h` 是页表项与 GPUVA 布局，`gpgpu_version.h` 是协议版本，`uapi/gpgpu_drm.h` 只描述 ioctl。用户态只包含后三者中的 `uapi/gpgpu_drm.h`、`gpgpu_queue_abi.h` 与 `gpgpu_vm_abi.h`，看不到寄存器。
 
@@ -171,58 +174,69 @@ KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` �
 
 任一数值比较、提交、等待或正常资源回收失败，程序返回非零退出码。
 
-## 5. 构建、运行与本次结果
+<a id="build-and-validation"></a>
 
-QEMU 配置和设备回归不需要 Linux 客体内核。宿主机需要 QEMU 构建依赖、`libjson-c-dev`、`libcmocka-dev`，以及固件使用的 `riscv64-unknown-elf-gcc`；GPGPU 构建不需要 Rust。以下命令从仓库根目录运行。
+## 5. 构建、运行与验证结果
 
-Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`。缺少该环境时按第 5.1 节先引导基础环境，再运行内核构建脚本；它使用仓库中的固定源码、配置与工具链清单。
+本节是依赖、构建与测试命令和当前验证结果的唯一说明，其他文档只链接到这里。命令都在仓库根目录运行。
+
+QEMU 配置和设备回归不需要 Linux 客体内核。宿主机需要 QEMU 的 C/Python 构建依赖、Ninja、`pkg-config`、GLib 和 pixman 开发包，另需 `libjson-c-dev`、`libcmocka-dev` 和固件使用的 `riscv64-unknown-elf-gcc`；GPGPU 构建不需要 Rust。Ubuntu 24.04 上，后三项可用 `sudo apt install libjson-c-dev libcmocka-dev gcc-riscv64-unknown-elf` 安装。
+
+`libjson-c-dev` 和 `libcmocka-dev` 是 vfio-user 服务端子项目 libvfio-user 的依赖。首次配置需要联网：配置参数带 `--enable-download`，Meson 会按 `subprojects/*.wrap` 下载缺少的子项目，其中 libvfio-user 从 gitlab.com 拉取，再应用 `subprojects/packagefiles/libvfio-user/` 中的本项目补丁。下载结果留在 `subprojects/` 下，不入库；离线环境需要先把这些目录拷进来。
 
 ```sh
-# 配置 aarch64 Host 与 riscv64 CP，产物位于 build/arm64-qemu
+# 配置 aarch64 Host 与 riscv64 CP，不需要客体内核；默认目录 build/arm64-qemu
 make -f Makefile.gpgpu configure
-# 构建两个 QEMU、两个 QTest 程序与 RV64 CP 固件；首次构建自动配置
+# 构建两个 QEMU、两个 QTest 程序与 RV64 CP 固件；缺少 build.ninja 时自动配置
 make -f Makefile.gpgpu build JOBS=4
-# 构建用户库、示例和三个 RV32 Kernel
-make -C software/gpgpu
-# 构建 RV64 CP 固件
+# 设备寄存器与双进程 CP 队列回归，核对退出状态、TAP 计划与结果
+make -f Makefile.gpgpu test-gpgpu-qtest
+
+# 用户库、gpgpu-demo 与三个 RV32 Kernel（输出到 build/gpgpu-stack），以及教学汇编器回归
+make -C software/gpgpu all check
+# RV64 CP 固件，输出 build/gpgpu-firmware/gpgpu-cp.bin
 make -C software/gpgpu/firmware
-# 需要准备内核环境时使用既有构建工具
-python3 software/gpgpu/scripts/kernel-build.py --help
-# 唯一核心计算验证入口：自动构建并顺序运行 GPUVM 开和关
+# 基础环境引导脚本的缓存与防覆盖回归，不需要设备或网络
+make -C software/gpgpu check-bootstrap
+
+# Linux 全栈：GPUVM 开、关各运行一次三个计算示例；缺少内核环境时在检查阶段退出
 make -f Makefile.gpgpu test-gpgpu-stack
+# 启动远端设备与开发客体，进入交互 shell
+make -C software/gpgpu/linux run IOMMU=smmuv3 GPUVM=off
+# 在开发客体中重编驱动模块
+make -C software/gpgpu/linux module
 ```
 
-核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。两种状态的日志分别保存在 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`：`compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列；两种状态都通过后另写 `core/summary.json`。
-
-设备与固件另有一组不需要 Linux 客体的回归：
+构建目标的简要说明可用 `make -f Makefile.gpgpu help` 查看。只运行一个 QTest 用例时，先用 `-l` 列出带架构前缀的路径，再用 GLib 的 `-p` 选择：
 
 ```sh
-# 运行设备寄存器与双进程 CP 队列回归，核对 TAP 计划及结果
-make -f Makefile.gpgpu test-gpgpu-qtest
-# RV32 教学汇编器的编码回归
-make -C software/gpgpu check
+QTEST_QEMU_BINARY=build/arm64-qemu/qemu-system-aarch64 \
+QTEST_GPGPU_REMOTE_BINARY=build/arm64-qemu/qemu-system-riscv64 \
+QTEST_GPGPU_REMOTE_LOG_DIR=build/gpgpu-qtest-logs \
+QTEST_GPGPU_FIRMWARE=build/gpgpu-firmware/gpgpu-cp.bin \
+build/arm64-qemu/tests/qtest/gpgpu-cp-test --tap -p /aarch64/gpgpu/cp/dispatch
+# 寄存器用例只需要 QTEST_QEMU_BINARY，例如 -p /aarch64/gpgpu/regs/irq
 ```
 
-`configure` 与 Linux 入口共用 `gpgpu_linux.py` 中的一份配置参数。`build` 和 `test-gpgpu-qtest` 在缺少 `build.ninja` 时自动配置；也可用 `GPGPU_BUILD_DIR=build/verify-qemu` 验证另一份构建，不覆盖默认目录。这个变量不改变 Linux 全栈使用的 `build/arm64-qemu`。
+CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位于 `qemu-system-riscv64 -machine gpgpu-cp` 进程中，经 `x-vfio-user-server` 导出到 unix socket；`qemu-system-aarch64` 中的 A57 客体用 `vfio-user-pci` 连接这个 socket。CP QTest 按 `QTEST_GPGPU_REMOTE_BINARY` 自行启动远端进程，Linux 全栈由 `software/gpgpu/scripts/gpgpu_remote.py` 启动和管理远端进程；寄存器 QTest 则把设备放在 aarch64 进程内。GPUVM 开关是设备属性 `-global gpgpu.gpuvm=on|off`，双进程时加在远端进程的命令行上，默认开启。
 
-> **[SOURCE]** 构建和清理后的代码版本为 `38cf573`（起点 `c9f8599`）。共享参数见 [gpgpu_linux.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>)，配置函数与 Linux 入口分别见[第 161 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:161:1>)、[第 168 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:168:1>)；首次构建的自动配置见 [Makefile.gpgpu](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>) [第 33～46 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>)。
+`configure` 与 Linux 入口共用 `gpgpu_linux.py` 中的一份配置参数。`build` 和 `test-gpgpu-qtest` 可用 `GPGPU_BUILD_DIR=build/verify-qemu` 把 QEMU 的配置、构建和 QTest 程序放到另一目录，不覆盖默认构建目录。固件 `build/gpgpu-firmware/`、QTest 日志 `build/gpgpu-qtest.log` 和远端日志 `build/gpgpu-qtest-logs/` 仍是共用路径，换目录运行 QTest 也会覆盖这些日志。这个变量不改变 Linux 全栈使用的 `build/arm64-qemu`。
 
-本轮整改的实际验证分两次完成：构建入口调整后保留 `build/remediation-stage1/`，清理课程与上游辅助内容、修正源码暂存后，在新默认目录重新构建并保存 `build/remediation-final/`。最终运行对应代码提交 `38cf573`，其后的本阶段改动只涉及文档。
+> **[SOURCE]** 共享配置参数见 [gpgpu_linux.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>)，配置函数与 Linux 入口分别见[第 161 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:161:1>)、[第 168 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:168:1>)；首次构建的自动配置见 [Makefile.gpgpu](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>) [第 33～45 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>)。
 
-- 全新配置并构建两个 QEMU、两个 QTest 程序和 RV64 固件成功。新默认目录 `build/arm64-qemu` 的 Python 环境由 `/usr/bin/python3` 创建，不再依赖旧项目工作区；原目录改名保留为 `build/arm64-qemu.pre-cleanup`，尚未删除。
-- 最终真实 QTest 为 11/11。汇编器 7/7、基础环境引导回归 6/6 已在整改过程中通过；配置和首次构建直接使用现有 Make 入口验证，不维护额外的模拟配置测试脚本。
-- 最终全栈结果记录的完成时间为 `2026-10-31T05:40:07Z`。复用已校验的 `6.18.57-0-gpgpu-virt` 开发环境并重编驱动；GPUVM 开、关均完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种模式 3/3，客体退出码均为 0。脚本同时检查设备返回的 ABI、GPUVM 状态与客体内核日志。
-- 驱动模块、固件和示例在两种模式下的 SHA-256 一致。固件为 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，与整改前现场重建的基线一致；模块为 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例为 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。
+Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-> **[SOURCE]** 最终本地实际运行记录：[QTest 命令与输出](../../build/remediation-final/qtest.log)、[全栈命令与输出](../../build/remediation-final/stack.log)、[两种模式汇总](../../build/gpgpu-kernel-gpuvm/core/summary.json)、GPUVM [开启结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/on/result.json)、[关闭结果与组件散列](../../build/gpgpu-kernel-gpuvm/core/off/result.json)。`build/` 产物不纳入 Git，`core/` 随下一次运行更新，不能作为旧协议版本的不可变归档。
+下列结果对应代码版本 `b8bad67`，实际运行的提交在它之后，只改动了文档。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
 
-**[BOUNDARY]** QTest 和全栈测试在沙箱内均遇到 Unix socket 权限限制，通过结果来自沙箱外复跑。早一轮客体编译出现 `Clock skew detected` 警告，输出保留在 `build/remediation-stage1/stack.log`，本次未调整客体时钟。现有开发环境可复用；从零引导所需的旧内核 APK 缺件仍按第 5.1 节处理，本轮没有重新验证下载 URL 或从零生成开发盘。
+- QTest 11/11，教学汇编器 7/7，基础环境引导回归 6/6。
+- Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0；设备返回的 ABI、GPUVM 状态和客体内核日志检查通过。
+- 两种模式的组件 SHA-256 相同：固件 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，模块 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。
 
-以下两段保留 2026-10-30 的历史验证和失败尝试，不代表本轮验收状态。
+> **[SOURCE]** 本地运行记录：[命令与结果汇总](../../build/gpgpu-validation/runtime-verification.json)、[QTest 输出](../../build/gpgpu-validation/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/bootstrap-check.log)、[全栈输出](../../build/gpgpu-validation/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/core/summary.json)。`build/` 产物不纳入 Git。
 
-2026-10-30 的版本 3 验证：`efd22b0` 的寄存器与 CP QTest 为 11/11，汇编器为 7/7，QEMU 双目标、用户库、示例和 RV64 固件构建通过。固件 SHA-256 为 `d5fc2cb9313c0d6dadaa12932c5b0ee3e38c0027bc8ae9321cabcfe0de3b1449`。
+**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在禁止 socket 的沙箱中运行会失败。上述结果不覆盖从零引导开发环境、SMMUv3、多进程或资源生命周期专项。
 
-2026-10-30 10:40:58（UTC+8）再次运行 `test-gpgpu-stack`，在环境检查阶段退出：缺少指定开发镜像。实际 Linux kernel release 和模块 SHA-256 均未取得；GPUVM on/off 的 17003/437/513 比较、3/3 汇总、ABI=3 输出和 dmesg 检查均未执行，未生成 `core/summary.json`。不能据此宣布 Linux 全栈验收通过，也没有进入需要按驱动／用户库提交二分的运行阶段。尝试日志在 `build/validation-v3/stack-bootstrap-attempt.log`。
+<a id="offline-materials"></a>
 
 ### 5.1 从零准备基础环境与离线材料
 
@@ -235,29 +249,39 @@ python3 software/gpgpu/scripts/kernel-build.py --output-dir build/gpgpu-kernel-g
 make -f Makefile.gpgpu test-gpgpu-stack
 ```
 
-引导入口复用 `kernel-build.py` 的 `download_checked()`。固定 ISO 为 Alpine 3.24.2 aarch64；80 个编译依赖的版本、URL 和 SHA-256 保存在 [bootstrap-packages.json](./linux/kernel/bootstrap-packages.json)，两个 6.18.57 内核包沿用 [cached-packages.json](./linux/kernel/cached-packages.json)。宿主机先验证全部文件，客体仅从本地安装并保留 APK 签名检查；不运行在线升级或恢复旧同步栈。引导脚本只格式化本次新建的暂存盘，已有未通过校验的开发盘不会被覆盖。安装、重启和内核版本检查都成功后，才发布 `environment.json`。
+默认输出目录 `build/gpgpu-linux-module` 里已有通过校验的基础环境时，`bootstrap-env.py` 会直接复用。要验证从零流程，须用 `--output-dir` 另选一个空目录，并把下面列出的材料放进去。
 
-本机已取得并校验 ISO 与 80 个依赖。镜像移除的两个旧内核包必须从保留同版包的归档或已有缓存补回，文件内容须匹配下列 SHA-256。放置目录为 `build/gpgpu-linux-module/apk-cache/`：
+引导入口复用 `kernel-build.py` 的 `download_checked()`。固定 ISO 为 Alpine 3.24.2 aarch64；80 个编译依赖的版本、URL 和 SHA-256 保存在 [bootstrap-packages.json](./linux/kernel/bootstrap-packages.json)，两个 6.18.57 内核包沿用 [cached-packages.json](./linux/kernel/cached-packages.json)。宿主机先验证全部文件，客体只从本地安装并保留 APK 签名检查，不运行在线升级。引导脚本只格式化新建的暂存盘，已有但未通过校验的开发盘不会被覆盖。安装、重启和内核版本检查都成功后，才发布 `environment.json`。
 
-- `linux-virt-6.18.57-r0.ad6fb931.apk`：`b3820fee22e0366a15f7c139e5bc00348e333f3e7f77802271df7ded795aee4f`。
-- `linux-virt-dev-6.18.57-r0.c57a20a2.apk`：`fd3462db5bd0573287ff4aeba0bc35a040af1d218a8871180b134418afad1cac`。
+本机材料的状态如下，可用 `--list-inputs` 导出完整清单后逐项核对：
 
-2026-10-30 两个固定 URL 均返回 404，尚未取得可用的同版归档。缓存清单只保存校验信息，不包含 APK 内容。脚本在 `build/gpgpu-linux-module/missing-inputs.json` 列出实际缺件的完整路径、URL、SHA-256 和错误；补齐后可使用 `--offline`，只校验本地缓存。ISO 放在 `build/gpgpu-linux-module/downloads/alpine-virt-3.24.2-aarch64.iso`；完整清单可由 `--list-inputs` 导出。
+- 两个 6.18.57 内核包的固定 URL 已返回 404，上游无法再下载。本机 `build/gpgpu-linux-module/apk-cache/` 中有散列一致的副本，`build/gpgpu-kernel-gpuvm/`、`build/gpgpu-kernel/` 和 `build/gpgpu-kernel-cross/` 的 `apk-cache/` 下另有副本。文件名和 SHA-256 为：
+  - `linux-virt-6.18.57-r0.ad6fb931.apk`：`b3820fee22e0366a15f7c139e5bc00348e333f3e7f77802271df7ded795aee4f`；
+  - `linux-virt-dev-6.18.57-r0.c57a20a2.apk`：`fd3462db5bd0573287ff4aeba0bc35a040af1d218a8871180b134418afad1cac`。
+- ISO 的本机副本是 `build/gpgpu-arm64-linux/alpine-virt-3.24.2-aarch64.iso`，散列与脚本中的固定值一致。引导脚本只在输出目录的 `downloads/` 下查找，使用前要先复制过去。
+- 80 个编译依赖本机没有缓存，需要联网按清单 URL 下载，或者从其他机器按 `--list-inputs` 给出的路径拷入，再使用 `--offline`。
 
-后续内核重建还需要以下材料；网络不能访问时，按清单固定 URL 获取原文件并放到对应位置，不能改版本或校验值：
+缓存清单只保存校验信息，不包含 APK 内容。脚本会在输出目录的 `missing-inputs.json` 中列出实际缺少文件的完整路径、URL、SHA-256 和错误原因；补齐后可用 `--offline` 只校验本地缓存。基础环境的 `environment.json`、`developer.raw`、内核和 initramfs 都由引导生成。
 
-- `build/gpgpu-kernel-gpuvm/downloads/linux-6.18.tar.xz`、`patch-6.18.57.patch.xz`：URL 与 SHA-512 在 [sources.json](./linux/kernel/sources.json)。当前网络不允许访问 `cdn.kernel.org`。
+重建内核还需要以下材料；网络不能访问时，按清单的固定 URL 获取原文件并放到对应位置，不能改版本或校验值：
+
+- `build/gpgpu-kernel-gpuvm/downloads/linux-6.18.tar.xz`、`patch-6.18.57.patch.xz`：URL 与 SHA-512 在 [sources.json](./linux/kernel/sources.json)。本机这两个文件已通过校验；输出目录缺少它们时，脚本先从 `build/gpgpu-kernel/downloads/` 复制。
 - `build/gpgpu-kernel-toolchain/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz`：URL 与 SHA-256 在 [cross-toolchain.json](./linux/kernel/cross-toolchain.json)。
 - `build/gpgpu-kernel-host-tools/downloads/`：按 [cross-host-dependencies.json](./linux/kernel/cross-host-dependencies.json) 的 `file` 字段放置各包；工具链脚本使用同一清单校验。
 - `build/gpgpu-kernel-gpuvm/apk-cache/`：补充包按 [build-dependencies.json](./linux/kernel/build-dependencies.json) 的 `cache_name` 放置，URL 与 SHA-256 也在该清单中。
 
-基础环境的 `environment.json`、`developer.raw`、内核和 initramfs 由引导生成。引导逻辑的缓存与防覆盖回归入口为 `make -C software/gpgpu check-bootstrap`，本次通过 6/6。
+清理 `build/` 时，下面这些不能当作可重建的产物删除：
 
-2026-10-30 另用已校验 ISO 启动真实 AArch64 客体，离线提交全部 80 个固定依赖包，完成 74 项安装或升级操作，最终为 96 个已安装包，GCC 为 15.2.0。日志保存在 `build/gpgpu-linux-module/bootstrap-package-smoke.log`。该检查使用 ISO 自带的 `6.18.52-0-virt`，仅验证依赖安装；指定的 `6.18.57-0-virt` 开发盘生成与重启验证仍待两个内核包补齐后执行。
+- `build/gpgpu-linux-module/`：基础开发环境，`kernel-build.py` 默认从这里读取 `--base-environment`，其中两个内核包上游已经 404；
+- `build/gpgpu-kernel-gpuvm/`：Linux 全栈当前使用的内核环境和开发盘；
+- `build/gpgpu-validation/`：当前验证结果的记录；
+- `build/gpgpu-arm64-linux/` 中的 ISO，以及 `build/gpgpu-kernel/downloads/`、`build/gpgpu-kernel-toolchain/` 中已校验的源码包和工具链压缩包，删除后要重新联网下载。
 
 ## 6. 历史验收记录
 
 以下记录属于当时的固定提交与旧协议。旧测试源文件、运行入口和兼容实现已从当前代码删除；这些数量、命令和日志只用于查阅历史，不构成当前验收要求。
+
+本仓库主线做过一次提交历史重构，提交号全部改变，各提交的文件树不变。本节和 `docs/` 中的历史提交号都在旧主线上，旧主线保存在远端分支 `archive/main-before-contributors-cleanup-20261031`；删除这个分支会让这些固定提交链接失效。
 
 <a id="stage-three-validation"></a>
 

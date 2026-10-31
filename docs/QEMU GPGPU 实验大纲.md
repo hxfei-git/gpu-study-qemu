@@ -186,7 +186,7 @@ Queue 存活期间冻结绑定。关闭 GEM handle、解除 GPU 绑定和结束 
 
 使用 `make -f Makefile.gpgpu test-gpgpu-stack`，固定 ARM virt、A57、1 GiB、IOMMU=none，分别运行 `gpuvm=on` 和 `gpuvm=off`。两种状态采用同一流程与放置方式：代码、描述符和数组在 VRAM，参数和队列相关 Host 对象经 Outbound 访问。
 
-向量加法、矩阵乘法和 ReLU 沿用既有规模与逐元素比较规则，任一失败返回非零。示例规模、运行命令与实际结果见[软件栈说明](<../software/gpgpu/README.md#5-构建运行与本次结果>)。
+向量加法、矩阵乘法和 ReLU 沿用既有规模与逐元素比较规则，任一失败返回非零。示例规模、运行命令与实际结果见[软件栈说明](<../software/gpgpu/README.md#build-and-validation>)。
 
 本轮不增加 CSR、Outbound、协议或生命周期专项验收，不扩展多进程、IOMMU、存储位置或数据规模矩阵。SMMUv3 功能保留。
 

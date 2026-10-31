@@ -2102,11 +2102,11 @@ AMD 运行时也有独立的队列异常处理路径：对故障分类，暂停�
 
 现有教学设备已经能报告非法启动配置、Kernel 执行失败和 DMA 访问失败，但使用的是设备级 `ERROR_STATUS`。后续接入队列时，还需要让 CP 得到失败结果，并把能够归属到某条队列的错误记录到对应 HQD。原有设备级错误位不能直接当作已经实现的 `CP_HQD_ERROR` 位定义。
 
-> **[SOURCE]** 实验子仓库固定版本 `1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a`：
+> **[SOURCE]** 实验子仓库固定版本 `fd2719636bb903ee2815e359dc9af5af7f0202a4`：
 >
-> - 原有设备级错误位：[hw/gpgpu/gpgpu_regs.h](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_regs.h#L91-L97) 的 [91–97 行](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_regs.h#L91-L97)。
-> - 启动校验与执行失败处理：[hw/gpgpu/gpgpu_dispatch.c](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_dispatch.c#L14-L39) 的 [14–39 行](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_dispatch.c#L14-L39)。
-> - DMA 返回失败后的报错：[hw/gpgpu/gpgpu_dma.c](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_dma.c#L47-L75) 的 [47–75 行](https://github.com/hxfei-git/gpu-study-qemu/blob/1c41928fbeff4dcb4c9baddf9fd58a50a3d3133a/hw/gpgpu/gpgpu_dma.c#L47-L75)。
+> - 原有设备级错误位：[hw/gpgpu/gpgpu_regs.h](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_regs.h#L91-L97) 的 [91–97 行](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_regs.h#L91-L97)。
+> - 启动校验与执行失败处理：[hw/gpgpu/gpgpu_dispatch.c](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_dispatch.c#L14-L39) 的 [14–39 行](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_dispatch.c#L14-L39)。
+> - DMA 返回失败后的报错：[hw/gpgpu/gpgpu_dma.c](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_dma.c#L47-L75) 的 [47–75 行](https://github.com/hxfei-git/gpu-study-qemu/blob/fd2719636bb903ee2815e359dc9af5af7f0202a4/hw/gpgpu/gpgpu_dma.c#L47-L75)。
 
 <a id="error-mqd"></a>
 
