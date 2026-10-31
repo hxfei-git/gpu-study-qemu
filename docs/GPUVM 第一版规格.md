@@ -183,7 +183,7 @@ Queue B → VMID 2 → 页表 B
   → 返回数据或报告本次访问错误
 ```
 
-页大小固定为 4 KiB，表项为 64 位小端。采用三级页表，每张表按 4 KiB 对齐并占 4 KiB，共 512 项；根目录只使用前 4 项。表页按需分配在受保护 VRAM，用户不能改写。
+页大小固定为 4 KiB，表项为 64 位小端。采用三级页表，每张表按 4 KiB 对齐并占 4 KiB，共 512 项；根目录只使用前 4 项。驱动的表页按需分配在受保护 VRAM，用户不能改写；设备也能读取放在 Host 内存中的表页，由指向它的中间项置 SYSTEM 说明。
 
 ```text
 32 位 GPUVA
@@ -197,13 +197,34 @@ Queue B → VMID 2 → 页表 B
 
 例如 `0x0040_0000` 的三个索引依次为 0、2、0，页内偏移为 0。首次建立这条路径需要三张表，共 12 KiB；相邻页复用已有表。固定三级是本设备的配置。
 
-目录项保存 `VALID` 与下一级表的 GPU 物理地址。叶子项保存 bit 0 `VALID`、bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`；目标地址位为 `[31:12]`，掩码为 `0xffff_f000`，其余位填零。bit 1 不再定义 `SYSTEM`，设为 1 的旧表项被拒绝。
+目录项保存 bit 0 `VALID`、bit 1 `SYSTEM` 和下一级表的地址域。叶子项在此基础上再保存 bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`。地址域为 `[31:12]`，掩码为 `0xffff_f000`；bit 2 及其余未定义位保留，有效项中出现即报页表错误。
 
-Host 页先将 DMA API 返回的 IOVA 转为 `0x8000_0000 + IOVA`，再把该 GPU 物理页地址写入 PTE。页表根和中间表页也保存 GPU 物理地址，遍历通过公共物理入口读取，不递归进行 GPUVM 翻译。驱动当前从受保护 VRAM 分配表页，因此这些物理地址的数值等于 VRAM 偏移。
+SYSTEM 决定地址域的含义，设备据此换算出 GPU 物理页，再交给公共物理入口：
+
+```text
+叶子项 0x4100_2000 | SYSTEM | VALID | R | W
+  └─ SYSTEM=1：地址域是 Host IOVA 0x4100_2000
+       → 检查整页在 2 GiB IOVA 窗口内
+       → GPU 物理页 0x8000_0000 + 0x4100_2000 = 0xc100_2000 → Outbound
+
+叶子项 0x0001_1000 | VALID | R | X
+  └─ SYSTEM=0：地址域是 VRAM 偏移 0x0001_1000
+       → 检查整页在 VRAM 内，且避开首页和固件区
+       → GPU 物理页 0x0001_1000 → VRAM
+
+叶子项 0xc100_2000 | VALID | R
+  └─ SYSTEM=0，但地址域不在 64 MiB VRAM 内 → 页表错误
+```
+
+地址域与 SYSTEM 不一致时报页表错误，设备不按地址数值去猜它属于 VRAM 还是 Outbound。最后一个例子是版本 3 的写法：当时 PTE 直接保存 GPU 物理地址，bit 1 必须为 0。现在 bit 1 定义为 SYSTEM，Host 页的叶子项改存 IOVA 并置 SYSTEM。
+
+驱动给 Host 对象和通知页写叶子项时，直接使用 DMA API 返回的 IOVA 并置 SYSTEM；VRAM 对象写 VRAM 偏移。对象的 GPU 物理地址只用于 GPUVM 关闭时的直通访问和管理域字段。页表根没有 SYSTEM 位，上下文寄存器直接保存根页的 GPU 物理地址；根页位于 Host 时，Outbound 未使能则不能启用上下文。遍历通过公共物理入口读取表页，不递归进行 GPUVM 翻译。驱动只从受保护 VRAM 分配表页，写出的中间项都不带 SYSTEM。
 
 完整表项写入前校验对齐、位宽及目标范围，不能靠掩码隐藏非法地址。无效项写零，不支持的有效项编码报页表错误。代码页开放读与取指，参数和输入页开放读，输出及共享状态按需要开放读写；不同权限的对象分开占页。
 
-> **[SOURCE]** 固定 Linux 源码：[amdgpu_gart.h，第 35～38 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h#L35-L38)定义 4 KiB GPU 页；[amdgpu_vm.h，第 57～68 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h#L57-L68)定义 AMD 的有效、区域与权限位；[amdgpu_gmc.c，第 163～175 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c#L163-L175)将地址和标志写入 8 字节表项；[gmc_v9_0.c，第 1985～1994 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L1985-L1994)设置 48 位地址掩码，并对包含 9.4.3 的分支选择 48 位 DMA 能力。[amdgpu_vm.c，第 2392～2425 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c#L2392-L2425)按空间大小计算层级及末级大小。这些是参考实现的编码，版本 3 的 32 位物理地址、删除 SYSTEM 和固定三级格式是本设备设计，不声明与 AMD 硬件格式兼容。
+> **[SOURCE]** 固定 Linux 源码：[amdgpu_gart.h，第 35～38 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h#L35-L38)定义 4 KiB GPU 页；[amdgpu_vm.h，第 57～68 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h#L57-L68)定义 AMD 的有效、区域与权限位；[amdgpu_gmc.c，第 163～175 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c#L163-L175)将地址和标志写入 8 字节表项；[gmc_v9_0.c，第 1985～1994 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L1985-L1994)设置 48 位地址掩码，并对包含 9.4.3 的分支选择 48 位 DMA 能力。[amdgpu_vm.c，第 2392～2425 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c#L2392-L2425)按空间大小计算层级及末级大小。这些是参考实现的编码，32 位地址和固定三级格式是本设备设计，不声明与 AMD 硬件格式兼容。
+
+> **[SOURCE]** SYSTEM 位的参考：固定 Linux 源码 [amdgpu_vm.h，第 57～68 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h#L57-L68)把 bit 1 定义为 `AMDGPU_PTE_SYSTEM`；[amdgpu_vm.c，第 1200～1209 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c#L1200-L1209)映射系统内存时取页的 DMA 地址，映射显存时给偏移加上 VRAM 基址；[gmc_v9_0.c，第 1019～1024 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L1019-L1024)只对不带 SYSTEM 的目录项做显存地址换算。gem5 固定提交 `f5c5a6e390f55dd5984977815bf9d0bd05da6945` 的 [pagetable.hh，第 51～75 行](https://github.com/gem5/gem5/blob/f5c5a6e390f55dd5984977815bf9d0bd05da6945/src/arch/amdgpu/vega/pagetable.hh#L51-L75)在 PTE 和 PDE 的 bit 1 都定义了 `s` 字段。本设备只借用“bit 1 区分系统内存与显存”这层关系；地址域保存 IOVA、2 GiB 窗口和 32 位地址是本设备设计，不据此推定 MI300X 的表项格式或 TLB 参数。
 
 对象和块搬运可以跨页，每一页分别检查。单次标量访问要求自然对齐且不跨页，完整 32/64 位共享字段不能拆成部分写入。跨页操作后续失败时保留先前写入，不提供回滚。
 
@@ -335,7 +356,7 @@ IH 继续按源 MQD 查找原队列、上下文与事件。MQD 地址、事件�
 
 沿用 24 字节 Signal、64 位有符号值及 CP 单独执行 `1 → 0`。AQL 中的 Signal 地址与 Signal 中的 `event_mailbox_ptr` 使用所属上下文的 GPU 地址；开启时为 GPUVA，关闭时为 GPU 物理地址。
 
-每个 VM 在创建 Queue 前建立一个 4 KiB Host 通知页，内部 GPUVA 为 `0xffff_f000～0xffff_ffff`，提供 512 个 8 字节槽。关闭 GPUVM 时使用同一类通知页，返回其 Outbound 物理地址加槽偏移。映射由驱动维护，两种模式都初始化、清零和回收，不向应用开放改页表或 CPU 写通知页的接口。创建事件只分配已有槽，不改变页表；名额不足返回失败。
+每个 VM 在创建 Queue 前建立一个 4 KiB Host 通知页，内部 GPUVA 为 `0xffff_f000～0xffff_ffff`，提供 512 个 8 字节槽。开启 GPUVM 时，通知页按 Host 页映射，叶子项保存它的 IOVA 并置 SYSTEM；关闭时使用同一类通知页，返回其 Outbound 物理地址加槽偏移。映射由驱动维护，两种模式都初始化、清零和回收，不向应用开放改页表或 CPU 写通知页的接口。创建事件只分配已有槽，不改变页表；名额不足返回失败。
 
 ```text
 驱动创建事件 → 返回事件编号和通知槽 GPU 地址

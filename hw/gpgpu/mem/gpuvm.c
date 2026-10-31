@@ -70,7 +70,46 @@ static bool vm_page_valid(GPGPUState *s, uint64_t addr)
 }
 
 /*
- * vm_walk() - 同步遍历 vmid 的三级页表，取得 va 所在页的叶子项
+ * vm_entry_page() - 求表项所指页的 GPU 物理基址
+ *
+ * 中间项指向下一级表页，叶子项指向数据页，地址域都按 SYSTEM 解释：
+ *
+ *   SYSTEM=1   地址域是 Host IOVA 页，GPU 物理页 = GPGPU_OUTBOUND_BASE + IOVA
+ *   SYSTEM=0   地址域是 VRAM 偏移，GPU 物理页就是地址域
+ *
+ * 例：0x4100_2000 | SYSTEM 得到 0xc100_2000；SYSTEM=0 的 0xc100_2000 不在
+ * 64 MiB VRAM 内，视为页表损坏。
+ *
+ * 1. 地址域必须落在 SYSTEM 指明的范围内：整页在 2 GiB IOVA 窗口内，或整页
+ *    在 VRAM 内。只靠第 2 步会把 SYSTEM=0、地址落在 Outbound 的项当成
+ *    合法 Host 页；
+ * 2. 换算后的物理页仍须可路由（Host 页要求窗口已使能），
+ *    且避开 VRAM 首页与固件保留区。
+ *
+ * Return: 0 并写入 *phys，否则为 GPGPU_VM_FAULT_TABLE。
+ */
+static uint32_t vm_entry_page(GPGPUState *s, uint64_t entry, uint64_t *phys)
+{
+	uint64_t addr = entry & GPGPU_VM_ADDR_MASK;
+
+	/* 1. 按 SYSTEM 检查地址域并换算成 GPU 物理页。 */
+	if (entry & GPGPU_VM_SYSTEM) {
+		if (!gpgpu_range_ok(addr, GPGPU_VM_PAGE_SIZE, GPGPU_OUTBOUND_SIZE))
+			return GPGPU_VM_FAULT_TABLE;
+		addr += GPGPU_OUTBOUND_BASE;
+	} else if (!gpgpu_vram_contains(s, addr, GPGPU_VM_PAGE_SIZE)) {
+		return GPGPU_VM_FAULT_TABLE;
+	}
+
+	/* 2. 与页表根相同的用户可见性检查。 */
+	if (!vm_page_valid(s, addr))
+		return GPGPU_VM_FAULT_TABLE;
+	*phys = addr;
+	return 0;
+}
+
+/*
+ * vm_walk() - 同步遍历 vmid 的三级页表，取得 va 所在页的物理页与权限
  *
  * TLB 未命中时由 vm_lookup() 调用。32 位 GPUVA 按下面的方式拆成三级索引
  * 和页内偏移，每级页表都占一个 4 KiB 物理页，表项为 8 字节小端值：
@@ -80,8 +119,10 @@ static bool vm_page_valid(GPGPUState *s, uint64_t addr)
  *   项数     4          512        512
  *
  * 表项格式：位 31..12 是下一级页表页（L0、L1）或目标数据页（L2）的
- * GPU 物理页基址；位 0 为 VALID；只有 L2 叶子项可以带 X(4)、R(5)、W(6)
- * 权限位，其余位必须为 0。
+ * 地址域，由位 1 SYSTEM 决定是 Host IOVA 还是 VRAM 偏移（见
+ * vm_entry_page()）；
+ * 位 0 为 VALID；只有 L2 叶子项可以带 X(4)、R(5)、W(6) 权限位，其余位
+ * 必须为 0。
  *
  * 例：va = 0x8000_1234 依次取 L0[2]、L1[0]、L2[1]。L2[1] 给出数据页基址，
  * 调用者再加上页内偏移 0x234 得到最终物理地址。
@@ -95,11 +136,15 @@ static bool vm_page_valid(GPGPUState *s, uint64_t addr)
  * 3. VALID 为 0 说明这段地址没有映射，记 UNMAPPED 故障；
  * 4. 表项带有本级不允许的位（中间项带权限位，或任一级带保留位）
  *    说明页表内容损坏，记 TABLE 故障；
- * 5. 取出位 31..12 作为下一级表页。到 L2 时它是数据页，同样检查
- *    后把整个叶子项交给调用者。
+ * 5. 按 SYSTEM 把地址域换算成 GPU 物理页，作为下一级表页；到 L2 时它是
+ *    数据页，换算后连同权限交给调用者。地址域与 SYSTEM 不符记 TABLE
+ *    故障。
  *
  * 函数只读页表，不检查本次访问的 R/W/X 权限，也不写 TLB，这两件事由
  * vm_translated_rw() 和 vm_lookup() 完成。
+ *
+ * *pte 写入解析后的叶子：GPU 物理页 | VALID | 权限，地址位已是 GPU
+ * 物理地址，不再带 SYSTEM。
  *
  * Return: 0 表示成功并写入 *pte，否则为 GPGPU_VM_FAULT_TABLE 或
  * GPGPU_VM_FAULT_UNMAPPED。
@@ -113,10 +158,12 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *pte
 		bool leaf = level == VM_LEVELS - 1;
 		/* 1. L0 取 va[31:30]，L1 取 va[29:21]，L2 取 va[20:12]。 */
 		uint32_t index = (va >> vm_level_shift[level]) & vm_level_mask[level];
-		/* 本级允许的位：中间项为地址和 VALID，叶子项再加 R/W/X。 */
-		uint64_t allowed = GPGPU_VM_ADDR_MASK | (leaf ? GPGPU_VM_FLAGS : GPGPU_VM_VALID);
+		/* 本级允许的位：中间项为地址、VALID、SYSTEM，叶子加 R/W/X。 */
+		uint64_t allowed = GPGPU_VM_ADDR_MASK |
+				   (leaf ? GPGPU_VM_FLAGS : GPGPU_VM_DIR_FLAGS);
 		uint8_t raw[VM_PTE_SIZE];
 		uint64_t entry;
+		uint32_t reason;
 
 		/* 2. 表页必须是用户可见的物理页，读出本级第 index 项。 */
 		if (!vm_page_valid(s, table) ||
@@ -133,22 +180,21 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *pte
 
 		/*
 		 * 4. 表项带有本级不允许的位：中间项带了 R/W/X，
-		 *    或任一级带了地址以外的高位、保留位。驱动不会
-		 *    写出这样的项，视为页表损坏。
+		 *    或任一级带了地址以外的高位、保留位（含 bit 2）。
+		 *    驱动不会写出这样的项，视为页表损坏。
 		 */
 		if (entry & ~allowed)
 			return GPGPU_VM_FAULT_TABLE;
 
 		/*
-		 * 5. 中间级：取下一级表页，下一轮循环再检查它。
-		 *    叶子级：取目标数据页，在这里检查后返回整个叶子项。
+		 * 5. 中间级：换算出下一级表页，下一轮循环读取它。
+		 *    叶子级：换算出目标数据页，连同权限返回。
 		 */
-		table = entry & GPGPU_VM_ADDR_MASK;
-		if (leaf) {
-			if (!vm_page_valid(s, table))
-				return GPGPU_VM_FAULT_TABLE;
-			*pte = entry;
-		}
+		reason = vm_entry_page(s, entry, &table);
+		if (reason)
+			return reason;
+		if (leaf)
+			*pte = table | GPGPU_VM_VALID | (entry & GPGPU_VM_PERMS);
 	}
 	return 0;
 }
@@ -157,7 +203,8 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *pte
  * vm_lookup() - 查 TLB，未命中时遍历页表并填回
  *
  * TLB 是 64 项直接映射，下标为 (页号 ^ vmid) % 64；项中保存 vmid、页号
- * 和叶子 PTE。pte 为 0 表示空项，合法叶子项至少带 VALID，不会为 0。
+ * 和 vm_walk() 解析后的叶子（GPU 物理页 | VALID | 权限）。pte 为 0 表示
+ * 空项，解析后的叶子至少带 VALID，不会为 0。
  * 只缓存成功的翻译，故障不进 TLB，下次访问会重新遍历页表。
  * Host 修改页表后必须写 INVALIDATE 清掉该 vmid 的全部项。
  *

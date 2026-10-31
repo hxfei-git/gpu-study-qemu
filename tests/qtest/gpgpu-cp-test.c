@@ -701,10 +701,13 @@ static void test_fault_scope(void)
 #define VM_DESC 0x00400000U
 #define VM_CODE 0x00401000U
 #define VM_DATA 0x00402000U
+/* test_gpuvm_system() 把一张 L2 表搬到这个 Host 页，经 SYSTEM 中间项访问。 */
+#define VM_HOST_TABLE (QUEUE_HOST + 0xd000)
 
 /*
- * 一页用户映射：va 是 GPUVA，target 是物理页地址，flags 是 R/W/X 权限位。
- * VRAM 页的物理地址就是 VRAM 偏移，Host 页写 GPA()。
+ * 一页用户映射：va 是 GPUVA，target 是叶子项的地址域，flags 是 SYSTEM 与
+ * R/W/X 位。VRAM 页写 VRAM 偏移；Host 页写 Host IOVA 并带 SYSTEM，设备
+ * 按 GPA() 访问。
  */
 typedef struct VmMapping {
 	uint32_t va;
@@ -742,6 +745,20 @@ static uint32_t vm_leaf(CPTest *s, uint32_t va, uint32_t *next_table)
 	return table + ((va >> 12) & 511) * 8;
 }
 
+/* 同步失效 VMID 1 的全部 TLB 项并要求确认；调用时槽 2 不能激活。 */
+static void vm_invalidate(CPTest *s)
+{
+	wr(s, GPGPU_REG_VM_INVALIDATE, 1);
+	g_assert_cmpuint(rd(s, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
+}
+
+/* 经 HIQ 卸载用户队列 slot 并要求成功；故障队列同样可以卸载。 */
+static void queue_unmap(CPTest *s, unsigned int slot)
+{
+	g_assert_cmpuint(queue_manage(s, 1, GPGPU_UNMAP_QUEUES, GPA(QUEUE_MQD(slot))), ==,
+			 GPGPU_MANAGEMENT_OK);
+}
+
 /*
  * vm_prepare() - 建立 VMID 1 的地址空间并映射用户队列（槽 2）
  * @code_flags: 代码页权限，用于构造取指权限故障。
@@ -755,12 +772,13 @@ static uint32_t vm_leaf(CPTest *s, uint32_t va, uint32_t *next_table)
 static void vm_prepare(CPTest *s, uint64_t code_flags)
 {
 	const uint64_t rw = GPGPU_VM_READ | GPGPU_VM_WRITE;
+	const uint64_t host = GPGPU_VM_SYSTEM;
 	const VmMapping maps[] = {
-		{ VM_RING, GPA(QUEUE_RING(2)), rw },
-		{ VM_PROGRESS, GPA(QUEUE_WPTR(0)), rw },
-		{ VM_ARGS, GPA(QUEUE_ARGS(0)), GPGPU_VM_READ },
-		{ VM_SIGNAL, GPA(QUEUE_SIGNAL(0)), rw },
-		{ GPGPU_VM_NOTIFY_VA, GPA(QUEUE_MAILBOX(0)), rw },
+		{ VM_RING, QUEUE_RING(2), host | rw },
+		{ VM_PROGRESS, QUEUE_WPTR(0), host | rw },
+		{ VM_ARGS, QUEUE_ARGS(0), host | GPGPU_VM_READ },
+		{ VM_SIGNAL, QUEUE_SIGNAL(0), host | rw },
+		{ GPGPU_VM_NOTIFY_VA, QUEUE_MAILBOX(0), host | rw },
 		{ VM_DESC, KERNEL_DESC, GPGPU_VM_READ },
 		{ VM_CODE, KERNEL_CODE, code_flags },
 		{ VM_DATA, KERNEL_OUT, rw },
@@ -774,8 +792,8 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 
 	/*
 	 * 1. 从 VM_ROOT 起清零 8 页，作为根表和按需分配的中间表、
-	 *    叶子表；再为 maps 中的每页写叶子项：物理页地址、权限位
-	 *    和 VALID。
+	 *    叶子表；再为 maps 中的每页写叶子项：地址域、SYSTEM 与
+	 *    权限位，以及 VALID。
 	 */
 	for (uint32_t off = 0; off < 8 * GPGPU_VM_PAGE_SIZE; off += 8)
 		qpci_io_writeq(s->dev, s->vram, VM_ROOT + off, 0);
@@ -789,8 +807,7 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 	 *    说明配置成功。
 	 */
 	wr(s, GPGPU_REG_VM_CONTEXT(1) + GPGPU_VM_ROOT_LO, VM_ROOT);
-	wr(s, GPGPU_REG_VM_INVALIDATE, 1);
-	g_assert_cmpuint(rd(s, GPGPU_REG_VM_STATUS), ==, GPGPU_VM_ACK);
+	vm_invalidate(s);
 	wr(s, GPGPU_REG_VM_CONTEXT(1) + GPGPU_VM_ENABLE, 1);
 	g_assert_cmphex(rd(s, GPGPU_REG_ERROR_STATUS), ==, 0);
 
@@ -803,10 +820,15 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 	queue_map(s, 2);
 }
 
-/* 在槽 2 提交 task 0，包中所有地址都是 VMID 1 下的 GPUVA。 */
-static void vm_submit(CPTest *s)
+/*
+ * 在槽 2 提交第 number 个包，执行 task，Kernel 把结果写到 GPUVA out。
+ * 包中所有地址都是 VMID 1 下的 GPUVA；task 的 Signal、通知槽和参数块
+ * 与 QUEUE_SIGNAL()、QUEUE_MAILBOX()、QUEUE_ARGS() 同页同偏移。
+ */
+static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint32_t out)
 {
-	aql_submit(s, 2, 0, 0, VM_DESC, VM_ARGS, VM_SIGNAL, GPGPU_VM_NOTIFY_VA, VM_DATA);
+	aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + 8 * task, VM_SIGNAL + 32 * task,
+		   GPGPU_VM_NOTIFY_VA + 8 * task, out);
 }
 
 /*
@@ -822,7 +844,7 @@ static void test_gpuvm_translation(void)
 	CPTest s = { 0 };
 
 	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
-	vm_submit(&s);
+	vm_submit(&s, 0, 0, VM_DATA);
 	wait_host32(&s, QUEUE_RPTR(2), 1);
 	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
 	assert_retired(&s, 2, 0, 0);
@@ -855,7 +877,7 @@ static void test_gpuvm_exec_fault(void)
 	CPTest s = { 0 };
 
 	vm_prepare(&s, GPGPU_VM_READ);
-	vm_submit(&s);
+	vm_submit(&s, 0, 0, VM_DATA);
 	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_PERMISSION);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_VMID), ==, 1);
@@ -869,6 +891,72 @@ static void test_gpuvm_exec_fault(void)
 	cp_stop(&s);
 }
 
+/*
+ * test_gpuvm_system() - 页表项 SYSTEM 位的地址解释
+ *
+ * 准备：vm_prepare() 建好 VMID 1 后卸载槽 2，把 Ring、进度、参数和 Signal
+ * 所在的 L2 表从 VRAM 复制到 Host 页 VM_HOST_TABLE，L1 项改为
+ * “IOVA | SYSTEM | VALID”。之后每次改表都先卸载槽 2，失效后再映射。
+ *
+ * 期望：
+ * 1. 经 Host 中间表也能完成派发，结果写到 VRAM KERNEL_OUT；
+ * 2. 参数页叶子写成 v3 风格的 GPU 物理地址 GPA()、不带 SYSTEM：地址落在
+ *    Outbound 而不在 VRAM，执行器读参数时记 TABLE 故障。空洞地址本来就
+ *    不可路由，测不出 SYSTEM 与地址域的匹配检查，所以不用它；
+ * 3. 参数页叶子恢复 SYSTEM 但置保留位 bit 2，同样记 TABLE 故障。
+ */
+static void test_gpuvm_system(void)
+{
+	const uint64_t fault = GPGPU_REG_VM_FAULT(2);
+	const uint64_t args_leaf = VM_HOST_TABLE + ((VM_ARGS >> 12) & 511) * 8;
+	const uint64_t args_ok = QUEUE_ARGS(0) | GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_VALID;
+	CPTest s = { 0 };
+	uint8_t table[GPGPU_VM_PAGE_SIZE];
+	uint64_t l1_entry;
+	uint64_t l2;
+
+	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
+	queue_unmap(&s, 2);
+
+	/* 1. L0[0] 指向 L1 表，L1[0] 指向覆盖 VA [0, 2 MiB) 的 L2 表。 */
+	l1_entry = (qpci_io_readq(s.dev, s.vram, VM_ROOT + ((VM_RING >> 30) & 3) * 8) &
+		    GPGPU_VM_ADDR_MASK) + ((VM_RING >> 21) & 511) * 8;
+	l2 = qpci_io_readq(s.dev, s.vram, l1_entry) & GPGPU_VM_ADDR_MASK;
+	qpci_memread(s.dev, s.vram, l2, table, sizeof(table));
+	qtest_memwrite(s.host, VM_HOST_TABLE, table, sizeof(table));
+	qpci_io_writeq(s.dev, s.vram, l1_entry, VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_VALID);
+	vm_invalidate(&s);
+	queue_map(&s, 2);
+	vm_submit(&s, 0, 0, VM_DATA);
+	wait_host32(&s, QUEUE_RPTR(2), 1);
+	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+
+	/* 2. SYSTEM=0 的叶子按 VRAM 偏移解释，0xc100_b000 超出 VRAM。 */
+	queue_unmap(&s, 2);
+	qtest_writeq(s.host, args_leaf, GPA(QUEUE_ARGS(0)) | GPGPU_VM_READ | GPGPU_VM_VALID);
+	vm_invalidate(&s);
+	queue_map(&s, 2);
+	vm_submit(&s, 1, 1, VM_DATA);
+	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
+	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_TABLE);
+	g_assert_cmphex(rd(&s, fault + GPGPU_VM_FAULT_ADDR_LO), ==, VM_ARGS + 8);
+
+	/*
+	 * 3. 故障队列卸载后清除故障记录，重写 MQD 去掉 saved_error，
+	 *    W、R 从 0 开始。bit 2 是保留位，有效项中出现即为页表损坏。
+	 */
+	queue_unmap(&s, 2);
+	wr(&s, fault + GPGPU_VM_FAULT_CLEAR, 1);
+	queue_mqd_at(&s, 2, VM_RING, VM_PROGRESS + 40, VM_PROGRESS + 32);
+	qtest_writeq(s.host, args_leaf, args_ok | (1ULL << 2));
+	vm_invalidate(&s);
+	queue_map(&s, 2);
+	vm_submit(&s, 0, 2, VM_DATA);
+	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
+	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_TABLE);
+	cp_stop(&s);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -877,5 +965,6 @@ int main(int argc, char **argv)
 	qtest_add_func("/gpgpu/cp/fault-scope", test_fault_scope);
 	qtest_add_func("/gpgpu/cp/gpuvm-translation", test_gpuvm_translation);
 	qtest_add_func("/gpgpu/cp/gpuvm-exec-fault", test_gpuvm_exec_fault);
+	qtest_add_func("/gpgpu/cp/gpuvm-system", test_gpuvm_system);
 	return g_test_run();
 }

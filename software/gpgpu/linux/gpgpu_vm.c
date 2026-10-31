@@ -4,7 +4,8 @@
  *
  * 每个会话在第一次绑定对象时取得一个用户 VMID 和一页通知页：
  *   gpuvm=on   建立三级页表（表页从 VRAM 分配），通知页映射到 GPGPU_VM_NOTIFY_VA；
- *              对象绑定到应用给出的 GPUVA；
+ *              对象绑定到应用给出的 GPUVA。Host 页的叶子项写 IOVA 并置
+ *              SYSTEM，VRAM 页写 VRAM 偏移；
  *   gpuvm=off  不建页表，对象的 GPU 地址就是它的 GPU 物理地址。
  *
  * 修改页表后必须同步失效 TLB 并读到 ACK，才能放下旧映射的引用。失效失败时
@@ -59,7 +60,8 @@ static int vm_table_alloc(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 *of
  *
  * 经 BAR2 读写页表：从根开始依次用 VA[31:30]、VA[29:21] 索引 L0、L1，
  * 中间项有效就进入下一级表页，缺失时按 @create 分配新表页（已清零）并
- * 写入只含 VALID 的中间项。最后用 VA[20:12] 算出 L2 叶子项的偏移。
+ * 写入只含 VALID 的中间项。驱动的表页都在 VRAM，中间项不带 SYSTEM，
+ * 地址域就是 BAR2 偏移。最后用 VA[20:12] 算出 L2 叶子项的偏移。
  */
 static int vm_leaf(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 va, bool create,
 		   u32 *offset)
@@ -100,22 +102,24 @@ static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 }
 
 /*
- * 写 [va, va + size) 的叶子 PTE：target 为对象的 GPU 物理地址，逐页写入
- * “物理页 | VALID | 权限”；target 为 0 表示撤销映射，把叶子项清零，
- * 中间级本就不存在的页跳过。写完后由调用者失效 TLB。
+ * 写 [va, va + size) 的叶子 PTE：flags 非零时逐页写入
+ * “(page + 偏移) | VALID | flags”，page 是地址域起点，Host 对象为 IOVA 且
+ * flags 带 SYSTEM，VRAM 对象为 VRAM 偏移。flags 为 0 表示撤销映射，把叶子
+ * 项清零，中间级本就不存在的页跳过。是否撤销看 flags 而不看 page：IOVA 0
+ * 是合法的 Host 页。写完后由调用者失效 TLB。
  */
 static int vm_set_ptes(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size,
-		       u64 target, u32 permissions)
+		       u64 page, u64 flags)
 {
 	for (u64 i = 0; i < size; i += PAGE_SIZE) {
 		u32 leaf;
-		int ret = vm_leaf(dev, vm, va + i, target != 0, &leaf);
+		int ret = vm_leaf(dev, vm, va + i, flags != 0, &leaf);
 
-		if (ret == -ENOENT && !target)
+		if (ret == -ENOENT && !flags)
 			continue;
 		if (ret)
 			return ret;
-		writeq(target ? (target + i) | GPGPU_VM_VALID | permissions : 0, dev->vram + leaf);
+		writeq(flags ? (page + i) | GPGPU_VM_VALID | flags : 0, dev->vram + leaf);
 	}
 	return 0;
 }
@@ -132,8 +136,8 @@ static int vm_enable_translation(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 
 	ret = vm_table_alloc(dev, vm, &vm->root);
 	if (!ret)
-		ret = vm_set_ptes(dev, vm, GPGPU_VM_NOTIFY_VA, PAGE_SIZE, vm->notify.addr,
-				  GPGPU_VM_READ | GPGPU_VM_WRITE);
+		ret = vm_set_ptes(dev, vm, GPGPU_VM_NOTIFY_VA, PAGE_SIZE, vm->notify.dma,
+				  GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_WRITE);
 	if (ret)
 		return ret;
 
@@ -266,9 +270,17 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	if (!dev->gpuvm)
 		return 0;
 
-	/* 4. 写叶子 PTE，再失效 TLB，设备才会看到新映射。 */
-	ret = vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
-			  args->permissions);
+	/*
+	 * 4. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
+	 *    IOVA 并置 SYSTEM，VRAM 对象写 VRAM 偏移；bo->phys_addr 仍是
+	 *    GPU 物理地址。
+	 */
+	if (bo->kind == GPGPU_MEMORY_HOST)
+		ret = vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
+				  GPGPU_VM_SYSTEM | args->permissions);
+	else
+		ret = vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
+				  args->permissions);
 	if (ret) {
 		vm->failed = true;
 		return ret;
