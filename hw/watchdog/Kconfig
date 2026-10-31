@@ -24,6 +24,3 @@ config WDT_SBSA
 config ALLWINNER_WDT
     bool
     select PTIMER
-
-config G233_WDT
-    bool
