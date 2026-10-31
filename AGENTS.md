@@ -23,8 +23,29 @@ GPGPU 不需要 Rust 和 `bindgen-cli`。
 - `make -f Makefile.gpgpu build JOBS=4`：构建两个 QEMU、两个 QTest 程序和 RV64 CP 固件；首次构建自动配置。
 - `make -f Makefile.gpgpu test-gpgpu-qtest`：运行 GPGPU 寄存器与 CP 队列 QTest。
 - `make -f Makefile.gpgpu test-gpgpu-stack`：在 Linux 客体中验证 GPUVM 开、关两种模式，需要先准备客体环境。
-- `make -C software/gpgpu check-configure`：运行独立 QEMU 配置入口的回归，不需要客体内核或网络。
 - `build/arm64-qemu/qemu-system-riscv64 -machine help`：列出可用机器类型。
+
+## 脚本、校验与验证的精简
+
+脚本、测试和验证项只覆盖最核心的行为。检查写得过多、过细，调整一个本该修改的参数也会连带报错，
+重复的检查还要在多处同步维护。
+
+本节约束仓库中保存的脚本、测试用例与断言、脚本对环境和参数的前置检查，以及计划中的验证项。
+产品代码中的输入检查与错误处理、其他规则要求的交付前核对，以及已完成验证的实际记录，
+不在本节范围内。
+
+- 默认不新增、不修改脚本、测试用例和验证项。检查优先并入已有的构建、测试入口或验证项，
+  或在终端用单条命令完成。只有检查保护核心功能，且现有入口和验证项无法覆盖时，才新增；
+  当前任务必须修改时，只改必需的部分。新增或修改的内容保持短小，一个脚本、用例或验证项
+  只检查一件事，理由在回复中说明；
+- 每项检查都要能说出它防止什么错误。只断言对外可见的结果、接口约定和用户明确要求的结论，
+  不为措辞、排版、内部中间步骤、日志内容或可调参数的具体取值写断言。计划中的验证项
+  同样只写核心结果，不写死会随参数或用例增减而变化的数量；
+- 参数、常量和路径引用其唯一定义处，或从中推导，不在脚本、测试和验证项中硬编码副本；
+  同一事实只在一处检查；
+- 一次性的核对直接在终端运行，在回复中报告结果，不留在仓库中；
+- 已有的脚本、用例或验证项妨碍正常的参数调整，或与其他检查重复时，直接删减或合并，
+  不继续追加特例，并在回复中说明。
 
 ## 代码修改与语言约束
 
@@ -313,7 +334,7 @@ Clippy 的 Meson 开发环境配置见 `docs/devel/rust.rst`。
 使用 TCG 裸机测试、基于 GLib 的 QTest/QOS 测试和原生 Rust 单元测试。
 指令测试命名为 `test-insn-*.c`，外设测试命名为 `test-*.c`，
 Rust 测试函数命名为 `test_*`。新增测试登记到对应的 Meson 或 Makefile 列表。
-覆盖修改的行为和回归场景；实验未规定覆盖率百分比。
+只覆盖修改涉及的核心行为；实验未规定覆盖率百分比。
 运行受影响的测试集，并核对通过数量和日志：评分脚本与 CI 可能在有失败项时仍返回成功。
 
 ## 提交与拉取请求要求
@@ -395,8 +416,8 @@ VMID、同步 TLB 失效及安全回收。保留 RV32 控制页
 固定实现提交、复现命令和实际日志见[软件栈说明](software/gpgpu/README.md#stage-three-validation)。
 
 运行 `make -f Makefile.gpgpu test-gpgpu-stack` 验证 ARM64 Linux 软件栈，
-运行 `make -f Makefile.gpgpu test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列
-（11 项），运行 `make -C software/gpgpu check` 验证 RV32 汇编器；
+运行 `make -f Makefile.gpgpu test-gpgpu-qtest` 验证设备寄存器与 RV64 CP 队列，
+运行 `make -C software/gpgpu check` 验证 RV32 汇编器；
 Linux `6.18.57-0-gpgpu-virt` 重建命令见软件栈 README。
 核对测试数量与日志，不能仅凭评分脚本退出状态判断全部通过。
 

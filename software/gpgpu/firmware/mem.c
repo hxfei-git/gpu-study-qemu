@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * CP 固件：经访存窗口读写 GPU 地址，以及访存异常的恢复
  *

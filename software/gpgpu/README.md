@@ -197,12 +197,10 @@ make -f Makefile.gpgpu test-gpgpu-stack
 设备与固件另有一组不需要 Linux 客体的回归：
 
 ```sh
-# 寄存器级 6 项（进程内设备）与 RV64 CP 队列 5 项（双进程），按 TAP 核对 11/11
+# 运行设备寄存器与双进程 CP 队列回归，核对 TAP 计划及结果
 make -f Makefile.gpgpu test-gpgpu-qtest
 # RV32 教学汇编器的编码回归
 make -C software/gpgpu check
-# 独立配置入口回归，模拟子进程，不启动 QEMU 或客体
-make -C software/gpgpu check-configure
 ```
 
 `configure` 与 Linux 入口共用 `gpgpu_linux.py` 中的一份配置参数。`build` 和 `test-gpgpu-qtest` 在缺少 `build.ninja` 时自动配置；也可用 `GPGPU_BUILD_DIR=build/verify-qemu` 验证另一份构建，不覆盖默认目录。这个变量不改变 Linux 全栈使用的 `build/arm64-qemu`。
@@ -212,7 +210,7 @@ make -C software/gpgpu check-configure
 本轮构建入口整改的验证结果如下，日志位于 `build/remediation-stage1/`：
 
 - 在全新目录 `build/verify-qemu` 配置、构建两个 QEMU 和两个 QTest 程序成功；无需客体内核，也未复用旧构建目录的 Python 环境。
-- 真实 QTest 11/11、汇编器 7/7、基础环境引导回归 6/6、独立配置入口回归 7/7。另用模拟程序验证 Makefile 的失败传播、通过数量、跳过标记和首次自动配置，共 8/8；这组模拟检查不计入真实 QTest 数量。
+- 真实 QTest 11/11、汇编器 7/7、基础环境引导回归 6/6。独立配置与首次构建直接使用现有 Make 入口验证，不维护额外的模拟配置测试脚本。
 - 2026-10-31 00:13:59 UTC 完成版本 3 的 Linux 全栈验证。复用已校验的 `6.18.57-0-gpgpu-virt` 开发环境并重编驱动；GPUVM 开、关均完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，每种模式 3/3，客体退出码均为 0。脚本已检查设备返回的 ABI、GPUVM 状态与客体内核日志。
 - 固件 SHA-256 为 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，与整改前现场重建的基线一致。
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 1. 规则来源与父仓库
 
-上面一行导入本仓库的 `AGENTS.md`。C 代码风格、三级注释、测试要求、
+上面一行导入本仓库的 `AGENTS.md`。C 代码风格、三级注释、测试要求、脚本与验证的精简原则、
 “子系统：具体修改”的提交标题和当前 GPGPU 实验状态都以它为准；本文件只补充
 跨文件的软件栈结构和 GPGPU 专用命令。规则要改时，改 `AGENTS.md`，
 不在这里另存一份。
@@ -78,7 +78,7 @@ hw/gpgpu/ + firmware/   QEMU 设备模型与 RV64 CP 裸机固件；RV32 执行�
 make -f Makefile.gpgpu configure
 make -f Makefile.gpgpu build JOBS=4
 
-# 设备寄存器 6 项、RV64 CP 队列 5 项：先构建固件和 QEMU，再按 TAP 核对 11/11
+# 设备寄存器与 RV64 CP 队列：先构建固件和 QEMU，再按 TAP 核对全部用例通过
 make -f Makefile.gpgpu test-gpgpu-qtest
 
 # 只运行一个用例：GLib 的 -p 选择用例路径，路径见测试文件末尾的 qtest_add_func
@@ -93,9 +93,8 @@ make -C software/gpgpu                  # 用户库、gpgpu-demo 与三个 RV32 
 make -C software/gpgpu/firmware         # RV64 CP 固件 build/gpgpu-firmware/gpgpu-cp.bin
 make -C software/gpgpu check            # RV32 教学汇编器回归
 make -C software/gpgpu check-bootstrap  # 基础环境引导脚本回归
-make -C software/gpgpu check-configure  # 独立 QEMU 配置入口回归，不启动客体
 
-# Linux 全栈：GPUVM 开、关各运行一次三个计算示例；缺少内核环境时在检查阶段退出
+# Linux 全栈：GPUVM 开、关各运行一次全部计算示例；缺少内核环境时在检查阶段退出
 make -f Makefile.gpgpu test-gpgpu-stack
 make -C software/gpgpu/linux run IOMMU=smmuv3 GPUVM=off   # 启动客体并进入交互 shell
 make -C software/gpgpu/linux module                       # 在开发客体中重编驱动模块
