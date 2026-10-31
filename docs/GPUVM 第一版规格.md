@@ -17,6 +17,8 @@
 | PDE    | Page Directory Entry                                   | 页目录项，定位下一级页表                                    |
 | GART   | Graphics Address Remapping Table                       | 图形地址重映射表；用于说明 AMDGPU 管理上下文的翻译          |
 | MMU    | Memory Management Unit                                 | 内存管理单元                                                |
+| LRU    | Least Recently Used                                    | 最久未用；TLB 组内最先被替换的一路                          |
+| MRU    | Most Recently Used                                     | 最近使用；TLB 组内刚用过的一路                              |
 | TLB    | Translation Lookaside Buffer                           | 地址翻译缓存                                                |
 | VPN    | Virtual Page Number                                    | 虚拟页号，即 GPUVA 除以 4 KiB                               |
 | VMID   | Virtual Memory Identifier                              | 设备虚拟地址空间标识；用于选择页表上下文                    |
@@ -339,7 +341,7 @@ CP 读取描述对象 → 保存代码、参数地址及长度、VMID、HQD 槽�
   → 允许新 Queue 使用映射，或释放已撤销映射的引用
 ```
 
-**[DESIGN]** TLB 共 64 组、每组 4 路，按 VMID 和 VPN（GPUVA 的 `[31:12]`）区分缓存项，组号为 VPN % 64。每项保存 GPU 物理页和读、写、取指权限，只缓存叶子翻译，不缓存中间表。命中时该路成为最近使用的一路；未命中时遍历页表，成功后先填本组的无效路，四路都有效时替换最久未用的一路，遍历失败不填。例如 VPN 5、69、133、197 都落在第 5 组，依次访问后四路占满；再访问 VPN 261 时替换最早访问的 VPN 5。设备另有命中、未命中和替换三个只读计数，全设备共用、32 位回绕，复位时清零，失效不清零。组相联结构参照 ARM 的通用做法，组数、路数和替换策略是本设备的取值，不代表 MI300X UTCL1/UTCL2 的参数。
+TLB 按 VMID 和 VPN（GPUVA 的 `[31:12]`）缓存叶子翻译，组织方式与替换顺序见[第 5.2.1 节](#gpuvm-tlb-lru)。
 
 驱动每次只请求一个 VMID。以失效 VMID 1 中 GPUVA `0x0040_0000～0x0040_2fff` 为例：先写 `VM_INV_VPN_START = 0x400`、`VM_INV_VPN_END = 0x402`，再写 `VM_INV_REQ` 为 VMID 1 的位加 RANGE，设备在这次寄存器写入内清除 VMID 1 中 VPN 落在 `0x400～0x402` 的项，`VM_INV_ACK` 读回 `0x2`。请求含保留位、位图为空、范围非法，或所选上下文仍有激活的队列或在途访问时，设备整体拒绝，不清任何项，ACK 只置 ERROR。失效结束保证后续请求使用更新后的翻译，旧数据请求则必须已由队列卸载协议确认结束。
 
@@ -348,6 +350,81 @@ CP 读取描述对象 → 保存代码、参数地址及长度、VMID、HQD 槽�
 > **[SOURCE]** 固定 Linux 源码：[amdgpu_vm_cpu.c，第 73～135 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.c#L73-L135)提供 CPU 写表与发布路径；[gmc_v9_0.c，第 776～879 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L776-L879)通过失效请求与 ACK 等待完成。本设备采用 CPU 同步更新，并额外限制为卸载队列后更新，省去运行中页表依赖管理。
 
 > **[SOURCE]** 按 VMID 位图请求、按位确认的参考：固定 Linux 源码 [gmc_v9_0.c，第 707～724 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L707-L724)用 `1 << vmid` 组成 `PER_VMID_INVALIDATE_REQ`；[第 810～875 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L810-L875)写请求寄存器并等待 ACK 中本 VMID 的位；[gc_9_4_3_sh_mask.h，第 10326～10343 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10326-L10343)与[第 10668～10671 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10668-L10671)给出 REQ、ACK 的位域。本设备沿用“VMID 位图请求、按位确认”的关系；RANGE 位、VPN 范围寄存器和同步完成方式是本设备设计，不与 AMD 寄存器逐位兼容。
+
+<a id="gpuvm-tlb-lru"></a>
+
+#### 5.2.1 TLB 的组织与替换顺序
+
+设备翻译一个 GPUVA 时，先在 TLB 中找 VMID 与 VPN 都相同的项，找不到才遍历三级页表，再把结果存进 TLB。TLB 容量有限，一组存满后要决定替换哪一项，所以每组除了保存翻译项，还要记下各项的使用先后。
+
+**[DESIGN]** TLB 共 64 组、每组 4 路，组号为 VPN % 64。每组的保存内容如下：
+
+```text
+VPN = GPUVA[31:12]，组号 = VPN % 64
+  例：GPUVA 0x0040_2000 → VPN 0x402 → 第 2 组
+
+第 2 组
+  ways[4]   4 个存储位置（路），每路保存一项翻译：
+            有效位、VMID、VPN、GPU 物理页、R/W/X 权限
+  order[4]  4 个路号按使用先后排名，下标是名次，值是路号：
+            order[0] = 最近刚用过的路号（MRU）
+            order[3] = 最久没用的路号（LRU），本组满了就替换它
+```
+
+翻译项填进 `ways[i]` 后一直留在第 i 路，每次使用只改变 `order` 中路号的排列。复位时各路都无效，`order = {0, 1, 2, 3}`。TLB 只缓存叶子翻译，不缓存中间表。
+
+一次查找按下面三步进行：
+
+1. **命中**：本组某一路有效，且 VMID、VPN 都相同。HITS 加 1，返回保存的物理页与权限，再把这一路移到 `order[0]`；
+2. **未命中**：MISSES 加 1，遍历页表。遍历失败时报告故障，不写 TLB，`order` 也不变；
+3. **填入**：遍历成功后，优先填入本组编号最小的无效路；四路都有效时替换 `order[3]` 记录的那一路，EVICTIONS 加 1。新填入的一路移到 `order[0]`。
+
+把某一路移到 `order[0]` 时，原来排在它前面的路各后移一位，排在它后面的路不动。只有被移动的路原来位于 `order[3]` 时，`order[0..2]` 才整体后移。下面的例子只访问 VPN 5、69、133、197、261，它们的 VPN % 64 都是 5，全部落在第 5 组，逐步写出 `order` 的变化：
+
+```text
+复位后：4 路都无效                          order = {0, 1, 2, 3}
+
+访问 VPN 5    未命中，填入路 0              order = {0, 1, 2, 3}
+访问 VPN 69   未命中，填入路 1              order = {1, 0, 2, 3}
+访问 VPN 133  未命中，填入路 2              order = {2, 1, 0, 3}
+访问 VPN 197  未命中，填入路 3              order = {3, 2, 1, 0}
+访问 VPN 261  未命中，4 路都有效：
+              替换 order[3] 记录的路 0（原为 VPN 5），EVICTIONS 加 1
+                                            order = {0, 3, 2, 1}
+访问 VPN 133  命中路 2；路 2 原在 order[2]，
+              排在前面的路 0、3 各后移一位，路 1 不动
+                                            order = {2, 0, 3, 1}
+```
+
+失效只把匹配的项标为无效，不改 `order`。被清除的路在下一次填入时按“编号最小的无效路”优先使用，不看它在 `order` 中排第几。接着上例，若失效 VPN 133，路 2 变为无效而 `order` 仍为 `{2, 0, 3, 1}`；下一次第 5 组未命中会填入路 2，而不是替换 `order[3]` 记录的路 1，填入后路 2 照常移到 `order[0]`。
+
+命中、未命中和替换三个计数由全设备共用，32 位回绕，复位时清零，失效不清零。组相联结构参照 ARM 的通用做法，组数、路数和替换策略是本设备的取值，不代表 MI300X UTCL1/UTCL2 的参数。
+
+> **[SOURCE] 可选源码索引**
+>
+> - 组与项的结构：[hw/gpgpu/mem/gpuvm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:31:1>) [第 31～55 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:31:1>)；
+> - 查找、未命中计数与填入：[hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:269:1>) [第 269～295 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:269:1>) 的 `vm_lookup()`；
+> - 选择无效路或替换 `order[3]`：[第 217～243 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:217:1>) 的 `tlb_fill()`；
+> - 失效只清有效位：[第 495～507 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:495:1>) 的 `tlb_invalidate()`。
+
+下面的 `tlb_touch()` 维护排名，可以对照上例中“前面的路后移、后面的路不动”：
+
+> **[SOURCE]** [hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:206:1>) [第 206～215 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:206:1>)，协议版本 4 的实现。
+
+```c
+206	/* 把 way 移到 order[0] 成为 MRU，排在它前面的路依次后移一位。 */
+207	static void tlb_touch(GPGPUVMTlbSet *set, uint8_t way)
+208	{
+209		unsigned int pos = 0;
+210	
+211		while (pos < GPGPU_VM_TLB_WAYS - 1 && set->order[pos] != way)
+212			pos++;
+213		memmove(&set->order[1], &set->order[0], pos);
+214		set->order[0] = way;
+215	}
+```
+
+第 211～212 行找出这一路当前的名次 `pos`；第 213 行只把 `order[0..pos-1]` 后移一位，`order[pos+1..3]` 保持原值；第 214 行把这一路放到 `order[0]`。上例命中路 2 时 `pos = 2`，移动的是路 0 和路 3。
 
 ### 5.3 结束旧访问和通知后才复用编号
 

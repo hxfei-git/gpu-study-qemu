@@ -74,9 +74,11 @@ SYSTEM=1 时整页须在 2 GiB IOVA 窗口内，SYSTEM=0 时整页须在 VRAM �
 版本 3 的 TLB 是 64 项直接映射。版本 4 改为 `GPGPU_VM_TLB_SETS` 组、每组 `GPGPU_VM_TLB_WAYS` 路，即 64 组 × 4 路，组号为 VPN % 64，标签为 VMID 与 VPN，只缓存叶子翻译。命中时该路成为 MRU；未命中时遍历页表，成功后先填本组的无效路，四路都有效时替换 LRU 路。
 
 ```text
-第 5 组依次访问 VPN 5、69、133、197：四路占满，order = {3, 2, 1, 0}
-再访问 VPN 261：替换路 0 中的 VPN 5，EVICTIONS 加 1
+第 5 组依次访问 VPN 5、69、133、197：四路占满，VPN 5 最久未用
+再访问 VPN 261：替换 VPN 5 所在的路，EVICTIONS 加 1
 ```
+
+每组怎样记录各路的使用先后、命中和失效时顺序如何变化，见 [GPUVM 规格第 5.2.1 节](<../../docs/GPUVM 第一版规格.md#gpuvm-tlb-lru>)。
 
 新增三个只读计数：`0x0920` VM_TLB_HITS、`0x0924` VM_TLB_MISSES、`0x0928` VM_TLB_EVICTIONS。它们全设备共用，32 位回绕，设备复位时清零，失效不清零。
 
