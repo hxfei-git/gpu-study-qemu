@@ -58,7 +58,7 @@
 - [CP/MEC 第一版规格](<./CP_MEC 第一版规格.md#spec-overview>)规定队列、派发、完成与错误处理；[GPUVM 第一版规格](<./GPUVM 第一版规格.md>)规定地址翻译、对象绑定和回收。
 - [GPGPU 硬件手册](<./GPGPU_硬件手册.html>)按硬件模块组织寄存器、位域、访问权限和复位值。
 - [CP/MEC 软件实现、参考与扩展（历史）](<./历史/CP_MEC 软件实现、参考与扩展.md>)保留旧实现分析、图示和 AMD/gem5 参考；查阅时按各段固定提交理解，不据此恢复已删除的接口。
-- 规格确认过程只保留在 [CP/MEC 规格第 9 节](<./CP_MEC 第一版规格.md#spec-open-interfaces>)。原课程资料仍由父仓库保存。
+- 规格确认过程只保留在 [CP/MEC 规格第 9 节](<./CP_MEC 第一版规格.md#spec-open-interfaces>)。原课程资料见[讲义](<./课程资料/QEMU_2026_讲义.html>)与[实验](<./课程资料/QEMU_2026_实验.html>)，按课程当时版本阅读。
 
 <a id="stage-two-implementation-results"></a>
 
