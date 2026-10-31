@@ -7,6 +7,8 @@
 .stgit-*
 .git-submodule-status
 .clang-format
+!hw/gpgpu/.clang-format
+!software/.clang-format
 .gdb_history
 cscope.*
 tags

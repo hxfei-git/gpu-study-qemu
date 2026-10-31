@@ -255,43 +255,47 @@ def prepare_sources(output):
         path = MATERIALS / name
         digest.update(path.name.encode() + b"\0" + path.read_bytes())
     fingerprint = digest.hexdigest()
+    source = output / "source"
+    expanded = source / "linux-6.18"
     marker = output / "source.sha256"
     if (marker.is_file() and marker.read_text().strip() == fingerprint
-            and (output / "source.tar").is_file()):
+            and (output / "source.tar").is_file() and expanded.is_dir()):
         return manifest
-    stage = Path(tempfile.mkdtemp(prefix=".kernel-source-", dir=output))
-    tree = stage / "linux-6.18"
-    with (output / "source-prepare.log").open("w") as log:
-        subprocess.run(["tar", "-xJf", str(downloads / "linux-6.18.tar.xz"),
-                        "-C", str(stage)], check=True, stdout=log, stderr=log)
-        stable = stage / "stable.patch"
-        with stable.open("wb") as stream:
-            subprocess.run(["xz", "-dc", str(downloads /
-                                             "patch-6.18.57.patch.xz")],
-                           stdout=stream, check=True)
-        patches = [stable] + [MATERIALS / name for name in
-                              manifest["patches"]] + [MATERIALS /
-                              "0008-gpgpu-expose-buddy-config.patch"]
-        for patch in patches:
-            # Alpine 原补丁按默认 fuzz=2 应用；stable 更新会移动上下文。
-            subprocess.run(["patch", "-p1", "--batch", "-i",
-                            str(patch)], cwd=tree, check=True,
+    with tempfile.TemporaryDirectory(prefix=".kernel-source-",
+                                     dir=output) as temporary:
+        stage = Path(temporary)
+        tree = stage / expanded.name
+        archive = stage / "source.tar"
+        with (output / "source-prepare.log").open("w") as log:
+            subprocess.run(["tar", "-xJf", str(downloads / "linux-6.18.tar.xz"),
+                            "-C", str(stage)], check=True,
                            stdout=log, stderr=log)
-        for path in tree.glob("localversion*"):
-            path.unlink()
-        subprocess.run(["tar", "-cf", str(output / "source.tar.new"),
-                        "-C", str(stage), tree.name], check=True)
-    (output / "source.tar.new").replace(output / "source.tar")
-    marker.write_text(fingerprint + "\n")
-    (output / "source-date-epoch").write_text(
-        str(manifest["source_date_epoch"]) + "\n")
-    # 展开源码仍留在 build/，便于核查实际使用的补丁结果。
-    previous = output / "source"
-    if previous.exists():
-        previous.rename(output / ("source.previous." + stage.name))
-    previous.mkdir()
-    tree.rename(previous / tree.name)
-    shutil.rmtree(stage)
+            stable = stage / "stable.patch"
+            with stable.open("wb") as stream:
+                subprocess.run(["xz", "-dc", str(downloads /
+                                                 "patch-6.18.57.patch.xz")],
+                               stdout=stream, check=True)
+            patches = [stable] + [MATERIALS / name for name in
+                                  manifest["patches"]] + [MATERIALS /
+                                  "0008-gpgpu-expose-buddy-config.patch"]
+            for patch in patches:
+                # Alpine 原补丁按默认 fuzz=2 应用。
+                subprocess.run(["patch", "-p1", "--batch", "-i",
+                                str(patch)], cwd=tree, check=True,
+                               stdout=log, stderr=log)
+            for path in tree.glob("localversion*"):
+                path.unlink()
+            subprocess.run(["tar", "-cf", str(archive),
+                            "-C", str(stage), tree.name], check=True)
+        # 新源码及归档准备成功后，才替换旧展开目录。
+        if source.exists():
+            shutil.rmtree(source)
+        source.mkdir()
+        tree.rename(expanded)
+        archive.replace(output / "source.tar")
+        (output / "source-date-epoch").write_text(
+            str(manifest["source_date_epoch"]) + "\n")
+        marker.write_text(fingerprint + "\n")
     return manifest
 
 

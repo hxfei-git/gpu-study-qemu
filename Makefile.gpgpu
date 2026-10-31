@@ -22,7 +22,7 @@ help:
 	@echo ""
 	@echo "  configure         配置 aarch64 Host 与 riscv64 CP，不需要客体内核"
 	@echo "  build             构建两个 QEMU、两个 QTest 程序和 RV64 CP 固件"
-	@echo "  test-gpgpu-qtest  运行设备寄存器与真实 CP 固件回归，核对 TAP 11/11"
+	@echo "  test-gpgpu-qtest  运行设备寄存器与真实 CP 固件回归，核对 TAP"
 	@echo "  test-gpgpu-stack  在 Linux 客体中运行 GPUVM 开／关的三个计算示例"
 	@echo ""
 	@echo "  JOBS=N                    QEMU 并行构建任务数（默认 $(JOBS)）"
@@ -44,7 +44,7 @@ build: $(GPGPU_BUILD_DIR)/build.ninja
 		qemu-system-aarch64 qemu-system-riscv64 \
 		tests/qtest/gpgpu-regs-test tests/qtest/gpgpu-cp-test
 
-# 寄存器级 6 项、双进程 CP 队列 5 项；退出状态和 TAP 结果都必须通过。
+# 退出状态、TAP 计划与结果都必须通过，数量由测试程序提供。
 test-gpgpu-qtest: build
 	{ QTEST_QEMU_BINARY="$(GPGPU_BUILD_DIR)/qemu-system-aarch64" \
 		"$(GPGPU_BUILD_DIR)/tests/qtest/gpgpu-regs-test" --tap && \
@@ -54,9 +54,12 @@ test-gpgpu-qtest: build
 		QTEST_GPGPU_FIRMWARE="$(BUILD_DIR)/gpgpu-firmware/gpgpu-cp.bin" \
 		"$(GPGPU_BUILD_DIR)/tests/qtest/gpgpu-cp-test" --tap; } \
 		2>&1 | tee "$(GPGPU_QTEST_LOG)"
-	@test "$$(grep -c '^ok ' "$(GPGPU_QTEST_LOG)")" = 11
-	@! grep -Eq '^not ok |# SKIP' "$(GPGPU_QTEST_LOG)"
-	@echo "--- GPGPU QTest: 11/11 passed ---"
+	@awk '/^1\.\.[0-9]+/ { planned += substr($$0, 4) } \
+		/^ok [0-9]+ / { passed++ } \
+		/^not ok |# SKIP/ { failed = 1 } \
+		END { if (failed || !planned || passed != planned) exit 1; \
+		printf "--- GPGPU QTest: %d/%d passed ---\n", passed, planned }' \
+		"$(GPGPU_QTEST_LOG)"
 
 # 固定 A57、1 GiB、IOMMU=none；缺少客体环境时在检查阶段退出。
 test-gpgpu-stack:
