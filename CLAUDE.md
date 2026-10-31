@@ -1,26 +1,5 @@
 # CLAUDE.md
 
-| 缩写 | 英文全称 | 中文含义 |
-| --- | --- | --- |
-| QEMU | Quick Emulator | 仿真与虚拟化工具 |
-| GPGPU / GPU | General-Purpose Computing on Graphics Processing Units / Graphics Processing Unit | GPU 通用计算／图形处理器 |
-| CP | Command Processor | 命令处理器 |
-| CPU | Central Processing Unit | 中央处理器 |
-| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 的 RISC-V 位宽 |
-| DRM / GEM | Direct Rendering Manager / Graphics Execution Manager | Linux 图形设备框架／内存对象管理 |
-| GPUVM | GPU Virtual Memory | GPU 虚拟内存 |
-| AQL | Architected Queuing Language | HSA 队列包格式 |
-| HSA / HSAKMT | Heterogeneous System Architecture / HSA Kernel Mode Thunk | 异构系统架构／HSA 内核接口封装层 |
-| IH | Interrupt Handler | 本实验的完成与错误通知模块 |
-| MQD | Memory Queue Descriptor | 内存队列描述符 |
-| BAR | Base Address Register | PCI 基址寄存器 |
-| PCI | Peripheral Component Interconnect | 外设互连总线 |
-| ABI | Application Binary Interface | 应用二进制接口 |
-| ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
-| IOMMU | Input/Output Memory Management Unit | 输入输出内存管理单元 |
-| TAP | Test Anything Protocol | 测试结果输出协议 |
-| WSL | Windows Subsystem for Linux | Windows 的 Linux 子系统 |
-
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 @AGENTS.md
@@ -31,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 不要删除这行导入。Claude Code 默认只在没有 `CLAUDE.md` 时加载 `AGENTS.md`；有了本文件，`AGENTS.md` 只能经导入进入上下文。
 
-本仓库通常作为 gpu_study 父仓库的子模块，检出在 `4.experiments/gpu-study-qemu`。从本目录启动时，Claude Code 会逐级向上加载父仓库根目录的 `CLAUDE.md`，并经其中的导入加载父仓库的 `AGENTS.md`。代码和实验文档均在本仓库维护。`docs/` 遵循父仓库写作规则；原课程材料随本仓库保存在 `docs/课程资料/`；单独克隆时，父仓库的学习笔记可能不存在。
+本仓库通常作为 gpu_study 父仓库的子模块，检出在 `4.experiments/gpu-study-qemu`。从本目录启动时，Claude Code 会逐级向上加载父仓库根目录的 `CLAUDE.md`，并经其中的导入加载父仓库的 `AGENTS.md`。代码和实验文档均在本仓库维护。`docs/` 遵循父仓库写作规则，缩写表与 humanizer-zh 检查的适用范围见本仓库 `AGENTS.md` 的“文档与交互”一节；原课程材料随本仓库保存在 `docs/课程资料/`；单独克隆时，父仓库的学习笔记可能不存在。
 
 ## 2. 分支与父仓库同步
 
