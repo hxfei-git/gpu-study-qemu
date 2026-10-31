@@ -38,7 +38,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本仓库通常作为 gpu_study 父仓库的子模块，检出在 `4.experiments/gpu-study-qemu`。
 从本目录启动时，Claude Code 会逐级向上加载父仓库根目录的 `CLAUDE.md`，
 并经其中的导入加载父仓库的 `AGENTS.md`。代码和实验文档均在本仓库维护。`docs/` 遵循父仓库写作规则；
-单独克隆本仓库时，父仓库的学习笔记与原课程材料可能不存在。
+原课程材料随本仓库保存在 `docs/课程资料/`；单独克隆时，父仓库的学习笔记可能不存在。
 
 ## 2. 分支与父仓库同步
 
