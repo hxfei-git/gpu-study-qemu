@@ -56,7 +56,7 @@ static bool user_phys_valid(GPGPUState *s, uint64_t addr, uint64_t len)
 
 	if (!gpgpu_phys_contains(s, addr, len))
 		return false;
-	if (addr >= gpgpu_vram_size(s))
+	if (addr >= GPGPU_OUTBOUND_BASE)
 		return true;
 	if (addr < GPGPU_VM_PAGE_SIZE)
 		return false;

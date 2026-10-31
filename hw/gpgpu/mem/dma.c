@@ -39,7 +39,7 @@ static void dma_fail(GPGPUState *s)
  *
  * 1. 锁存方向与中断使能位；没有 START 位时只更新这两位，不搬运；
  * 2. 检查描述符：设备已使能、长度非零、VRAM 端完整位于 VRAM 内，
- *    Host 端不在 VRAM 范围内且落在已使能的 Outbound 窗口里。
+ *    Host 端不低于 Outbound 起点且落在已使能的窗口里，空洞地址失败。
  *    不合法时置 ERROR 并锁存 DMA_FAULT，不搬运；
  * 3. 置 BUSY，把 VRAM 端映射成一段 Host 指针，再经 gpgpu_phys_rw()
  *    与 Host 端直接互拷。Host 访问失败时置 ERROR，已写入的部分保留；
@@ -62,7 +62,7 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 
 	/* 2. 两端范围检查，任一项不满足即失败。 */
 	if (!gpgpu_enabled(s) || !d->size || !gpgpu_vram_contains(s, vram_addr, d->size) ||
-	    host_addr < gpgpu_vram_size(s) || !gpgpu_phys_contains(s, host_addr, d->size)) {
+	    host_addr < GPGPU_OUTBOUND_BASE || !gpgpu_phys_contains(s, host_addr, d->size)) {
 		dma_fail(s);
 		return;
 	}

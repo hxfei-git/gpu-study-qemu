@@ -135,7 +135,7 @@ HQD 保存状态，CP 读取状态并执行命令，计算执行器执行 Kernel
 
 Host 建立一条队列时，需要准备 Ring、MQD 和进度内存。MQD 保存队列配置与需要恢复的状态；装入 HQD 后，CP 使用 HQD 中的活动状态读取 Ring。卸载保存时，消费位置和错误快照写回原 MQD，供以后恢复或诊断。MQD 的 64 字节布局与装载、保存范围见[第 2.6 节](#spec-mqd-format)。
 
-**[DESIGN]** GPU 物理空间连续分为 VRAM `[0, vram_size)` 与 Outbound `[vram_size, 0x1_0000_0000)`。用户访问在 GPUVM 开启时先翻译，关闭时直接使用输入地址；管理对象始终使用 GPU 物理地址。两类访问汇入同一个物理入口，再按范围访问 VRAM 或经 PCIe DMA 访问 Host RAM。
+**[DESIGN]** GPU 物理空间分为 VRAM `[0, vram_size)`、不可路由的空洞 `[vram_size, 0x8000_0000)` 和固定的 Outbound `[0x8000_0000, 0x1_0000_0000)`。用户访问在 GPUVM 开启时先翻译，关闭时直接使用输入地址；管理对象始终使用 GPU 物理地址。两类访问汇入同一个物理入口，再按范围访问 VRAM 或经 PCIe DMA 访问 Host RAM。
 
 <a id="spec-ring-mqd-storage"></a>
 
@@ -196,8 +196,9 @@ CP 本地窗口 load/store
       └─ 管理域：输入直接作为 GPU 物理地址
   → 公共物理入口
       ├─ [0, vram_size) → VRAM
-      └─ [vram_size, 0x1_0000_0000) → 减 vram_size 得到 Host IOVA
-                                          → PCIe DMA → SMMUv3（启用时）→ Host RAM
+      ├─ [vram_size, 0x8000_0000) → 空洞，路由失败
+      └─ [0x8000_0000, 0x1_0000_0000) → 减 0x8000_0000 得到 Host IOVA
+                                            → PCIe DMA → SMMUv3（启用时）→ Host RAM
 ```
 
 CP 的代码、栈和控制寄存器仍使用自己的裸机地址；Host 经 BAR2 读写 VRAM。下面只列 CP 本地窗口，不能将这些地址当作 RV32 Kernel 的特殊地址：
@@ -213,9 +214,9 @@ CP 的代码、栈和控制寄存器仍使用自己的裸机地址；Host 经 BA
 
 基址按 64 KiB 对齐，固件写完高低位后再访问。窗口支持自然对齐的 1、2、4、8 字节小端访问，8 字节由 RV64 的 `LD/SD` 完成。失败返回原生 load/store access fault，已完成的写入保留；窗口不修改独立 COPY 的 DMA 完成状态。
 
-例如 `gpuvm=off`、64 MiB VRAM 时，GPU 物理地址 `0x4500_1234` 对应 Host IOVA `0x4100_1234`。CP 设置基址 `0x4500_0000`，读取本地 `0x8000_1234`，公共物理入口再减去 `0x0400_0000`。IOVA 0 对应 GPU 物理地址 `0x0400_0000`，不排除该页。窗口覆盖只选择路由，实际 Host 存储及 IOMMU 映射必须有效。
+例如 `gpuvm=off` 时，GPU 物理地址 `0xc100_1234` 对应 Host IOVA `0x4100_1234`。CP 设置基址 `0xc100_0000`，读取本地 `0x8000_1234`，公共物理入口再减去 Outbound 起点 `0x8000_0000`。本地地址 `0x8000_1234` 在 CP 自己的地址空间里，Outbound 起点 `0x8000_0000` 在 GPU 物理地址空间里，两者只是数值相近，没有换算关系。IOVA 0 对应 GPU 物理地址 `0x8000_0000`，不排除该页。窗口覆盖只选择路由，实际 Host 存储及 IOMMU 映射必须有效。
 
-全设备 Outbound 窗口布局固定，驱动在 CP 启动前读回核对，再写 CONTROL 使能并确认：GPU 基址为 `vram_size`，Host IOVA 基址为 0，长度为 `0x1_0000_0000 - vram_size`。BAR0 `0x0b00～0x0b18` 保存这些值、使能和确认状态；其中 `0x0b00～0x0b10` 只读，写入置 `OUTBOUND_STATUS.ERROR` 并锁存 `INVALID_CMD`，仅 CONTROL 可写；运行期间拒绝修改 CONTROL。驱动设置 31 位 DMA mask，每次分配用 64 位算术检查完整区间，再保存原始 DMA 地址和转换后的 GPU 物理地址；释放和 CPU 映射仍用原始地址。
+全设备 Outbound 窗口布局固定，驱动在 CP 启动前读回核对，再写 CONTROL 使能并确认：GPU 基址固定为 `0x8000_0000`，Host IOVA 基址为 0，长度为 2 GiB，与 VRAM 容量无关。BAR0 `0x0b00～0x0b18` 保存这些值、使能和确认状态；其中 `0x0b00～0x0b10` 只读，写入置 `OUTBOUND_STATUS.ERROR` 并锁存 `INVALID_CMD`，仅 CONTROL 可写；运行期间拒绝修改 CONTROL。驱动设置 31 位 DMA mask，每次分配用 64 位算术检查完整区间，再保存原始 DMA 地址和转换后的 GPU 物理地址；释放和 CPU 映射仍用原始地址。
 
 停止时先保持 CP 复位，等待在途物理访问结束，再确认整体复位已关闭窗口。未确认停止时保留相关资源。BO 分配、队列创建与进程退出均不重配窗口。
 
@@ -231,10 +232,10 @@ CP 正在处理 Queue A，位于 HQD 槽位 2
   │ 固件记录本次访问：
   │   所属槽位 = 2
   │   操作 = 读取 Ring
-  │   GPU 物理地址 = 0x4500_0080
+  │   GPU 物理地址 = 0xc100_0080
   ▼
 配置 Host 访存窗口
-  窗口基址 = 0x4500_0000
+  窗口基址 = 0xc100_0000
   CP 本地读取地址 = 0x8000_0080
   │
   ▼
@@ -359,7 +360,7 @@ Host 只能读到完整旧值或完整新值
 Dispatch.kernel_object = 0x4000 → VRAM 中的16字节描述对象
   └─ code_entry = 0x8000 → 执行器经公共入口从 VRAM 取指
 
-Dispatch.kernarg_address = 0x4500_2000 → 启动时 a0 = 0x4500_2000
+Dispatch.kernarg_address = 0xc100_2000 → 启动时 a0 = 0xc100_2000
   └─ 普通内存读取 → Outbound → Host IOVA 0x4100_2000 的参数块
        ├─ X = 0x1_0000 → VRAM 中的 X
        ├─ Y = 0x2_0000 → VRAM 中的 Y
@@ -378,11 +379,11 @@ Host 发布前准备好全部内容，发布后保持代码、参数、数组和
 驱动已为 Queue A 绑定 Ring，接下来把 Ring 的 GPU 地址交给 CP。下例使用关闭 GPUVM 时的物理地址，窗口换算条件与上节相同：
 
 ```text
-Host IOVA 0x4100_0000 → Ring 的 GPU 物理地址 0x4500_0000
-  → 驱动填写 MQD.ring_base = 0x4500_0000
+Host IOVA 0x4100_0000 → Ring 的 GPU 物理地址 0xc100_0000
+  → 驱动填写 MQD.ring_base = 0xc100_0000
   → HIQ 管理命令提供 MQD 的 GPU 物理地址
   → CP 按管理域读取 MQD，再配置 HQD
-      ├─ CP_HQD_PQ_BASE = 0x4500_0000
+      ├─ CP_HQD_PQ_BASE = 0xc100_0000
       ├─ CP_HQD_PQ_BASE_HI = 0
       └─ VMID = 1
   → CP 按用户域读取 Ring → 公共物理入口 → Host IOVA 0x4100_0000
@@ -396,19 +397,19 @@ Host IOVA 0x4100_0000 → Ring 的 GPU 物理地址 0x4500_0000
 
 #### 2.4.1 共享对象中的小端字段
 
-设 GPUVM 关闭，Host 已取得 Signal S 的 GPU 物理地址 `0x4500_3000`，接下来把它写入 Dispatch 的 `completion_signal` 字段。CP 读取这个 64 位字段时，需要按相同的字节顺序还原地址：
+设 GPUVM 关闭，Host 已取得 Signal S 的 GPU 物理地址 `0xc100_3000`，接下来把它写入 Dispatch 的 `completion_signal` 字段。CP 读取这个 64 位字段时，需要按相同的字节顺序还原地址：
 
 ```text
-completion_signal 的数值 = 0x4500_3000
+completion_signal 的数值 = 0xc100_3000
          │
          │ Host 按小端写入 Dispatch 中的 8 字节字段
          ▼
 字段内偏移： +0  +1  +2  +3  +4  +5  +6  +7
-对应字节：   00  30  00  45  00  00  00  00
+对应字节：   00  30  00  c1  00  00  00  00
          │
          │ CP 按小端读取这 8 个字节
          ▼
-还原物理地址 = 0x4500_3000
+还原物理地址 = 0xc100_3000
 ```
 
 **[DESIGN]** Ring 命令、MQD、Signal、通知槽、Kernel 描述对象和参数块中的多字节字段统一采用小端格式：低地址存低有效字节，高地址存高有效字节。该规则同时适用于 Host RAM 和 VRAM 中的这些对象；驱动、运行时、CP 和计算执行器按同一规则读写各自访问的字段。图中的 `00`、`30` 等均为十六进制字节。
@@ -458,7 +459,7 @@ CP 取得 kernel_object：64 位无符号地址，数值为 0x4000
 ```text
 AQL Dispatch
   └─ completion_signal：64 位
-       保存 S 的物理地址 = 0x4500_3000
+       保存 S 的物理地址 = 0xc100_3000
          │
          │ CP 按物理地址访问 Host RAM
          ▼
@@ -470,7 +471,7 @@ Host RAM 中的 Signal S
   │    └─ 保存事件编号，本例为 7
   │
   └─ event_mailbox_ptr：64 位
-       保存 M7 的物理地址 = 0x4500_4000
+       保存 M7 的物理地址 = 0xc100_4000
          │
          │ CP 需要发送完成通知时，按这个地址写入
          ▼
@@ -1636,13 +1637,13 @@ CP 拒绝旧值 0 和所有不支持的 ABI。代码入口按 4 字节对齐，�
 
 #### 6.2.3 计算线程用真实 a0 读取参数
 
-`a0 = kernarg_address`。以 GPUVM 关闭、64 MiB VRAM 为例，参数 Host IOVA 为 `0x4100_2000`，对应 GPU 物理地址 `0x4500_2000`：
+`a0 = kernarg_address`。以 GPUVM 关闭、64 MiB VRAM 为例，参数 Host IOVA 为 `0x4100_2000`，对应 GPU 物理地址 `0xc100_2000`：
 
 ```text
-Kernel 执行 lw t0, 12(a0)，a0 = 0x4500_2000
-  → 普通用户访问 GPU 地址 0x4500_200c
+Kernel 执行 lw t0, 12(a0)，a0 = 0xc100_2000
+  → 普通用户访问 GPU 地址 0xc100_200c
   → 公共物理入口选择 Outbound
-  → 减 0x0400_0000 → Host IOVA 0x4100_200c
+  → 减 0x8000_0000 → Host IOVA 0x4100_200c
   → t0 取得 N
 ```
 
@@ -2496,8 +2497,8 @@ CP_HQD_ACTIVE
 低位寄存器：地址的低 32 位
 高位寄存器：地址的高 32 位
 
-例如地址 = 0x4500_0000
-  ├─ LO = 0x4500_0000
+例如地址 = 0xc100_0000
+  ├─ LO = 0xc100_0000
   └─ HI = 0x0
 ```
 

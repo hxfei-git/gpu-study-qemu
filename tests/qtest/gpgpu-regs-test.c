@@ -212,7 +212,7 @@ static void test_vram(void)
  */
 static void test_dma_unrouted(void)
 {
-	const uint64_t host = GPGPU_TEST_VRAM_SIZE + HOST_BUFFER;
+	const uint64_t host = GPGPU_OUTBOUND_BASE + HOST_BUFFER;
 	RegsTest t = { 0 };
 
 	regs_start(&t, true);
@@ -226,15 +226,15 @@ static void test_dma_unrouted(void)
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 
 	/*
-	 * 2. Outbound 布局固定为 VRAM 之后到 4 GiB 的整段 GPU 物理地址，
+	 * 2. Outbound 布局固定为 0x8000_0000 起的 2 GiB，与 VRAM 容量无关，
 	 *    布局寄存器只读：改写 GPU_BASE 锁存 INVALID_CMD，读回不变。
 	 */
-	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
-	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_SIZE_LO), ==,
-			(uint32_t)(GPGPU_VM_ADDRESS_LIMIT - GPGPU_TEST_VRAM_SIZE));
+	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_OUTBOUND_BASE);
+	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_SIZE_LO), ==, (uint32_t)GPGPU_OUTBOUND_SIZE);
+	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_SIZE_HI), ==, GPGPU_OUTBOUND_SIZE >> 32);
 	wr(&t, GPGPU_REG_OUTBOUND_GPU_BASE, 0);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
-	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_TEST_VRAM_SIZE);
+	g_assert_cmphex(rd(&t, GPGPU_REG_OUTBOUND_GPU_BASE), ==, GPGPU_OUTBOUND_BASE);
 
 	/*
 	 * 3. 设备使能后提交 Host→VRAM 的 64 字节描述符：源地址落在未打开的

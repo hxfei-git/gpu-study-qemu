@@ -9,7 +9,7 @@
 
 #include "gpgpu/gpgpu_protocol.h"
 
-/* 设备默认 VRAM 容量，也是 Outbound 窗口的 GPU 物理起点。 */
+/* 设备默认 VRAM 容量；VRAM 末端到 Outbound 起点之间是不可路由的空洞。 */
 #define GPGPU_TEST_VRAM_SIZE 0x04000000ULL
 
 #endif /* TESTS_QTEST_GPGPU_TEST_H */

@@ -25,19 +25,20 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
  * gpgpu_phys_rw() - 按 GPU 物理地址读写 VRAM 或 Host 内存
  *
  * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都经过这里。
- * GPU 物理空间低端是 VRAM，其上是 Outbound 窗口，窗口内的地址对应 Host
- * 内存：
+ * GPU 物理空间低端是 VRAM，0x8000_0000 起是 Outbound 窗口，窗口内的地址
+ * 对应 Host 内存；两者之间的空洞不可路由：
  *
  * 1. 检查 [addr, addr + len) 完整落在 VRAM 或已使能的 Outbound 窗口内，
- *    不允许跨越两者的边界；
+ *    不允许触及空洞或跨越边界；
  * 2. 增加在途访问计数。访问 Host 内存时 vfio-user DMA 可能暂时释放
  *    主锁，此时 Host 发起的设备复位和 Outbound 重配会因计数非零被拒绝，
  *    窗口配置不会在访问中途被改掉；
  * 3. VRAM 直接读写设备内部的后备 RAM；Outbound 把地址减去窗口起点、
- *    加上 Host 基址换算成 Host IOVA，再经 vfio-user DMA 读写；
+ *    加上 Host 基址换算成 Host IOVA，再经 vfio-user DMA 读写。
+ *    例：0xc100_2000 减去 0x8000_0000 得到 IOVA 0x4100_2000；
  * 4. 成功或失败都撤销计数，失败前已写入的部分保留。
  *
- * 使能时 host_base 为 0 且窗口不超过 4 GiB，换算后的 IOVA 不会溢出。
+ * 使能时 host_base 为 0 且窗口为 2 GiB，换算后的 IOVA 不会溢出。
  */
 MemTxResult gpgpu_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, bool is_write)
 {
@@ -119,7 +120,7 @@ void gpgpu_outbound_reset(GPGPUState *s)
 {
 	assert(!s->phys.accesses);
 	s->phys = (GPGPUPhysState) {
-		.gpu_base = s->vram_size,
-		.size = GPGPU_VM_ADDRESS_LIMIT - s->vram_size,
+		.gpu_base = GPGPU_OUTBOUND_BASE,
+		.size = GPGPU_OUTBOUND_SIZE,
 	};
 }

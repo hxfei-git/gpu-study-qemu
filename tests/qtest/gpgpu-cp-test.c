@@ -7,7 +7,8 @@
  * KIQ，经管理队列映射 HIQ 和用户队列，再提交 AQL 包并核对完成发布。
  *
  * 地址约定：Host RAM 中的对象在设备协议中写 GPU 物理地址
- * GPA(host) = VRAM 容量 + Host IOVA；未启用 IOMMU 时 IOVA 即客体物理地址。
+ * GPA(host) = GPGPU_OUTBOUND_BASE + Host IOVA；未启用 IOMMU 时 IOVA 即客体
+ * 物理地址。
  */
 
 #include "qemu/osdep.h"
@@ -45,8 +46,8 @@
 #define KERNEL_CODE 0x11000U
 #define KERNEL_OUT 0x12000U
 
-/* Host 地址换成设备协议中的 GPU 物理地址：Outbound 窗口紧接在 VRAM 之后。 */
-#define GPA(host) (GPGPU_TEST_VRAM_SIZE + (host))
+/* Host 地址换成设备协议中的 GPU 物理地址：窗口固定从 2 GiB 开始。 */
+#define GPA(host) (GPGPU_OUTBOUND_BASE + (host))
 /* 有效的一维派发 Header：低 16 位为包类型等字段，setup 写维度数 1。 */
 #define AQL_DISPATCH_1D ((1U << 16) | GPGPU_AQL_HEADER)
 
@@ -292,7 +293,7 @@ static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes)
 
 	/*
 	 * 2. Outbound 布局在复位后固定为
-	 *    “GPU 物理地址 = VRAM 容量 + Host IOVA”，只需打开；
+	 *    “GPU 物理地址 = GPGPU_OUTBOUND_BASE + Host IOVA”，只需打开；
 	 *    状态为 ACK 表示设备接受了这次配置。此后 CP 才能经
 	 *    GPA() 换算出的地址访问 Host RAM。
 	 */
@@ -562,7 +563,8 @@ static void test_management(void)
  *
  * 期望：三个任务的输出都写到 VRAM；每个任务的 Signal 归零、通知槽为事件
  * 编号、Header 恢复 INVALID；IH 中有 3 条 SIGNAL_NOTIFY；卸载槽 2 后
- * saved_rptr 为 2，即这条队列消费的包数。
+ * saved_rptr 为 2，即这条队列消费的包数。Outbound 已打开时，Host 端落在
+ * VRAM 与窗口之间空洞里的 DMA 仍然失败。
  */
 static void test_dispatch(void)
 {
@@ -608,6 +610,19 @@ static void test_dispatch(void)
 			 GPGPU_MANAGEMENT_OK);
 	g_assert_cmpuint(qtest_readq(s.host, QUEUE_MQD(2) + offsetof(GpgpuMqd, saved_rptr)), ==,
 			 2);
+
+	/*
+	 * 空洞不可路由：Host 端取 VRAM 末端之后的 0x0400_1000，即使窗口已
+	 * 打开，START 时检查也失败，状态为 ERROR 并锁存 DMA_FAULT。
+	 */
+	wr(&s, GPGPU_REG_DMA_SRC_LO, GPGPU_TEST_VRAM_SIZE + 0x1000);
+	wr(&s, GPGPU_REG_DMA_SRC_HI, 0);
+	wr(&s, GPGPU_REG_DMA_DST_LO, 0x3000);
+	wr(&s, GPGPU_REG_DMA_DST_HI, 0);
+	wr(&s, GPGPU_REG_DMA_SIZE, 64);
+	wr(&s, GPGPU_REG_DMA_CTRL, GPGPU_DMA_START);
+	g_assert_cmphex(rd(&s, GPGPU_REG_DMA_STATUS), ==, GPGPU_DMA_ERROR);
+	g_assert_cmphex(rd(&s, GPGPU_REG_ERROR_STATUS), ==, GPGPU_ERR_DMA_FAULT);
 	cp_stop(&s);
 }
 

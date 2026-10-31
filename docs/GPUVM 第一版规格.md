@@ -199,7 +199,7 @@ Queue B → VMID 2 → 页表 B
 
 目录项保存 `VALID` 与下一级表的 GPU 物理地址。叶子项保存 bit 0 `VALID`、bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`；目标地址位为 `[31:12]`，掩码为 `0xffff_f000`，其余位填零。bit 1 不再定义 `SYSTEM`，设为 1 的旧表项被拒绝。
 
-Host 页先将 DMA API 返回的 IOVA 转为 `vram_size + IOVA`，再把该 GPU 物理页地址写入 PTE。页表根和中间表页也保存 GPU 物理地址，遍历通过公共物理入口读取，不递归进行 GPUVM 翻译。驱动当前从受保护 VRAM 分配表页，因此这些物理地址的数值等于 VRAM 偏移。
+Host 页先将 DMA API 返回的 IOVA 转为 `0x8000_0000 + IOVA`，再把该 GPU 物理页地址写入 PTE。页表根和中间表页也保存 GPU 物理地址，遍历通过公共物理入口读取，不递归进行 GPUVM 翻译。驱动当前从受保护 VRAM 分配表页，因此这些物理地址的数值等于 VRAM 偏移。
 
 完整表项写入前校验对齐、位宽及目标范围，不能靠掩码隐藏非法地址。无效项写零，不支持的有效项编码报页表错误。代码页开放读与取指，参数和输入页开放读，输出及共享状态按需要开放读写；不同权限的对象分开占页。
 
@@ -209,26 +209,30 @@ Host 页先将 DMA API 返回的 IOVA 转为 `vram_size + IOVA`，再把该 GPU 
 
 ### 3.3 Host DMA 与系统 IOMMU
 
-驱动已取得 Host 对象的 DMA 地址，需要把它放入 GPU 可访问的物理空间。设 VRAM 为 64 MiB，设备物理布局和换算如下：
+驱动已取得 Host 对象的 DMA 地址，需要把它放入 GPU 可访问的物理空间。Outbound 窗口固定从 `0x8000_0000` 开始，与 VRAM 容量无关。设 VRAM 为 64 MiB，设备物理布局和换算如下：
 
 ```text
-GPU 物理地址 [0x0000_0000, 0x0400_0000) → VRAM
-GPU 物理地址 [0x0400_0000, 0x1_0000_0000) → Outbound
+GPU 物理地址 [0x0000_0000, 0x0400_0000)   → VRAM
+GPU 物理地址 [0x0400_0000, 0x8000_0000)   → 空洞，不可路由
+GPU 物理地址 [0x8000_0000, 0x1_0000_0000) → Outbound
 
 Host IOVA 0x4100_0000
-  → 加 vram_size 0x0400_0000
-  → GPU 物理地址 0x4500_0000
+  → 加 Outbound 起点 0x8000_0000
+  → GPU 物理地址 0xc100_0000
 
 用户访问 → GPUVM 开启时翻译，关闭时直通
   → 公共物理入口
       ├─ VRAM：访问设备存储
-      └─ Outbound：减 vram_size → Host IOVA → PCIe DMA
-                                      └─ SMMUv3（启用时）→ Host 物理内存
+      ├─ 空洞：路由失败，按窗口未使能处理
+      └─ Outbound：减 0x8000_0000 → Host IOVA → PCIe DMA
+                                       └─ SMMUv3（启用时）→ Host 物理内存
 ```
 
-Outbound 的 GPU 基址为 `vram_size`、Host IOVA 基址为 0、窗口长度为 `0x1_0000_0000 - vram_size`。BAR0 `0x0b00～0x0b10` 布局寄存器只读，驱动在 CP 启动前读回核对布局，再写 `0x0b14` CONTROL 并确认成功；写只读布局置 `OUTBOUND_STATUS.ERROR` 并锁存 `INVALID_CMD`；窗口由整个设备共用，运行期间拒绝重配置。窗口覆盖仅决定路由，Host 存储或 IOMMU 映射不存在仍会访问失败。
+Outbound 的 GPU 基址固定为 `0x8000_0000`，Host IOVA 基址为 0，窗口长度为 2 GiB。VRAM 改变容量时，Host 对象的 GPU 物理地址不变；VRAM 末端到窗口起点之间的空洞不可路由。访问空洞与访问未使能的窗口按同样的方式报错：用户访问记 GPUVM 故障，CP 管理域访问记队列错误，DMA 引擎置 `DMA_FAULT`。
 
-驱动统一设置 31 位 DMA mask，保留 `vram_size < 2 GiB` 限制。每次分配都用 64 位算术校验完整 DMA 区间及转换后的 GPU 区间，IOVA 0 合法，对应 GPU 物理地址 `vram_size`。用户 Host BO、管理 Ring、MQD、完成区、IH 和通知页遵守同一规则；Host BO 独立使用 `dma_alloc_coherent()`，不建立大块连续池。原始 `dma_addr_t` 供 DMA API 映射和释放，转换后的地址供设备协议使用。
+BAR0 `0x0b00～0x0b10` 布局寄存器只读，驱动在 CP 启动前读回核对起点、长度和 Host 基址，再写 `0x0b14` CONTROL 并确认成功；写只读布局置 `OUTBOUND_STATUS.ERROR` 并锁存 `INVALID_CMD`；窗口由整个设备共用，运行期间拒绝重配置。窗口覆盖仅决定路由，Host 存储或 IOMMU 映射不存在仍会访问失败。
+
+驱动统一设置 31 位 DMA mask，正好覆盖窗口对应的 2 GiB IOVA；`vram_size < 2 GiB` 的限制保证 VRAM 不伸进窗口。每次分配都用 64 位算术校验完整 DMA 区间，IOVA 0 合法，对应 GPU 物理地址 `0x8000_0000`。用户 Host BO、管理 Ring、MQD、完成区、IH 和通知页遵守同一规则；Host BO 独立使用 `dma_alloc_coherent()`，不建立大块连续池。原始 `dma_addr_t` 供 DMA API 映射和释放，转换后的地址供设备协议使用。
 
 GPUVM 选择应用页表，SMMUv3 处理设备 DMA，不把 GPU VMID 当成系统 IOMMU 的进程标识。本轮保留 SMMUv3 功能，但只在 `IOMMU=none` 下运行既有三个计算示例，不追加 IOMMU 验收矩阵。
 
@@ -448,7 +452,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 3、32 位地址�
 <a id="gpuvm-confirm-memory-access"></a>
 <a id="gpuvm-confirm-host-dma"></a>
 
-- **地址与页表：** 32 位 GPU 地址、真实 `a0`、只读启动 CSR；开启时使用三级 4 KiB 页表和读写取指权限，关闭时不创建页表；两者共用连续 VRAM／Outbound 物理空间。
+- **地址与页表：** 32 位 GPU 地址、真实 `a0`、只读启动 CSR；开启时使用三级 4 KiB 页表和读写取指权限，关闭时不创建页表；两者共用同一物理布局：VRAM 在低端，Outbound 固定从 `0x8000_0000` 开始，中间的空洞不可路由。
 
 <a id="gpuvm-confirm-access"></a>
 <a id="gpuvm-confirm-address-fields"></a>

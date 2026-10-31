@@ -74,7 +74,7 @@ struct gpgpu_fpriv;
  * struct gpgpu_dma_buf - 一块一致性 DMA 内存
  * @cpu: 内核虚拟地址；为 NULL 表示未分配。
  * @dma: DMA API 使用的原始地址（启用 IOMMU 时为 IOVA）。
- * @addr: 写入设备协议的 GPU 物理地址，即 vram_size + IOVA。
+ * @addr: 写入设备协议的 GPU 物理地址，即 GPGPU_OUTBOUND_BASE + IOVA。
  * @size: 字节数。
  */
 struct gpgpu_dma_buf {
@@ -293,7 +293,7 @@ struct gpgpu_mgmt_request {
  * @dma_failed: 本次 DMA 报告了错误。
  * @dma_uncertain: DMA 等待超时，无法证明访问已结束；之后禁止 COPY 与回收。
  * @gpuvm: 设备以 gpuvm=on 启动。
- * @vram_size: VRAM 字节数，也是 Outbound 窗口的 GPU 物理起点。
+ * @vram_size: VRAM 字节数；VRAM 占 GPU 物理地址 [0, vram_size)。
  * @vmids: 用户 VMID 1、2 的占用位图。
  * @drm: DRM 设备。
  * @fprivs: 全部会话，包括 orphan。

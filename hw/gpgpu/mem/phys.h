@@ -2,10 +2,12 @@
 /*
  * GPU 物理地址空间：VRAM 与 Outbound 路由
  *
- * GPU 物理地址连续覆盖 32 位空间：
+ * GPU 物理地址为 32 位，布局固定：
  *
- *   [0, vram_size)              VRAM
- *   [vram_size, 0x1_0000_0000)  Outbound：减去 vram_size 得到 Host IOVA，经 PCIe DMA 访问
+ *   [0, vram_size)                VRAM
+ *   [vram_size, 0x8000_0000)      空洞：不可路由，访问按窗口未使能处理
+ *   [0x8000_0000, 0x1_0000_0000)  Outbound：减去 0x8000_0000 得到 Host IOVA，
+ *                                 再经 PCIe DMA 访问
  *
  * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都走 gpgpu_phys_rw()；
  * 用户地址先经 mem/gpuvm.c 翻译（或直通）再进入这里。
@@ -19,8 +21,8 @@
 
 /**
  * struct GPGPUPhysState - Outbound 窗口配置与在途访问
- * @gpu_base: 窗口在 GPU 物理空间的起点，固定为 vram_size。
- * @size: 窗口字节数，固定为 4 GiB - vram_size。
+ * @gpu_base: 窗口在 GPU 物理空间的起点，固定为 GPGPU_OUTBOUND_BASE。
+ * @size: 窗口字节数，固定为 GPGPU_OUTBOUND_SIZE。
  * @host_base: 窗口起点对应的 Host IOVA，固定为 0。
  * @status: 最近一次配置写入的 ACK 或 ERROR。
  * @accesses: 在途物理访问数。跨进程 DMA 可能暂时释放主锁，计数非零时
@@ -44,7 +46,8 @@ typedef struct GPGPUPhysState {
  *
  * 只检查路由；Host 端是否真有映射要到访问时才知道。
  *
- * Return: 范围完整位于 VRAM 或已使能的 Outbound 窗口内时为 true。
+ * Return: 范围完整位于 VRAM 或已使能的 Outbound 窗口内时为 true；
+ * 触及空洞时为 false。
  */
 bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len);
 
@@ -69,7 +72,7 @@ bool gpgpu_phys_busy(GPGPUState *s);
 uint32_t gpgpu_outbound_read(GPGPUState *s, hwaddr reg);
 void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value);
 
-/* 复位：窗口未使能，布局为 [vram_size, 4 GiB) 到 IOVA 0。 */
+/* 复位：窗口未使能，布局为 [0x8000_0000, 4 GiB) 到 IOVA 0。 */
 void gpgpu_outbound_reset(GPGPUState *s);
 
 #endif /* HW_GPGPU_MEM_PHYS_H */

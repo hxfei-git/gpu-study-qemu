@@ -149,10 +149,11 @@ static int gpgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto release;
 
 	/*
-	 * 2. DMA 地址限制在 31 位内，换算成 GPU 物理地址 vram_size + IOVA 后
-	 *    仍在 Outbound 窗口内；映射 BAR0 寄存器与 BAR4 Doorbell。
+	 * 2. DMA 地址限制在 Outbound 窗口覆盖的 2 GiB IOVA 内（31 位），换算成
+	 *    GPU 物理地址 GPGPU_OUTBOUND_BASE + IOVA；
+	 *    映射 BAR0 寄存器与 BAR4 Doorbell。
 	 */
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(31));
+	ret = dma_set_mask_and_coherent(&pdev->dev, GPGPU_OUTBOUND_SIZE - 1);
 	if (ret)
 		goto release;
 	pci_set_master(pdev);

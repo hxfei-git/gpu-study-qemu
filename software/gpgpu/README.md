@@ -113,7 +113,7 @@ CP 用户访问 / RV32 取指与数据访问
                   └─ Outbound → Host IOVA → PCIe DMA
 ```
 
-**[DESIGN]** GPU 物理空间连续覆盖 32 位地址：`[0, vram_size)` 属于 VRAM，`[vram_size, 0x1_0000_0000)` 属于 Outbound。以 64 MiB VRAM 为例，Outbound 从 `0x0400_0000` 开始，长度为 `0xfc00_0000`。Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0x4500_0000`；IOVA 0 对应 `0x0400_0000`，允许正常使用。
+**[DESIGN]** GPU 物理地址为 32 位，布局固定：`[0, vram_size)` 属于 VRAM，`[vram_size, 0x8000_0000)` 是不可路由的空洞，`[0x8000_0000, 0x1_0000_0000)` 属于 Outbound。窗口起点与 VRAM 容量无关，长度为 2 GiB。Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0xc100_0000`；IOVA 0 对应 `0x8000_0000`，允许正常使用。
 
 Outbound 布局由设备固定，BAR0 `0x0b00` 起的布局寄存器只读；驱动在启动 CP 前读回核对，再写 `OUTBOUND_CONTROL` 打开窗口并读取确认状态。窗口由整个设备共用，队列运行期间不重配。DMA 分配统一采用 31 位 mask，保留原始 DMA 地址供 DMA API 释放和映射，转换后的 GPU 物理地址写入设备协议。Host BO 仍逐对象使用 `dma_alloc_coherent()`。
 
@@ -123,7 +123,7 @@ Outbound 只决定访问路由。Host 存储或 IOMMU 映射不存在时访问�
 
 ## 2. GPUVM、对象绑定与资源回收
 
-GPUVM 开启时使用三级 4 KiB 页表、两个用户 VMID 和同步 TLB 失效。PTE 只保存 GPU 物理页地址与有效、读、写、执行权限，Host 页指向 `vram_size + IOVA`。根目录和中间表页也使用 GPU 物理地址，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
+GPUVM 开启时使用三级 4 KiB 页表、两个用户 VMID 和同步 TLB 失效。PTE 只保存 GPU 物理页地址与有效、读、写、执行权限，Host 页指向 `0x8000_0000 + IOVA`。根目录和中间表页也使用 GPU 物理地址，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
 
 用户 GPUVA 的唯一可分配区间为 `[0x1000, 0xffff_f000)`，末页保存内部通知槽。`0x8000_0000` 与 `0x9000_0000` 均为普通 GPUVA，不再代表控制页或参数窗口。GPUVM 关闭时不创建页表，能力查询返回零个 GPUVA 区间，MAP 返回对象固定的 GPU 物理地址；非零 `fixed_va` 请求返回不支持。
 

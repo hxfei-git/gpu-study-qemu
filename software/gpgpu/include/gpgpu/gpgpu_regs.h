@@ -371,13 +371,24 @@ enum GpgpuDispatchError {
 #define GPGPU_VM_PHASE_DATA 0x102U
 
 /*
- * ---- 0xb00 Outbound：GPU 物理地址 [VRAM 容量, 4 GiB) 映射到 Host IOVA ----
+ * ---- 0xb00 Outbound：GPU 物理地址 [2 GiB, 4 GiB) 映射到 Host IOVA ----
  *
- * 窗口布局固定：起点等于 VRAM 容量，覆盖到 4 GiB，起点对应 IOVA 0，
- * 布局寄存器只读。驱动在启动 CP 前写 CONTROL 打开窗口。
+ * 窗口布局固定，与 VRAM 容量无关，布局寄存器只读。驱动在启动 CP 前写
+ * CONTROL 打开窗口。VRAM 末端到窗口起点之间是空洞，不可路由：
+ *
+ *   [0, vram_size)                 VRAM
+ *   [vram_size, 0x8000_0000)       空洞
+ *   [0x8000_0000, 0x1_0000_0000)   Outbound：GPU 物理地址 = 窗口起点 + IOVA
+ *
+ * 例：Host IOVA 0x4100_2000 对应 GPU 物理地址 0xc100_2000。
  */
 
-/* 只读：窗口在 GPU 物理空间的起点，等于 VRAM 容量。 */
+/* 窗口在 GPU 物理空间的起点，对应 Host IOVA 0。 */
+#define GPGPU_OUTBOUND_BASE 0x80000000ULL
+/* 窗口字节数，也是可经窗口访问的 Host IOVA 上界（不含）。 */
+#define GPGPU_OUTBOUND_SIZE 0x80000000ULL
+
+/* 只读：窗口在 GPU 物理空间的起点，等于 GPGPU_OUTBOUND_BASE。 */
 #define GPGPU_REG_OUTBOUND_GPU_BASE 0x0b00
 /* 只读：窗口字节数低 32 位。 */
 #define GPGPU_REG_OUTBOUND_SIZE_LO 0x0b04

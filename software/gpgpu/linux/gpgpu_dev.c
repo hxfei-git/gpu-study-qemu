@@ -19,8 +19,8 @@
 #include <linux/slab.h>
 #include "gpgpu_drv.h"
 
-/* DMA 地址的可用范围：驱动把 DMA mask 设为 31 位。 */
-#define GPGPU_DMA_LIMIT (1ULL << 31)
+/* DMA 地址的可用范围，等于 Outbound 窗口长度（31 位）。 */
+#define GPGPU_DMA_LIMIT GPGPU_OUTBOUND_SIZE
 
 /* ---- DMA 缓冲区 ---- */
 
@@ -32,26 +32,25 @@
  * @align: DMA 地址的对齐要求（2 的幂）；dma_alloc_coherent 按分配阶对齐，
  *         调用者需保证 size 足以满足该对齐。
  *
- * DMA 地址必须落在 31 位范围和 Outbound 窗口内，才能换算成
- * GPU 物理地址 vram_size + IOVA。
+ * DMA 地址必须整段落在 Outbound 窗口覆盖的 IOVA 范围内，才能换算成
+ * GPU 物理地址 GPGPU_OUTBOUND_BASE + IOVA。例：IOVA 0x4100_2000 对应
+ * 0xc100_2000；IOVA 0 也合法，对应窗口起点。
  *
  * Return: 0，或 -ENOMEM / -ERANGE（失败时不保留任何分配）。
  */
 int gpgpu_dma_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
 			size_t align)
 {
-	u64 window = (1ULL << 32) - dev->vram_size;
-
 	buf->cpu = dma_alloc_coherent(&dev->pdev->dev, size, &buf->dma, GFP_KERNEL);
 	if (!buf->cpu)
 		return -ENOMEM;
 	buf->size = size;
 	if ((buf->dma & (align - 1)) || buf->dma >= GPGPU_DMA_LIMIT ||
-	    size > GPGPU_DMA_LIMIT - buf->dma || buf->dma >= window || size > window - buf->dma) {
+	    size > GPGPU_DMA_LIMIT - buf->dma) {
 		gpgpu_dma_buf_free(dev, buf);
 		return -ERANGE;
 	}
-	buf->addr = dev->vram_size + buf->dma;
+	buf->addr = GPGPU_OUTBOUND_BASE + buf->dma;
 	memset(buf->cpu, 0, size);
 	return 0;
 }
@@ -205,12 +204,14 @@ static int gpgpu_load_firmware(struct gpgpu_device *dev)
 }
 
 /*
- * 第 2 步：Outbound 布局由设备固定为 [vram_size, 4 GiB) → IOVA 0，驱动只核对
- * 布局与 gpgpu_dma_buf_alloc() 的换算一致，然后打开窗口。
+ * 第 2 步：Outbound 布局由设备固定为 [0x8000_0000, 4 GiB) → IOVA 0。驱动只核对
+ * 起点、长度与 Host 基址和 gpgpu_dma_buf_alloc() 的换算一致，再打开窗口。
  */
 static int gpgpu_enable_outbound(struct gpgpu_device *dev)
 {
-	if (gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_GPU_BASE) != dev->vram_size ||
+	if (gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_GPU_BASE) != GPGPU_OUTBOUND_BASE ||
+	    gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_SIZE_LO) != lower_32_bits(GPGPU_OUTBOUND_SIZE) ||
+	    gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_SIZE_HI) != upper_32_bits(GPGPU_OUTBOUND_SIZE) ||
 	    gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_HOST_LO) || gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_HOST_HI))
 		return -EIO;
 	gpgpu_wreg(dev, GPGPU_REG_OUTBOUND_CONTROL, GPGPU_OUTBOUND_ENABLE);

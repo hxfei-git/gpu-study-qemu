@@ -12,9 +12,9 @@
 #include "gpgpu_state.h"
 #include "bar0.h"
 
-/* vram_size 属性的下限与上限（不含），单位字节。 */
+/* vram_size 属性的下限与上限（不含），单位字节；上限即 Outbound 起点。 */
 #define VRAM_SIZE_MIN 4096
-#define VRAM_SIZE_LIMIT (1ULL << 31)
+#define VRAM_SIZE_LIMIT GPGPU_OUTBOUND_BASE
 
 /* ---- 跨模块入口 ---- */
 
