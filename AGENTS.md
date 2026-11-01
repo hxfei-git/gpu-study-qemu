@@ -435,6 +435,8 @@ TAP 计划与结果，不固定通过数；Linux 全栈核对实际比较结果�
 - 阶段依赖、范围和完成标准在[实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)，进入当前阶段
   后再细化近期任务，不预先固定全部目标；已确认设计在 CP/MEC 与 GPUVM 规格，
   确认过程只保留 CP/MEC 规格第 9 节。
+- 与 AMD 实现的差异分析、已发现的缺陷和改进草案在
+  [第三阶段规格评审](<./docs/第三阶段规格评审.md>)；草案确认后转入对应规格，评审只保留链接。
 - 寄存器、位域、访问权限和复位值在[硬件手册](<./docs/GPGPU_硬件手册.html>)；
   组件升级差异在 [PROTOCOL_V4.md](<./software/gpgpu/PROTOCOL_V4.md>)，协议常量以
   `software/gpgpu/include/gpgpu/` 为准。
