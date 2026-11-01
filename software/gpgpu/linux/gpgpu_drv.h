@@ -190,8 +190,9 @@ struct gpgpu_event {
 
 /**
  * struct gpgpu_vm - 会话的 GPU 地址空间
- * @vmid: 用户 VMID；0 表示尚未绑定任何对象。
+ * @vmid: 队列驻留期间占用的用户 VMID；0 表示当前没有占用。
  * @root: 页表根的 VRAM 偏移；GPUVM 关闭时不使用。
+ * @ready: 第一次 MAP 已建立通知页，gpuvm=on 时还有根表与通知页映射。
  * @failed: 页表写入或失效结果未知，禁止继续修改并禁止建队列。
  * @tables: 驱动私有的页表页。
  * @notify: 通知页，事件的通知槽都在这一页内。
@@ -202,6 +203,7 @@ struct gpgpu_event {
 struct gpgpu_vm {
 	u32 vmid;
 	u32 root;
+	bool ready;
 	bool failed;
 	struct list_head tables;
 	struct gpgpu_dma_buf notify;
@@ -294,7 +296,7 @@ struct gpgpu_mgmt_request {
  * @dma_uncertain: DMA 等待超时，无法证明访问已结束；之后禁止 COPY 与回收。
  * @gpuvm: 设备以 gpuvm=on 启动。
  * @vram_size: VRAM 字节数；VRAM 占 GPU 物理地址 [0, vram_size)。
- * @vmids: 用户 VMID 1、2 的占用位图。
+ * @vmids: 用户 VMID 1、2 的占用位图；队列驻留期间占用。
  * @drm: DRM 设备。
  * @fprivs: 全部会话，包括 orphan。
  * @requests: 未回收的管理请求结果区。
@@ -425,6 +427,8 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args);
 
 int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args);
 int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args);
+int gpgpu_vm_attach(struct gpgpu_fpriv *fpriv);
+void gpgpu_vm_detach(struct gpgpu_fpriv *fpriv);
 int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv);
 void gpgpu_vm_save_fault(struct gpgpu_queue *q);
 void gpgpu_vm_clear_free_faults(struct gpgpu_device *dev);

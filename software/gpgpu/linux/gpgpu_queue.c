@@ -6,13 +6,14 @@
  *   1. 检查 Ring 与进度：两个 BO 都已绑定、属于 Host 内存、不被别的队列占用，
  *      偏移对齐且 Ring 与 R/W 不重叠；当前 R == W；
  *   2. 分配会话的 Doorbell 页和页内入口；
- *   3. 分配 MQD，Ring 全部置为 INVALID；
- *   4. 经 HIQ 发送 MAP_QUEUES。结果未知时队列保留为 FAULTED，CP 可能仍在
- *      访问它；确认失败时直接删除。
+ *   3. 分配 MQD；
+ *   4. 取得 VMID（gpgpu_vm_attach()），填写 MQD，Ring 全部置为 INVALID；
+ *   5. 经 HIQ 发送 MAP_QUEUES。结果未知时队列保留为 FAULTED，CP 可能仍在
+ *      访问它，VMID 也一并保留；确认失败时直接删除并归还 VMID。
  *
  * 销毁队列（gpgpu_queue_destroy）：正常队列必须已排空（R == W），经 HIQ 发送
- * UNMAP_QUEUES，确认后消费旧 IH，再放下 Ring 与进度的使用计数。队列对象本身
- * 等事件和 Doorbell 映射都不再引用时才回收。
+ * UNMAP_QUEUES，确认后消费旧 IH，再放下 Ring 与进度的使用计数并归还 VMID。
+ * 队列对象本身等事件和 Doorbell 映射都不再引用时才回收。
  */
 #include <linux/log2.h>
 #include <linux/mm.h>
@@ -165,18 +166,22 @@ static void queue_init_mqd(struct gpgpu_queue *q, const struct gpgpu_queue_creat
 }
 
 /*
- * 第 4 步：MAP_QUEUES 失败后的处理。从未发布、或 CP 明确拒绝（未占用槽）
- * 时可以删除；MQD 访问失败、需要恢复或结果未知时，CP 可能仍持有该队列，保留。
+ * 第 5 步：MAP_QUEUES 失败后的处理。从未发布、或 CP 明确拒绝（未占用槽）
+ * 时删除队列并归还 VMID；MQD 访问失败、需要恢复或结果未知时，CP 可能仍
+ * 持有该队列，队列和 VMID 都保留。
  */
 static int queue_map_failed(struct gpgpu_queue *q, int ret, u32 status, bool published)
 {
+	struct gpgpu_fpriv *fpriv = q->fpriv;
 	bool cp_may_hold = published && (ret || status == GPGPU_MANAGEMENT_MQD_FAULT ||
 					 status == GPGPU_MANAGEMENT_RECOVERY_REQUIRED);
 
-	if (cp_may_hold)
+	if (cp_may_hold) {
 		q->state = GPGPU_QUEUE_FAULTED;
-	else
+	} else {
 		gpgpu_queue_free(q);
+		gpgpu_vm_detach(fpriv);
+	}
 	if (ret)
 		return ret;
 	return status == GPGPU_MANAGEMENT_NO_SLOT ? -ENOSPC : -EIO;
@@ -185,7 +190,7 @@ static int queue_map_failed(struct gpgpu_queue *q, int ret, u32 status, bool pub
 /*
  * gpgpu_queue_create() - QUEUE_CREATE：建立一条用户 AQL 队列
  *
- * 调用者持 vm_serial 与 dev->lock；第 4 步等待管理结果时会暂时释放
+ * 调用者持 vm_serial 与 dev->lock；第 5 步等待管理结果时会暂时释放
  * dev->lock。步骤见文件头。
  *
  * 队列对象在发送 MAP_QUEUES 前就登记为 UNLOADING + uncertain，并取得
@@ -210,7 +215,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	 *    返回 -EINVAL。
 	 */
 	queue_collect(fpriv);
-	if (fpriv->vm.failed || !fpriv->vm.vmid || !ring || !progress || !ring->bound ||
+	if (fpriv->vm.failed || !fpriv->vm.ready || !ring || !progress || !ring->bound ||
 	    !progress->bound || gpgpu_queue_any_live(fpriv))
 		return -EBUSY;
 	if (!queue_args_valid(ring, progress, args) || !fpriv->next_queue)
@@ -229,15 +234,24 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	if (ret)
 		return ret;
 
-	/*
-	 * 3. 分配队列对象与 MQD，登记为“结果未知”，取得 Ring 与
-	 *    进度的使用计数，再填 MQD、把 Ring 置为 INVALID。
-	 */
+	/* 3. 分配队列对象与 MQD。 */
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
 	ret = gpgpu_dma_buf_alloc(dev, &q->mqd, sizeof(GpgpuMqd), 8);
 	if (ret) {
+		kfree(q);
+		return ret;
+	}
+
+	/*
+	 * 4. 队列驻留期间占用 VMID，MQD 写入这个编号。之后把队列登记为
+	 *    “结果未知”，取得 Ring 与进度的使用计数，再填 MQD、把 Ring
+	 *    置为 INVALID。
+	 */
+	ret = gpgpu_vm_attach(fpriv);
+	if (ret) {
+		gpgpu_dma_buf_free(dev, &q->mqd);
 		kfree(q);
 		return ret;
 	}
@@ -258,7 +272,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	list_add_tail(&q->node, &fpriv->queues);
 
 	/*
-	 * 4. 经 HIQ 发送 MAP_QUEUES，由 CP 选择空闲用户槽装载 MQD。失败交给
+	 * 5. 经 HIQ 发送 MAP_QUEUES，由 CP 选择空闲用户槽装载 MQD。失败交给
 	 *    queue_map_failed() 决定删除还是保留；等待期间设备若进入故障，
 	 *    队列保留为 FAULTED。
 	 */
@@ -321,8 +335,9 @@ int gpgpu_queue_query(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
  * 2. 先把队列置为 UNLOADING + uncertain，再经 HIQ 发送 UNMAP_QUEUES。
  *    等待期间文件关闭时，会话因这条队列保留为 orphan；
  * 3. 确认成功：先消费旧 IH，让本队列已发布的通知和错误都处理完，
- *    再放下 Ring 与进度的使用计数并标记 dead，队列对象留待
- *    queue_collect() 回收；
+ *    再放下 Ring 与进度的使用计数并标记 dead，最后归还 VMID，队列对象
+ *    留待 queue_collect() 回收。VMID 归还失败只让 VM 进入 failed，队列
+ *    已经卸载，仍按成功返回；
  *    从未发布：恢复原状态；已发布但 CP 拒绝：队列视为出错；
  *    已发布但结果未知：保持 UNLOADING 与 uncertain，资源全部保留。
  */
@@ -360,6 +375,7 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 		q->progress->users--;
 		q->dead = true;
 		q->uncertain = false;
+		gpgpu_vm_detach(fpriv);
 	} else if (!published) {
 		q->uncertain = false;
 		q->state = dev->fatal ? GPGPU_QUEUE_FAULTED : previous;

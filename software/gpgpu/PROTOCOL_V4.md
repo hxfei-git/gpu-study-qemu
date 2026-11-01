@@ -97,7 +97,7 @@ SYSTEM=1 时整页须在 2 GiB IOVA 窗口内，SYSTEM=0 时整页须在 VRAM �
 
 设备在写 REQ 的同一次寄存器访问中完成失效，没有忙状态。请求含保留位（包括 VMID 0 的 bit 0）、位图为空、RANGE=1 且 START 大于 END 或 END 不小于 2^20，或任一所选 VMID 仍有激活的队列或在途访问时，整体拒绝，不清任何项，ACK 只置 `GPGPU_VM_INV_ERROR`。未启用的 VMID 可以失效。gpuvm=off 时写 REQ、START、END 锁存 `INVALID_CMD`。
 
-驱动一次只请求一个 VMID，核对 ACK 等于 `GPGPU_VM_INV_VMID(vmid)`；绑定和解绑对象只失效该对象的 VPN 范围，启用和停用上下文失效整个 VMID。
+驱动一次只请求一个 VMID，核对 ACK 等于 `GPGPU_VM_INV_VMID(vmid)`；VM 占有 VMID 时，绑定和解绑对象只失效该对象的 VPN 范围；取得和归还 VMID 时失效整个 VMID。
 
 ## 5. 未改变的部分
 

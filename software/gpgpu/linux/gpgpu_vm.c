@@ -2,11 +2,20 @@
 /*
  * GPGPU 驱动：GPU 地址空间
  *
- * 每个会话在第一次绑定对象时取得一个用户 VMID 和一页通知页：
+ * 每个会话在第一次绑定对象时建立地址空间，分配一页通知页：
  *   gpuvm=on   建立三级页表（表页从 VRAM 分配），通知页映射到 GPGPU_VM_NOTIFY_VA；
  *              对象绑定到应用给出的 GPUVA。Host 页的叶子项写 IOVA 并置
  *              SYSTEM，VRAM 页写 VRAM 偏移；
  *   gpuvm=off  不建页表，对象的 GPU 地址就是它的 GPU 物理地址。
+ *
+ * 用户 VMID 只在队列驻留期间占用：
+ *
+ *   建队列   gpgpu_vm_attach()：取空闲 VMID → 写根 → 失效整个 VMID → 启用
+ *   卸载后   gpgpu_vm_detach()：停用 → 失效整个 VMID → 清根 → 归还 VMID
+ *
+ * TLB 项按 VMID 标记，同一个编号会先后分给不同会话，取得和归还时都失效
+ * 整个 VMID，上一个使用者的翻译不会留给下一个。没有驻留队列时 TLB 中
+ * 没有本 VM 的翻译，修改页表只写表项，不发失效。
  *
  * 修改页表后必须同步失效 TLB 并读到 ACK，才能放下旧映射的引用。失效失败时
  * 无法确认设备是否仍在使用旧映射，VM 标记为 failed，保留全部资源。
@@ -105,7 +114,7 @@ static int vm_invalidate_req(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 
 	return -EIO;
 }
 
-/* 失效本 VM 的全部 TLB 项，用于启用和停用上下文。 */
+/* 失效本 VM 的全部 TLB 项，用于取得和归还 VMID；调用时 VM 占有 VMID。 */
 static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 {
 	return vm_invalidate_req(dev, vm, GPGPU_VM_INV_VMID(vm->vmid));
@@ -114,10 +123,14 @@ static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 /*
  * 只失效 [va, va + size) 覆盖的页，用于绑定和解绑一个对象，不影响同一 VM
  * 其他对象的翻译。例：va = 0x0040_0000、size = 0x3000 时 VPN 范围为
- * 0x400～0x402。size 非零。
+ * 0x400～0x402。size 非零。没有驻留队列时 VM 不占 VMID，TLB 中也没有
+ * 它的翻译，直接返回；下次取得 VMID 时会失效整个 VMID。
  */
 static int vm_invalidate_range(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size)
 {
+	if (!vm->vmid)
+		return 0;
+
 	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_START, va / GPGPU_VM_PAGE_SIZE);
 	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_END, (va + size - 1) / GPGPU_VM_PAGE_SIZE);
 	return vm_invalidate_req(dev, vm, GPGPU_VM_INV_VMID(vm->vmid) | GPGPU_VM_INV_RANGE);
@@ -147,66 +160,36 @@ static int vm_set_ptes(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u6
 }
 
 /*
- * gpuvm=on：分配根表页，把通知页映射到固定的 GPGPU_VM_NOTIFY_VA，CP 才能
- * 按 GPUVA 写通知槽。之后把根写进本 VMID 的上下文寄存器，失效 TLB，最后
- * 启用上下文。设备在启用时检查根页合法，读回 ENABLE 确认已接受。
+ * vm_init() - 第一次绑定时建立地址空间
+ *
+ * 会话第一次 MAP 时调用，之后直接返回（VM 已失败时返回 -EIO）。这里不取
+ * VMID：VMID 到建队列时才由 gpgpu_vm_attach() 取得，页表根也在那时写进
+ * 上下文寄存器。
+ *
+ * 1. 分配一页通知页，会话的全部事件通知槽都在这一页内；
+ * 2. gpuvm=on 时分配根表页，并把通知页映射到固定的 GPGPU_VM_NOTIFY_VA，
+ *    CP 才能按 GPUVA 写通知槽；gpuvm=off 时设备直接使用物理地址，不需要
+ *    这一步。
+ *
+ * 失败后 VM 进入 failed，已取得的存储留到会话清理时回收。
  */
-static int vm_enable_translation(struct gpgpu_device *dev, struct gpgpu_vm *vm)
-{
-	u32 ctx = GPGPU_REG_VM_CONTEXT(vm->vmid);
-	int ret;
-
-	ret = vm_table_alloc(dev, vm, &vm->root);
-	if (!ret)
-		ret = vm_set_ptes(dev, vm, GPGPU_VM_NOTIFY_VA, PAGE_SIZE, vm->notify.dma,
-				  GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_WRITE);
-	if (ret)
-		return ret;
-
-	gpgpu_wreg64(dev, ctx + GPGPU_VM_ROOT_LO, vm->root);
-	ret = vm_invalidate(dev, vm);
-	if (ret)
-		return ret;
-
-	gpgpu_wreg(dev, ctx + GPGPU_VM_ENABLE, 1);
-	return gpgpu_rreg(dev, ctx + GPGPU_VM_ENABLE) == 1 ? 0 : -EIO;
-}
-
-/*
- * vm_bind() - 第一次绑定时建立地址空间
- *
- * 会话第一次 MAP 时调用，之后直接返回（VM 已失败时返回 -EIO）。
- *
- * 1. 从 VMID 1、2 中取一个空闲的，全设备最多两个会话同时拥有地址空间；
- * 2. 分配一页通知页，会话的全部事件通知槽都在这一页内；
- * 3. gpuvm=on 时建立页表并启用该 VMID 的翻译；gpuvm=off 时设备直接
- *    使用物理地址，不需要这一步。
- *
- * 第 2、3 步失败后 VM 进入 failed，已取得的 VMID 和存储留到会话清理时
- * 回收。
- */
-static int vm_bind(struct gpgpu_device *dev, struct gpgpu_vm *vm)
+static int vm_init(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 {
 	int ret;
 
-	if (vm->vmid)
+	if (vm->ready)
 		return vm->failed ? -EIO : 0;
+	vm->ready = true;
 
-	/* 1. 原子地占用第一个空闲的用户 VMID。 */
-	for (vm->vmid = 1; vm->vmid <= GPGPU_VM_USERS; vm->vmid++)
-		if (!test_and_set_bit(vm->vmid, &dev->vmids))
-			break;
-	if (vm->vmid > GPGPU_VM_USERS) {
-		vm->vmid = 0;
-		return -ENOSPC;
-	}
-
-	/* 2. 通知页按页对齐，gpuvm=on 时整页映射给设备。 */
+	/* 1. 通知页按页对齐，gpuvm=on 时整页映射给设备。 */
 	ret = gpgpu_dma_buf_alloc(dev, &vm->notify, PAGE_SIZE, PAGE_SIZE);
 
-	/* 3. 只有 gpuvm=on 才需要页表。 */
+	/* 2. 只有 gpuvm=on 才需要页表。 */
 	if (!ret && dev->gpuvm)
-		ret = vm_enable_translation(dev, vm);
+		ret = vm_table_alloc(dev, vm, &vm->root);
+	if (!ret && dev->gpuvm)
+		ret = vm_set_ptes(dev, vm, GPGPU_VM_NOTIFY_VA, PAGE_SIZE, vm->notify.dma,
+				  GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_WRITE);
 	if (ret)
 		vm->failed = true;
 	return ret;
@@ -256,12 +239,14 @@ static int map_args_valid(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo,
  *
  * 1. VM 已失败或有存活队列时返回 -EBUSY：队列存活期间冻结地址空间；
  *    再检查对象、权限和 GPUVA 区间；
- * 2. 第一次绑定时建立地址空间（VMID、通知页与页表）；
+ * 2. 第一次绑定时建立地址空间（通知页与页表），不取 VMID；
  * 3. 记录绑定地址并取得绑定引用：此后即使句柄关闭，对象和存储
  *    也保留到 UNMAP 或会话清理。gpuvm=off 时 GPU 地址就是物理地址，
  *    到此结束；
- * 4. gpuvm=on 时写 PTE 并同步失效 TLB。写入或失效失败时 VM 进入 failed，
- *    无法确认设备看到的映射，绑定引用保留到会话清理。
+ * 4. gpuvm=on 时写 PTE，VM 占有 VMID 时再按范围同步失效 TLB。队列存活
+ *    期间禁止 MAP，这里实际不占 VMID，旧翻译由取得 VMID 时的整体失效
+ *    清除。写入或失效失败时 VM 进入 failed，无法确认设备看到的映射，
+ *    绑定引用保留到会话清理。
  */
 int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 {
@@ -277,8 +262,8 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	if (ret)
 		return ret;
 
-	/* 2. 首次绑定时取得 VMID 与通知页，必要时建页表。 */
-	ret = vm_bind(dev, vm);
+	/* 2. 首次绑定时分配通知页，必要时建页表。 */
+	ret = vm_init(dev, vm);
 	if (ret)
 		return ret;
 
@@ -315,8 +300,9 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
  * @fpriv: 会话；调用者持 dev->lock。
  * @args: ioctl 参数；handle 与 permissions 必须为 0。
  *
- * 按地址查找，句柄已关闭的对象也能解绑。gpuvm=on 时先清 PTE 并失效，
- * 读到 ACK 后才放下绑定引用；句柄已关闭的对象同时放下列表引用。
+ * 按地址查找，句柄已关闭的对象也能解绑。gpuvm=on 时先清 PTE；VM 占有
+ * VMID 时再失效并读到 ACK，之后才放下绑定引用；句柄已关闭的对象同时
+ * 放下列表引用。
  */
 int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 {
@@ -369,18 +355,94 @@ static int vm_disable_translation(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 }
 
 /**
+ * gpgpu_vm_attach() - 为即将驻留的队列取得 VMID
+ * @fpriv: 会话；调用者持 vm_serial 与 dev->lock，VM 已建立、未失败且没有
+ *         存活队列。
+ *
+ * 建队列时在写 MQD 之前调用，MQD 中写入这里取得的编号：
+ *
+ * 1. 从 VMID 1、2 中取一个空闲的。没有空闲编号时返回 -ENOSPC，不改任何
+ *    状态；
+ * 2. gpuvm=on 时把根写进上下文寄存器，失效整个 VMID，再启用上下文。TLB 项
+ *    按 VMID 标记，这个编号上一次可能属于别的会话，必须先清掉它留下的
+ *    翻译。设备启用时检查根页合法，读回 ENABLE 确认已接受。gpuvm=off 时
+ *    VMID 只标识队列来源，不配置上下文。
+ *
+ * 第 2 步的结果未知时 VM 进入 failed，VMID 保留到会话清理。
+ *
+ * Return: 0、-ENOSPC 或 -EIO。
+ */
+int gpgpu_vm_attach(struct gpgpu_fpriv *fpriv)
+{
+	struct gpgpu_device *dev = fpriv->dev;
+	struct gpgpu_vm *vm = &fpriv->vm;
+	u32 ctx;
+	int ret;
+
+	/* 1. 原子地占用第一个空闲的用户 VMID。 */
+	for (vm->vmid = 1; vm->vmid <= GPGPU_VM_USERS; vm->vmid++)
+		if (!test_and_set_bit(vm->vmid, &dev->vmids))
+			break;
+	if (vm->vmid > GPGPU_VM_USERS) {
+		vm->vmid = 0;
+		return -ENOSPC;
+	}
+	if (!dev->gpuvm)
+		return 0;
+
+	/* 2. 写根 → 失效整个 VMID → 启用并读回。 */
+	ctx = GPGPU_REG_VM_CONTEXT(vm->vmid);
+	gpgpu_wreg64(dev, ctx + GPGPU_VM_ROOT_LO, vm->root);
+	ret = vm_invalidate(dev, vm);
+	if (!ret) {
+		gpgpu_wreg(dev, ctx + GPGPU_VM_ENABLE, 1);
+		if (gpgpu_rreg(dev, ctx + GPGPU_VM_ENABLE) != 1)
+			ret = -EIO;
+	}
+	if (ret)
+		vm->failed = true;
+	return ret;
+}
+
+/**
+ * gpgpu_vm_detach() - 队列卸载后归还 VMID
+ * @fpriv: 会话；调用者持 dev->lock，并已确认 CP 不再持有本 VM 的队列。
+ *
+ * gpuvm=on 时先停用上下文、失效整个 VMID，再清零根地址：这个编号随后
+ * 可能交给别的会话，设备不会再经本 VM 翻译，TLB 中也不留本 VM 的翻译。
+ * 停用或失效的结果未知时 VM 进入 failed，VMID 保留到会话清理时再试。
+ * 没有占用 VMID 时直接返回。
+ */
+void gpgpu_vm_detach(struct gpgpu_fpriv *fpriv)
+{
+	struct gpgpu_device *dev = fpriv->dev;
+	struct gpgpu_vm *vm = &fpriv->vm;
+
+	if (!vm->vmid)
+		return;
+	if (dev->gpuvm && vm_disable_translation(dev, vm)) {
+		vm->failed = true;
+		return;
+	}
+	clear_bit(vm->vmid, &dev->vmids);
+	vm->vmid = 0;
+}
+
+/**
  * gpgpu_vm_cleanup() - 会话结束时拆除地址空间
  * @fpriv: 会话；调用者持 dev->lock。
  *
  * 文件关闭时调用（gpgpu_postclose()、gpgpu_fpriv_destroy()）。必须先确认
- * 设备不会再经本 VM 访问内存，才能放下对象并归还页表页和 VMID。
+ * 设备不会再经本 VM 访问内存，才能放下对象，归还页表页、通知页和
+ * VMID。
  *
  * 1. 设备仍在运行时：有存活队列或 DMA 结果未知则返回 -EBUSY；否则先
- *    消费旧 IH，让通知和故障都处理完，gpuvm=on 时再停用上下文并失效 TLB。
+ *    消费旧 IH，让通知和故障都处理完。VMID 通常已在队列卸载时归还；
+ *    上次归还失败而仍占有 VMID 时，gpuvm=on 再停用上下文并失效 TLB。
  *    设备已停止时它不会再访问内存，直接回收；
  * 2. 释放全部事件：它们的通知槽都在即将释放的通知页内；
  * 3. 放下全部绑定引用，没有其他引用的对象随之释放；
- * 4. 归还页表页、通知页与 VMID，VMID 可以分给其他会话。
+ * 4. 归还页表页、通知页与仍占有的 VMID。
  *
  * Return: 0，或设备可能仍在访问时的 -EBUSY / -EIO（资源全部保留）。
  */
@@ -391,7 +453,7 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 	struct gpgpu_vm_table *table, *next;
 	struct gpgpu_bo *bo;
 
-	if (!vm->vmid)
+	if (!vm->ready)
 		return 0;
 
 	/* 1. 设备仍在运行时，先确认它不会再经本 VM 访问内存。 */
@@ -399,7 +461,7 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 		if (gpgpu_queue_any_live(fpriv) || dev->dma_uncertain)
 			return -EBUSY;
 		gpgpu_ih_drain(dev);
-		if (dev->gpuvm && vm_disable_translation(dev, vm))
+		if (vm->vmid && dev->gpuvm && vm_disable_translation(dev, vm))
 			return -EIO;
 	}
 
@@ -422,9 +484,11 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 		kfree(table);
 	}
 	gpgpu_dma_buf_free(dev, &vm->notify);
-	clear_bit(vm->vmid, &dev->vmids);
+	if (vm->vmid)
+		clear_bit(vm->vmid, &dev->vmids);
 	vm->vmid = 0;
 	vm->root = 0;
+	vm->ready = false;
 	return 0;
 }
 

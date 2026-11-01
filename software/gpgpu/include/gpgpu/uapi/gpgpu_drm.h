@@ -152,7 +152,7 @@ struct gpgpu_va_range {
  * @user_vmids: 全设备用户 VMID 数量。
  * @queues_per_vm: 每个 VM 可同时持有的用户队列数量。
  * @range_count: ranges 中有效的区间数量。
- * @bindings: 全设备已绑定的用户 VMID 数量，包含异常保留项。
+ * @bindings: 全设备当前被队列占用的用户 VMID 数量，包含异常保留项。
  * @ranges: 可分配区间，已经排除设备和驱动保留地址。
  */
 struct gpgpu_vm_info {
