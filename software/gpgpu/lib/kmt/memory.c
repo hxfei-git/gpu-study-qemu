@@ -17,11 +17,23 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
 	return (value + alignment - 1) & ~(alignment - 1);
 }
 
-/* 与已绑定对象重叠时返回该对象，否则返回 NULL。调用者持 lock。 */
+/* m 已绑定，且绑定范围与 [va, va + size) 重叠。 */
+static bool vm_overlaps(const KmtMemory *m, uint64_t va, uint64_t size)
+{
+	return m->bound && va < m->pub.gpu_address + m->pub.mapped_size &&
+		m->pub.gpu_address < va + size;
+}
+
+/*
+ * 与已绑定对象重叠时返回该对象，否则返回 NULL。通知页不在 memory
+ * 链表中，单独检查。调用者持 lock。
+ */
 static KmtMemory *vm_find_overlap(GpgpuKmtContext *c, uint64_t va, uint64_t size)
 {
+	if (c->notify && vm_overlaps(c->notify, va, size))
+		return c->notify;
 	for (KmtMemory *m = c->memory; m; m = m->next)
-		if (va < m->pub.gpu_address + m->pub.mapped_size && m->pub.gpu_address < va + size)
+		if (vm_overlaps(m, va, size))
 			return m;
 	return NULL;
 }
@@ -60,59 +72,43 @@ static bool map_error_uncertain(int error)
 }
 
 /*
- * gpgpuKmtAllocMemory() - 创建并绑定一个整对象
+ * kmt_memory_create() - 创建并绑定一个整对象，填写 m，不挂入连接链表
  *
  * 一个内存对象由三部分组成：驱动中的 GEM 对象、Host 对象在本进程的 CPU
- * 映射，以及设备可用的 GPU 地址。依次建立：
+ * 映射，以及设备可用的 GPU 地址。调用者持 lock，依次建立：
  *
  * 1. GPGPU_DRM_BO_CREATE 创建 GEM 对象，驱动返回句柄、页对齐后的
- *    mapped_size 和 mmap 偏移；
+ *    mapped_size 和 mmap 偏移；flags 带 GPGPU_BO_EVENT_PAGE 时驱动同时把它
+ *    登记为会话的通知页；
  * 2. Host 对象用 mmap 建立 CPU 映射。VRAM 对象没有 CPU 映射，
  *    只能经 CopyMemory 访问；
  * 3. GPUVM 开启时由库在可分配区间中挑选对齐的 GPUVA（或使用 fixed_va），
  *    再用 GPGPU_DRM_MAP 让驱动写页表；关闭时驱动在 map.address 中返回
  *    GPU 物理地址。绑定失败且驱动可能已写入部分页表时标记 uncertain；
- * 4. 填写公开信息，挂到连接的 memory 链表。
+ * 4. 填写 m 的公开信息与句柄。
  *
  * 第 2、3 步失败时解除 CPU 映射并关闭 GEM 句柄。整个过程持连接锁，
  * 保证并发分配不会选到同一个 GPUVA。
  */
-GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t size,
-				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
-				   GpgpuKmtMemory **memory)
+GpgpuKmtStatus kmt_memory_create(GpgpuKmtContext *c, uint32_t kind, uint32_t flags, uint64_t size,
+				 uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
+				 KmtMemory *m)
 {
 	struct gpgpu_bo_create create = {
 		.version = GPGPU_DRM_VERSION,
 		.kind = kind,
 		.size = size,
 		.alignment = alignment,
+		.flags = flags,
 	};
 	struct gpgpu_vm_map map = { .version = GPGPU_DRM_VERSION, .permissions = permissions };
 	GpgpuKmtStatus status;
-	KmtMemory *m;
 	void *cpu = NULL;
-
-	if (!memory || !size || !alignment || (alignment & (alignment - 1)))
-		return GPGPU_KMT_INVALID_PARAMETER;
-	*memory = NULL;
-	m = calloc(1, sizeof(*m));
-	if (!m)
-		return GPGPU_KMT_NO_MEMORY;
-	status = kmt_enter(c);
-	if (status != GPGPU_KMT_SUCCESS)
-		goto free_m;
-	pthread_mutex_lock(&c->lock);
-
-	/* GPUVM 关闭时设备地址由驱动分配，不能指定 fixed_va。 */
-	if (!c->gpuvm && fixed_va) {
-		status = GPGPU_KMT_NOT_SUPPORTED;
-		goto out;
-	}
 
 	/* 1. 创建 GEM 对象，取得句柄、mapped_size 和 mmap 偏移。 */
 	status = kmt_ioctl(c, GPGPU_DRM_BO_CREATE, &create);
 	if (status != GPGPU_KMT_SUCCESS)
-		goto out;
+		return status;
 
 	/* 2. 只有 Host 对象建立 CPU 映射。 */
 	if (kind == GPGPU_MEMORY_HOST) {
@@ -147,7 +143,7 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 		goto undo;
 	}
 
-	/* 4. 挂入链表后把 m 置 NULL，避免末尾的 free 释放它。 */
+	/* 4. 填写公开信息。 */
 	m->pub = (GpgpuKmtMemory) {
 		.kind = kind,
 		.size = size,
@@ -158,17 +154,49 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 	m->context = c;
 	m->handle = create.handle;
 	m->bound = true;
-	m->next = c->memory;
-	c->memory = m;
-	*memory = &m->pub;
-	m = NULL;
-	goto out;
+	return GPGPU_KMT_SUCCESS;
 undo:
 	if (cpu)
 		munmap(cpu, create.mapped_size);
 	/* 句柄关不掉时驱动仍保留对象，本连接不能再报告正常关闭。 */
 	if (gem_close(c, create.handle) != GPGPU_KMT_SUCCESS)
 		c->uncertain = true;
+	return status;
+}
+
+/* 创建并绑定一个整对象，成功后挂到连接的 memory 链表。 */
+GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t size,
+				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
+				   GpgpuKmtMemory **memory)
+{
+	GpgpuKmtStatus status;
+	KmtMemory *m;
+
+	if (!memory || !size || !alignment || (alignment & (alignment - 1)))
+		return GPGPU_KMT_INVALID_PARAMETER;
+	*memory = NULL;
+	m = calloc(1, sizeof(*m));
+	if (!m)
+		return GPGPU_KMT_NO_MEMORY;
+	status = kmt_enter(c);
+	if (status != GPGPU_KMT_SUCCESS)
+		goto free_m;
+	pthread_mutex_lock(&c->lock);
+
+	/* GPUVM 关闭时设备地址由驱动分配，不能指定 fixed_va。 */
+	if (!c->gpuvm && fixed_va) {
+		status = GPGPU_KMT_NOT_SUPPORTED;
+		goto out;
+	}
+
+	status = kmt_memory_create(c, kind, 0, size, alignment, permissions, fixed_va, m);
+	if (status == GPGPU_KMT_SUCCESS) {
+		/* 挂入链表后把 m 置 NULL，避免末尾的 free 释放它。 */
+		m->next = c->memory;
+		c->memory = m;
+		*memory = &m->pub;
+		m = NULL;
+	}
 out:
 	pthread_mutex_unlock(&c->lock);
 	kmt_leave(c);

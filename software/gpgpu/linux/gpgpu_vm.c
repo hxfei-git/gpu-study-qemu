@@ -2,11 +2,14 @@
 /*
  * GPGPU 驱动：GPU 地址空间
  *
- * 每个会话在第一次绑定对象时建立地址空间，分配一页通知页：
- *   gpuvm=on   建立三级页表（表页从 VRAM 分配），通知页映射到 GPGPU_VM_NOTIFY_VA；
- *              对象绑定到应用给出的 GPUVA。Host 页的叶子项写 IOVA 并置
- *              SYSTEM，VRAM 页写 VRAM 偏移；
+ * 每个会话在第一次绑定对象时建立地址空间：
+ *   gpuvm=on   建立三级页表（表页从 VRAM 分配），对象绑定到应用给出的
+ *              GPUVA。Host 页的叶子项写 IOVA 并置 SYSTEM，VRAM 页写 VRAM 偏移；
  *   gpuvm=off  不建页表，对象的 GPU 地址就是它的 GPU 物理地址。
+ *
+ * 通知页由用户态创建：BO_CREATE 带 GPGPU_BO_EVENT_PAGE 时登记为会话的
+ * 通知页，应用再像普通对象一样把它 MAP 到 GPU 地址。登记期间通知页持有
+ * 一个 users 计数，不能解绑，会话清理时撤销登记。
  *
  * 用户 VMID 只在队列驻留期间占用：
  *
@@ -167,42 +170,31 @@ static int vm_set_ptes(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u6
  *
  * 会话第一次 MAP 时调用，之后直接返回（VM 已失败时返回 -EIO）。这里不取
  * VMID：VMID 到建队列时才由 gpgpu_vm_attach() 取得，页表根也在那时写进
- * 上下文寄存器。
+ * 上下文寄存器。gpuvm=on 时分配根表页；gpuvm=off 时设备直接使用物理地址，
+ * 不需要页表。
  *
- * 1. 分配一页通知页，会话的全部事件通知槽都在这一页内；
- * 2. gpuvm=on 时分配根表页，并把通知页映射到固定的 GPGPU_VM_NOTIFY_VA，
- *    CP 才能按 GPUVA 写通知槽；gpuvm=off 时设备直接使用物理地址，不需要
- *    这一步。
- *
- * 失败后 VM 进入 failed，已取得的存储留到会话清理时回收。
+ * 失败后 VM 进入 failed，已取得的表页留到会话清理时回收。
  */
 static int vm_init(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 {
-	int ret;
+	int ret = 0;
 
 	if (vm->ready)
 		return vm->failed ? -EIO : 0;
 	vm->ready = true;
 
-	/* 1. 通知页按页对齐，gpuvm=on 时整页映射给设备。 */
-	ret = gpgpu_dma_buf_alloc(dev, &vm->notify, PAGE_SIZE, PAGE_SIZE);
-
-	/* 2. 只有 gpuvm=on 才需要页表。 */
-	if (!ret && dev->gpuvm)
+	if (dev->gpuvm)
 		ret = vm_table_alloc(dev, vm, &vm->root);
-	if (!ret && dev->gpuvm)
-		ret = vm_set_ptes(dev, vm, GPGPU_VM_NOTIFY_VA, PAGE_SIZE, vm->notify.dma,
-				  GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_WRITE);
 	if (ret)
 		vm->failed = true;
 	return ret;
 }
 
-/* 用户 GPUVA 区间：页对齐，不含零页与末尾的通知页。 */
+/* 用户 GPUVA 区间：页对齐，不含零页。 */
 static bool vm_range_ok(u64 va, u64 size)
 {
-	return va >= PAGE_SIZE && !(va & (PAGE_SIZE - 1)) && size && size <= GPGPU_VM_NOTIFY_VA &&
-		va <= GPGPU_VM_NOTIFY_VA - size;
+	return va >= PAGE_SIZE && !(va & (PAGE_SIZE - 1)) && size &&
+		size <= GPGPU_VM_ADDRESS_LIMIT && va <= GPGPU_VM_ADDRESS_LIMIT - size;
 }
 
 /* [va, va + size) 是否与会话中已绑定的对象重叠。 */
@@ -219,14 +211,17 @@ static bool vm_overlaps(struct gpgpu_fpriv *fpriv, u64 va, u64 size)
 /*
  * map_args_valid() - 检查 MAP 参数
  *
- * 对象未绑定；权限非空且只含 R/W/X；gpuvm=on 时 GPUVA 合法且不与已有绑定
- * 重叠，gpuvm=off 时地址必须为 0（由驱动返回物理地址）。
+ * 对象未绑定；权限非空且只含 R/W/X，通知页还必须可写（CP 经用户域
+ * 写通知槽）；gpuvm=on 时 GPUVA 合法且不与已有绑定重叠，gpuvm=off 时
+ * 地址必须为 0（由驱动返回物理地址）。
  */
 static int map_args_valid(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo,
 			  const struct gpgpu_vm_map *args)
 {
 	if (!bo || bo->bound || args->reserved || !args->permissions ||
 	    (args->permissions & ~GPGPU_VM_PERMS))
+		return -EINVAL;
+	if (bo == fpriv->vm.notify && !(args->permissions & GPGPU_VM_WRITE))
 		return -EINVAL;
 	if (!fpriv->dev->gpuvm)
 		return args->address ? -EOPNOTSUPP : 0;
@@ -241,7 +236,7 @@ static int map_args_valid(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo,
  * @args: ioctl 参数；输出最终 GPU 地址。
  *
  * 1. VM 已失败时返回 -EBUSY；再检查对象、权限和 GPUVA 区间；
- * 2. 第一次绑定时建立地址空间（通知页与页表），不取 VMID；
+ * 2. 第一次绑定时建立地址空间（gpuvm=on 时为根表），不取 VMID；
  * 3. 记录绑定地址并取得绑定引用：此后即使句柄关闭，对象和存储
  *    也保留到 UNMAP 或会话清理。gpuvm=off 时 GPU 地址就是物理地址，
  *    到此结束；
@@ -264,7 +259,7 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	if (ret)
 		return ret;
 
-	/* 2. 首次绑定时分配通知页，必要时建页表。 */
+	/* 2. 首次绑定时建立地址空间，gpuvm=on 时分配根表。 */
 	ret = vm_init(dev, vm);
 	if (ret)
 		return ret;
@@ -435,16 +430,17 @@ void gpgpu_vm_detach(struct gpgpu_fpriv *fpriv)
  * @fpriv: 会话；调用者持 dev->lock。
  *
  * 文件关闭时调用（gpgpu_postclose()、gpgpu_fpriv_destroy()）。必须先确认
- * 设备不会再经本 VM 访问内存，才能放下对象，归还页表页、通知页和
- * VMID。
+ * 设备不会再经本 VM 访问内存，才能放下对象，归还页表页和 VMID。
  *
  * 1. 设备仍在运行时：有存活队列或 DMA 结果未知则返回 -EBUSY；否则先
  *    消费旧 IH，让通知和故障都处理完。VMID 通常已在队列卸载时归还；
  *    上次归还失败而仍占有 VMID 时，gpuvm=on 再停用上下文并失效 TLB。
  *    设备已停止时它不会再访问内存，直接回收；
- * 2. 释放全部事件：它们的通知槽都在即将释放的通知页内；
+ * 2. 释放全部事件，再撤销通知页登记：事件的通知槽都在通知页内；
  * 3. 放下全部绑定引用，没有其他引用的对象随之释放；
- * 4. 归还页表页、通知页与仍占有的 VMID。
+ * 4. 归还页表页与仍占有的 VMID。
+ *
+ * 还没有 MAP 过的会话没有地址空间，只撤销可能存在的通知页登记。
  *
  * Return: 0，或设备可能仍在访问时的 -EBUSY / -EIO（资源全部保留）。
  */
@@ -455,8 +451,10 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 	struct gpgpu_vm_table *table, *next;
 	struct gpgpu_bo *bo;
 
-	if (!vm->ready)
+	if (!vm->ready) {
+		gpgpu_vm_set_event_page(fpriv, NULL);
 		return 0;
+	}
 
 	/* 1. 设备仍在运行时，先确认它不会再经本 VM 访问内存。 */
 	if (!dev->stopped) {
@@ -467,8 +465,9 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 			return -EIO;
 	}
 
-	/* 2. 事件的通知槽在通知页内，先于通知页释放。 */
+	/* 2. 事件的通知槽在通知页内，先释放事件再撤销登记。 */
 	gpgpu_event_release_all(fpriv);
+	gpgpu_vm_set_event_page(fpriv, NULL);
 
 	/* 3. 放下每个已绑定对象的绑定引用。 */
 	list_for_each_entry(bo, &fpriv->bos, node) {
@@ -479,19 +478,37 @@ int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv)
 		drm_gem_object_put(&bo->gem);
 	}
 
-	/* 4. 归还页表页、通知页与 VMID。 */
+	/* 4. 归还页表页与 VMID。 */
 	list_for_each_entry_safe(table, next, &vm->tables, node) {
 		gpgpu_vram_free(dev, &table->blocks);
 		list_del(&table->node);
 		kfree(table);
 	}
-	gpgpu_dma_buf_free(dev, &vm->notify);
 	if (vm->vmid)
 		clear_bit(vm->vmid, &dev->vmids);
 	vm->vmid = 0;
 	vm->root = 0;
 	vm->ready = false;
 	return 0;
+}
+
+/**
+ * gpgpu_vm_set_event_page() - 登记或撤销会话的通知页
+ * @fpriv: 会话；调用者持 dev->lock。
+ * @bo: 要登记的 Host 对象；NULL 表示撤销当前登记。
+ *
+ * 登记期间通知页持有一个 users 计数：UNMAP 返回 -EBUSY，关闭句柄也不放下
+ * 对象。撤销前调用者须确认已没有事件使用其中的通知槽。
+ */
+void gpgpu_vm_set_event_page(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo)
+{
+	struct gpgpu_vm *vm = &fpriv->vm;
+
+	if (vm->notify)
+		vm->notify->users--;
+	vm->notify = bo;
+	if (bo)
+		bo->users++;
 }
 
 /* 找到 q 当前所在的用户槽；不在任何槽上返回 -1。 */

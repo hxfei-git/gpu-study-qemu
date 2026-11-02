@@ -698,6 +698,8 @@ static void test_fault_scope(void)
 #define VM_PROGRESS 0x00101000U
 #define VM_ARGS 0x00102000U
 #define VM_SIGNAL 0x00103000U
+/* 通知页由用户态创建，GPUVA 不固定；测试把它放在 Signal 之后。 */
+#define VM_NOTIFY 0x00104000U
 #define VM_DESC 0x00400000U
 #define VM_CODE 0x00401000U
 #define VM_DATA 0x00402000U
@@ -786,7 +788,7 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 		{ VM_PROGRESS, QUEUE_WPTR(0), host | rw },
 		{ VM_ARGS, QUEUE_ARGS(0), host | GPGPU_VM_READ },
 		{ VM_SIGNAL, QUEUE_SIGNAL(0), host | rw },
-		{ GPGPU_VM_NOTIFY_VA, QUEUE_MAILBOX(0), host | rw },
+		{ VM_NOTIFY, QUEUE_MAILBOX(0), host | rw },
 		{ VM_DESC, KERNEL_DESC, GPGPU_VM_READ },
 		{ VM_CODE, KERNEL_CODE, code_flags },
 		{ VM_DATA, KERNEL_OUT, rw },
@@ -840,7 +842,7 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint32_t out)
 {
 	aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + 8 * task, VM_SIGNAL + 32 * task,
-		   GPGPU_VM_NOTIFY_VA + 8 * task, out);
+		   VM_NOTIFY + 8 * task, out);
 }
 
 /*

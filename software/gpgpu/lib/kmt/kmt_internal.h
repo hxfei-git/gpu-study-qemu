@@ -94,6 +94,9 @@ typedef struct KmtEvent {
  * @uncertain: 存在结果未知、驱动仍在保留的资源；Close 不能报告成功。
  * @gpuvm: 设备以 GPUVM 模式运行。
  * @vm_info: 打开时查询到的 GPUVM 能力与可分配区间。
+ * @notify: 打开时创建的通知页，事件的通知槽都在其中。不在 memory
+ *          链表中：最后一次 Close 时只解除 CPU 映射，其余由驱动在文件
+ *          关闭时回收。
  * @memory: 内存对象链表。
  * @queues: 队列链表。
  * @events: 事件链表。
@@ -110,6 +113,7 @@ struct GpgpuKmtContext {
 	bool uncertain;
 	bool gpuvm;
 	struct gpgpu_vm_info vm_info;
+	KmtMemory *notify;
 	KmtMemory *memory;
 	GpgpuKmtQueue *queues;
 	KmtEvent *events;
@@ -153,5 +157,9 @@ GpgpuKmtStatus kmt_call(GpgpuKmtContext *context, unsigned long request, void *a
 void kmt_mark_uncertain(GpgpuKmtContext *context);
 /* [offset, offset + size) 非空且位于对象请求长度内。 */
 bool kmt_range_ok(KmtMemory *m, uint64_t offset, uint64_t size);
+/* 创建并绑定一个整对象，填写 m，不挂入链表；调用者持 lock。 */
+GpgpuKmtStatus kmt_memory_create(GpgpuKmtContext *context, uint32_t kind, uint32_t flags,
+				 uint64_t size, uint64_t alignment, uint32_t permissions,
+				 uint64_t fixed_va, KmtMemory *m);
 
 #endif /* GPGPU_KMT_INTERNAL_H */

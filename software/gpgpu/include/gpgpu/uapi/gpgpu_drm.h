@@ -32,6 +32,10 @@ typedef uint64_t gpgpu_u64;
 #define GPGPU_MEMORY_HOST 1U
 /* 内存种类：gpu_buddy 管理的设备 VRAM。 */
 #define GPGPU_MEMORY_VRAM 2U
+/* BO_CREATE 标志：对象是会话的通知页，须为一页 Host 对象。 */
+#define GPGPU_BO_EVENT_PAGE (1U << 0)
+/* 通知页字节数；每个事件占其中一个 8 字节通知槽。 */
+#define GPGPU_EVENT_PAGE_SIZE 4096U
 /* 队列可提交，尚未记录故障。 */
 #define GPGPU_QUEUE_READY 1U
 /* 队列正进行管理操作，禁止重复卸载。 */
@@ -121,7 +125,8 @@ struct gpgpu_queue_state {
  * @timeout_ms: 等待毫秒数；零只检查，UINT32_MAX 不设调用方期限。
  * @state: 输出 PENDING、NOTIFIED 或 FAILED 状态。
  * @error: 输出事件失败时保存的错误值。
- * @mailbox_address: 创建时输出通知槽的 GPUVA 或 GPU 物理地址。
+ * @mailbox_address: 创建时输出通知槽的 GPU 地址，即会话通知页的 GPU 地址
+ *                   加槽号 × 8。
  */
 struct gpgpu_event_request {
 	gpgpu_u32 version;
@@ -174,7 +179,8 @@ struct gpgpu_vm_info {
  * @size: 逻辑大小，单位为字节。
  * @alignment: 存储对齐，单位为字节，必须为 2 的幂。
  * @handle: 输出的本文件 GEM handle，不暴露设备物理地址。
- * @reserved: 保留，输入必须为零。
+ * @flags: 输入 0 或 GPGPU_BO_EVENT_PAGE；带后者时驱动把对象登记为会话的
+ *         通知页，每个会话只能有一个，登记后不能解绑。
  * @mapped_size: 输出的整页映射大小，包含已清零的尾部。
  * @mmap_offset: Host 对象的 CPU 映射偏移；VRAM 对象通过 COPY 访问。
  */
@@ -184,7 +190,7 @@ struct gpgpu_bo_create {
 	gpgpu_u64 size;
 	gpgpu_u64 alignment;
 	gpgpu_u32 handle;
-	gpgpu_u32 reserved;
+	gpgpu_u32 flags;
 	gpgpu_u64 mapped_size;
 	gpgpu_u64 mmap_offset;
 };

@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include "kmt_internal.h"
 
 /* 最后一次 Close 排空每条剩余队列的等待上限，单位毫秒。 */
@@ -104,6 +105,19 @@ bool kmt_range_ok(KmtMemory *m, uint64_t offset, uint64_t size)
 	return m && size && size <= m->pub.size && offset <= m->pub.size - size;
 }
 
+/* 清空连接状态，之后可以重新 Open；fd 由调用者关闭。调用者持 lock。 */
+static void kmt_reset(GpgpuKmtContext *c)
+{
+	free(c->notify);
+	free(c->path);
+	c->notify = NULL;
+	c->path = NULL;
+	c->fd = -1;
+	c->references = 0;
+	c->gpuvm = false;
+	c->uncertain = false;
+}
+
 /* 驱动必须是本库支持的版本：4 KiB 页、32 位 GPUVA、至多一个可分配区间。 */
 static bool kmt_vm_info_supported(const struct gpgpu_vm_info *info)
 {
@@ -125,7 +139,10 @@ static bool kmt_vm_info_supported(const struct gpgpu_vm_info *info)
  * 2. 用 GPGPU_DRM_INFO 查询 GPUVM 能力，核对版本、页大小和地址位数，
  *    不支持时关闭 fd 并返回 VERSION_MISMATCH；
  * 3. 记录 fd、进程号和能力。range_count 为 1 表示 GPUVM 开启，之后由库
- *    挑选 GPUVA；为 0 时设备地址就是驱动返回的 GPU 物理地址。
+ *    挑选 GPUVA；为 0 时设备地址就是驱动返回的 GPU 物理地址；
+ * 4. 创建会话的通知页：一页可读写的 Host 对象，BO_CREATE 带
+ *    GPGPU_BO_EVENT_PAGE，驱动据此登记；事件的通知槽都分配在这一页内。
+ *    失败时关闭 fd，驱动在文件关闭时回收已建立的部分。
  */
 GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 {
@@ -177,6 +194,17 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 	c->references = 1;
 	c->gpuvm = info.range_count == 1;
 	c->vm_info = info;
+
+	/* 4. 通知页创建失败时撤销第 3 步并关闭 fd。 */
+	c->notify = calloc(1, sizeof(*c->notify));
+	status = c->notify ? kmt_memory_create(c, GPGPU_MEMORY_HOST, GPGPU_BO_EVENT_PAGE,
+					       GPGPU_EVENT_PAGE_SIZE, KMT_PAGE_SIZE,
+					       GPGPU_VM_READ | GPGPU_VM_WRITE, 0, c->notify) :
+			     GPGPU_KMT_NO_MEMORY;
+	if (status != GPGPU_KMT_SUCCESS) {
+		kmt_reset(c);
+		close(fd);
+	}
 out:
 	if (status == GPGPU_KMT_SUCCESS)
 		*context = c;
@@ -236,7 +264,9 @@ static bool kmt_has_objects(GpgpuKmtContext *c)
  * 2. 标记 closing 并记下当前线程，然后解锁回收剩余对象。回收函数会再次
  *    kmt_enter() 本连接，只有记下的线程能通过，其他线程的新调用被拒绝。
  *    回收失败时清除 closing 并返回错误；
- * 3. 全部回收后关闭 fd、清空连接，之后可以重新 Open。
+ * 3. 全部回收后解除通知页的 CPU 映射，关闭 fd、清空连接，之后可以重新
+ *    Open。通知页仍登记在驱动中，不经 FreeMemory 释放，由驱动在文件关闭时
+ *    撤销登记并回收。
  */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 {
@@ -274,14 +304,10 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 			goto out;
 	}
 
-	/* 3. 关闭 fd 并复位连接。 */
+	/* 3. 通知页的 CPU 映射也引用 DRM 文件，先解除映射再关闭 fd。 */
+	munmap(c->notify->pub.cpu, c->notify->pub.mapped_size);
 	close(c->fd);
-	free(c->path);
-	c->fd = -1;
-	c->path = NULL;
-	c->references = 0;
-	c->gpuvm = false;
-	c->uncertain = false;
+	kmt_reset(c);
 	status = GPGPU_KMT_SUCCESS;
 out:
 	pthread_mutex_unlock(&c->lock);

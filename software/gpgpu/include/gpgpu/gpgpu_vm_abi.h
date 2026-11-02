@@ -14,8 +14,6 @@
 #define GPGPU_VM_USERS 2U
 /* GPU 地址空间上界（不含）：GPUVA 与 GPU 物理地址都在 32 位内。 */
 #define GPGPU_VM_ADDRESS_LIMIT 0x100000000ULL
-/* 驱动为每个 VM 保留的通知槽页 GPUVA，位于地址空间末页。 */
-#define GPGPU_VM_NOTIFY_VA 0xfffff000U
 
 /*
  * 页表项地址域 [31:12]：SYSTEM 为 1 时是 Host IOVA 页，设备经 Outbound

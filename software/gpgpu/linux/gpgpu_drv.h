@@ -22,7 +22,7 @@
  *     │    ├─ gpgpu_bo（GEM 对象；会话列表、GEM 句柄、GPU 绑定各持一个引用）
  *     │    ├─ gpgpu_queue（引用 Ring 与进度两个 BO）
  *     │    ├─ gpgpu_event（引用来源队列）
- *     │    └─ gpgpu_vm（VMID、页表页与通知页）
+ *     │    └─ gpgpu_vm（VMID、页表页，以及登记为通知页的 BO）
  *     └─ 管理 Ring、管理请求结果区、IH Ring
  *
  * 锁的顺序：vm_serial → lock → management_lock / dma_lock → irq_lock。
@@ -58,7 +58,7 @@
 /* 每条管理 Ring 的字节数；其后另有一页存放 R/W 进度。 */
 #define GPGPU_MGMT_BYTES 4096U
 /* 每个 VM 通知页中的 8 字节通知槽数。 */
-#define GPGPU_NOTIFY_SLOTS (PAGE_SIZE / sizeof(u64))
+#define GPGPU_NOTIFY_SLOTS (GPGPU_EVENT_PAGE_SIZE / sizeof(u64))
 /*
  * 每个会话可同时占用的 Doorbell 入口数（页内入口 0、1），包括已卸载但
  * 尚未回收的队列。设备只有两个用户队列槽，更多入口用不上。
@@ -100,7 +100,8 @@ struct gpgpu_dma_buf {
  * @gpu_addr: 绑定后队列使用的地址：GPUVM 开启时为 GPUVA，否则等于 phys_addr。
  * @bound: 持有 GPU 绑定引用。
  * @permissions: 绑定时的 GPGPU_VM_READ/WRITE/EXEC。
- * @users: 进行中的 COPY 与存活队列持有的使用计数；非零时不能解绑。
+ * @users: 进行中的 COPY、存活队列与通知页登记持有的使用计数；
+ *         非零时不能解绑。
  *
  * 除 gem 与 dev 外的字段由 dev->lock 保护。
  */
@@ -192,10 +193,11 @@ struct gpgpu_event {
  * struct gpgpu_vm - 会话的 GPU 地址空间
  * @vmid: 队列驻留期间占用的用户 VMID；0 表示当前没有占用。
  * @root: 页表根的 VRAM 偏移；GPUVM 关闭时不使用。
- * @ready: 第一次 MAP 已建立通知页，gpuvm=on 时还有根表与通知页映射。
+ * @ready: 第一次 MAP 已建立地址空间，gpuvm=on 时包括根表。
  * @failed: 页表写入或失效结果未知，禁止继续修改并禁止建队列。
  * @tables: 驱动私有的页表页。
- * @notify: 通知页，事件的通知槽都在这一页内。
+ * @notify: 带 GPGPU_BO_EVENT_PAGE 创建的通知页，事件的通知槽都在这一页内；
+ *          登记期间持有它的一个 users 计数。NULL 表示尚未登记。
  * @notify_slots: 通知槽占用位图。
  *
  * 由 dev->lock 保护。
@@ -206,7 +208,7 @@ struct gpgpu_vm {
 	bool ready;
 	bool failed;
 	struct list_head tables;
-	struct gpgpu_dma_buf notify;
+	struct gpgpu_bo *notify;
 	DECLARE_BITMAP(notify_slots, GPGPU_NOTIFY_SLOTS);
 };
 
@@ -430,6 +432,7 @@ int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args);
 int gpgpu_vm_attach(struct gpgpu_fpriv *fpriv);
 void gpgpu_vm_detach(struct gpgpu_fpriv *fpriv);
 int gpgpu_vm_cleanup(struct gpgpu_fpriv *fpriv);
+void gpgpu_vm_set_event_page(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo);
 void gpgpu_vm_save_fault(struct gpgpu_queue *q);
 void gpgpu_vm_clear_free_faults(struct gpgpu_device *dev);
 

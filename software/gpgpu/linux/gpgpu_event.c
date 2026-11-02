@@ -100,15 +100,16 @@ static void event_report(struct gpgpu_event *e, struct gpgpu_event_request *args
  *
  * 1. 来源队列必须存在、未卸载且处于 READY。事件编号回绕为 0
  *    后不再创建，避免与仍存活的旧事件同号；
- * 2. 在会话通知页中找一个空闲的 8 字节槽并清零。通知页在第一次 MAP 时
- *    才分配，还没有通知页时返回 -ENOSPC；
- * 3. 登记事件并返回编号与通知槽地址：gpuvm=on 时是通知页的固定 GPUVA，
- *    gpuvm=off 时是通知页的 GPU 物理地址，再加槽号 * 8。
+ * 2. 在会话通知页中找一个空闲的 8 字节槽并清零。通知页由用户态创建并
+ *    绑定，还没有登记或尚未绑定时返回 -ENOSPC；
+ * 3. 登记事件并返回编号与通知槽地址：通知页绑定得到的 GPU 地址（gpuvm=on
+ *    时为 GPUVA，gpuvm=off 时为 GPU 物理地址）加槽号 * 8。
  */
 int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *args)
 {
 	struct gpgpu_vm *vm = &fpriv->vm;
 	struct gpgpu_queue *q = gpgpu_queue_lookup(fpriv, args->queue_id);
+	struct gpgpu_bo *page = vm->notify;
 	struct gpgpu_event *e;
 	u32 slot;
 
@@ -118,7 +119,7 @@ int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *ar
 
 	/* 2. 占用一个空闲通知槽，CP 写到这里的值就是事件编号。 */
 	slot = find_first_zero_bit(vm->notify_slots, GPGPU_NOTIFY_SLOTS);
-	if (!vm->notify.cpu || slot >= GPGPU_NOTIFY_SLOTS)
+	if (!page || !page->bound || slot >= GPGPU_NOTIFY_SLOTS)
 		return -ENOSPC;
 
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
@@ -127,8 +128,8 @@ int gpgpu_event_create(struct gpgpu_fpriv *fpriv, struct gpgpu_event_request *ar
 
 	set_bit(slot, vm->notify_slots);
 	e->slot = slot;
-	e->mailbox = (u64 *)vm->notify.cpu + slot;
-	e->mailbox_addr = (fpriv->dev->gpuvm ? GPGPU_VM_NOTIFY_VA : vm->notify.addr) + slot * 8;
+	e->mailbox = (u64 *)page->host.cpu + slot;
+	e->mailbox_addr = page->gpu_addr + slot * sizeof(u64);
 	*e->mailbox = 0;
 
 	/* 3. 编号在会话内递增且非零，事件挂到会话链表后返回给应用。 */

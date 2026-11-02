@@ -121,10 +121,16 @@ static const struct drm_gem_object_funcs bo_funcs = {
 
 /*
  * 种类为 Host 或 VRAM；长度非零且不超过可用 VRAM；
- * 对齐为 2 的幂且不超过 GPGPU_QUEUE_RING_MAX。
+ * 对齐为 2 的幂且不超过 GPGPU_QUEUE_RING_MAX；
+ * 标志只能是 GPGPU_BO_EVENT_PAGE，通知页须为一页 Host 对象。
  */
 static bool bo_args_valid(const struct gpgpu_bo_create *args)
 {
+	if (args->flags & ~GPGPU_BO_EVENT_PAGE)
+		return false;
+	if ((args->flags & GPGPU_BO_EVENT_PAGE) &&
+	    (args->kind != GPGPU_MEMORY_HOST || args->size != GPGPU_EVENT_PAGE_SIZE))
+		return false;
 	return (args->kind == GPGPU_MEMORY_HOST || args->kind == GPGPU_MEMORY_VRAM) &&
 		args->size && args->size <= GPGPU_VRAM_USABLE_SIZE && args->alignment &&
 		is_power_of_2(args->alignment) && args->alignment <= GPGPU_QUEUE_RING_MAX;
@@ -154,16 +160,20 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  * 因此不变。
  *
  * 1. VM 已失败时返回 -EBUSY，之后才检查参数格式。新对象尚未绑定，
- *    不改变任何队列能访问的地址，队列存活时也可以创建；
+ *    不改变任何队列能访问的地址，队列存活时也可以创建。带
+ *    GPGPU_BO_EVENT_PAGE 而会话已有通知页时返回 -EEXIST；
  * 2. 分配并清零存储，初始化 GEM。对象另取 DRM 与设备引用，句柄和会话
- *    都关闭后对象仍能安全释放存储；挂入会话链表即持有列表引用；
+ *    都关闭后对象仍能安全释放存储；挂入会话链表即持有列表引用。
+ *    通知页在第 4 步解锁之前登记，并发的第二个通知页请求会在第 1 步
+ *    失败；
  * 3. 建立 mmap 偏移，Host 对象之后可经 render node 映射到用户态；
  * 4. 创建 GEM 句柄。句柄一出现，其他线程就可能用它关闭对象，GEM 核心
  *    随即回调要取 dev->lock 的 bo_close()。因此先取临时引用保住对象，
  *    解锁后再创建；重新加锁后若句柄已被关闭，按失败处理；
  * 5. 记录句柄，返回映射长度和 mmap 偏移（VRAM 对象为 0，不可映射）。
  *
- * 失败时放下列表引用；GEM 的最后一个引用会经 bo_free() 释放存储。
+ * 失败时撤销通知页登记并放下列表引用；GEM 的最后一个引用会经 bo_free()
+ * 释放存储。
  */
 int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 {
@@ -172,11 +182,13 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	u32 handle;
 	int ret;
 
-	/* 1. 先检查 VM 状态，再检查参数。 */
-	if (args->reserved || fpriv->vm.failed)
+	/* 1. 先检查 VM 状态，再检查参数；每个会话只有一个通知页。 */
+	if (fpriv->vm.failed)
 		return -EBUSY;
 	if (!bo_args_valid(args))
 		return -EINVAL;
+	if ((args->flags & GPGPU_BO_EVENT_PAGE) && fpriv->vm.notify)
+		return -EEXIST;
 
 	/* 2. 分配存储，初始化 GEM，再取 DRM、设备引用并挂入会话。 */
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
@@ -200,6 +212,8 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	gpgpu_device_get(dev);
 	bo->fpriv = fpriv;
 	list_add_tail(&bo->node, &fpriv->bos);
+	if (args->flags & GPGPU_BO_EVENT_PAGE)
+		gpgpu_vm_set_event_page(fpriv, bo);
 
 	/* 3. 为 GEM 分配 mmap 偏移，失败时放下刚取得的列表引用。 */
 	ret = drm_gem_create_mmap_offset(&bo->gem);
@@ -218,6 +232,8 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 		ret = -ENOENT;
 
 	if (ret) {
+		if (fpriv->vm.notify == bo)
+			gpgpu_vm_set_event_page(fpriv, NULL);
 		if (bo->fpriv)
 			gpgpu_bo_drop(bo);
 		mutex_unlock(&dev->lock);
@@ -237,6 +253,8 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	return 0;
 
 drop:
+	if (fpriv->vm.notify == bo)
+		gpgpu_vm_set_event_page(fpriv, NULL);
 	gpgpu_bo_drop(bo);
 	return ret;
 }

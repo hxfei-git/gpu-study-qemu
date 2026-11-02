@@ -169,7 +169,7 @@ static void gpgpu_ioctl_exit(struct gpgpu_fpriv *fpriv, bool serial)
 		return ret;                                                               \
 	}
 
-/* INFO：GPUVM 开启时报告一个可分配区间 [PAGE_SIZE, 通知页)，关闭时为零个。 */
+/* INFO：GPUVM 开启时报告可分配区间 [PAGE_SIZE, GPUVA 上限)，关闭时为零个。 */
 static int gpgpu_info(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_info *args)
 {
 	struct gpgpu_device *dev = fpriv->dev;
@@ -184,7 +184,8 @@ static int gpgpu_info(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_info *args)
 		.queues_per_vm = GPGPU_QUEUES_PER_VM,
 		.range_count = dev->gpuvm ? 1 : 0,
 		.bindings = hweight_long(dev->vmids),
-		.ranges = { { dev->gpuvm ? PAGE_SIZE : 0, dev->gpuvm ? GPGPU_VM_NOTIFY_VA : 0 } },
+		.ranges = { { dev->gpuvm ? PAGE_SIZE : 0,
+				dev->gpuvm ? GPGPU_VM_ADDRESS_LIMIT : 0 } },
 	};
 	return 0;
 }
