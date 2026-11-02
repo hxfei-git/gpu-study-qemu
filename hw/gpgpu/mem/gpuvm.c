@@ -303,9 +303,10 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *p
  *
  * 1. 检查 vmid 的上下文已启用，请求不越过 GPUVA 上限，
  *    长度与对齐合法；
- * 2. 增加上下文的在途访问计数。访问 Host 内存时 vfio-user DMA
- *    可能暂时释放主锁，此时 Host 写 VM_INV_REQ 或上下文寄存器
- *    会因计数非零被拒绝，页表根和 TLB 不会在访问中途被换掉；
+ * 2. 增加上下文的在途访问计数。整次访问在主锁下完成：访问 Host 内存的
+ *    vfio-user DMA 同步等待回复，期间不释放主锁，收到的 Host 寄存器写入
+ *    暂存到访问结束后才处理。计数让上下文修改在访问期间被拒绝，也让
+ *    vm_invalidate() 断言这一前提；
  * 3. 逐页查 TLB 或遍历页表，检查叶子项的权限位，再读写物理页；
  * 4. 撤销计数。失败时按 HQD 槽位记录首个故障，已完成的页不回退。
  *
@@ -331,10 +332,7 @@ static bool vm_translated_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64
 		goto fail;
 	}
 
-	/*
-	 * 2. 计数非零期间 vm_context_busy() 为真，Host 发起的失效
-	 *    和上下文修改都会被拒绝，直到第 4 步撤销计数。
-	 */
+	/* 2. 计数非零期间 vm_context_busy() 为真，直到第 4 步撤销计数。 */
 	ctx = &s->vm.contexts[vmid];
 	ctx->accesses++;
 
@@ -404,7 +402,7 @@ bool gpgpu_vm_context_enabled(GPGPUState *s, unsigned int vmid)
 	return vmid >= 1 && vmid <= GPGPU_VM_USERS && s->vm.contexts[vmid].enabled;
 }
 
-/* 上下文有激活的用户队列或在途访问时，Host 不能修改它或使其失效。 */
+/* 上下文有激活的用户队列或在途访问时，Host 不能修改它的根和使能。 */
 static bool vm_context_busy(GPGPUState *s, unsigned int vmid)
 {
 	return s->vm.contexts[vmid].accesses || gpgpu_hqd_vmid_active(s, vmid);
@@ -538,13 +536,17 @@ static void vm_invalidate(GPGPUState *s, uint32_t req)
 	uint32_t start = range ? vm->inv_vpn_start : 0;
 	uint32_t end = range ? vm->inv_vpn_end : VM_VPN_LIMIT - 1;
 
-	/* 1. 请求本身和所选上下文都通过检查后才改动 TLB。 */
+	/*
+	 * 1. 请求本身合法才改动 TLB。所选 VMID 可以有激活的队列：失效在主锁下
+	 *    处理，此时不会有进行到一半的翻译访问（见 vm_translated_rw()），
+	 *    清除后也不会有旧遍历再填回。两次访问之间的任务可能看到新映射，
+	 *    哪些对象还在使用由驱动和应用负责。
+	 */
 	if ((req & ~(VM_INV_VMIDS | GPGPU_VM_INV_RANGE)) || !vmids || start > end ||
 	    end >= VM_VPN_LIMIT)
 		goto invalid;
 	for (unsigned int vmid = 1; vmid <= GPGPU_VM_USERS; vmid++)
-		if ((vmids & GPGPU_VM_INV_VMID(vmid)) && vm_context_busy(s, vmid))
-			goto invalid;
+		g_assert(!(vmids & GPGPU_VM_INV_VMID(vmid)) || !vm->contexts[vmid].accesses);
 
 	/* 2. 清除所选 VMID 在范围内的翻译。 */
 	tlb_invalidate(vm, vmids, start, end);

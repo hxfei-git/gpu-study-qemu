@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * GPGPU 示例：向量加法、矩阵乘法与 ReLU
+ * GPGPU 示例：向量加法、矩阵乘法、ReLU 与队列存活时的数组替换
  *
  * 每个示例：
  *   1. Host 准备输入与 CPU 参考结果；
@@ -239,6 +239,79 @@ out:
 	return rc;
 }
 
+/*
+ * 同一运行时、同一队列连续派发两次向量加法：第一次完成后释放输出数组，
+ * 队列不卸载，再分配新输出区并第二次派发。新输出区先写入 poison，
+ * 第二次计算漏执行时比较会失败。
+ */
+static int lifecycle_demo(GpgpuKmtContext *ctx)
+{
+	const uint32_t count = 17003;
+	const size_t bytes = count * sizeof(float);
+	const GpgpuRtDim3 grid = { (count + 63) / 64, 1, 1 }, block = { 64, 1, 1 };
+	float *a = malloc(bytes), *b = malloc(bytes), *out = malloc(bytes), *ref = malloc(bytes);
+	GpgpuKmtMemory *x, *y, *z;
+	GpgpuRtKernel kernel;
+	GpgpuRt *rt = NULL;
+	uint32_t args[4];
+	int rc = -1;
+
+	if (!a || !b || !out || !ref)
+		goto out;
+	for (uint32_t i = 0; i < count; i++) {
+		a[i] = ((int)(i % 37) - 18) * 0.5f;
+		b[i] = ((int)(i % 23) - 11) * 0.25f;
+		out[i] = DEMO_POISON;
+		ref[i] = a[i] + b[i];
+	}
+	if (check(gpgpu_rt_create(ctx, bytes, &rt), "建立运行时"))
+		goto out;
+
+	/* 1. 装载 Kernel，分配并上传 X、Y、Z，参数块为三个地址与元素数。 */
+	if (check(gpgpu_rt_kernel_load(rt, vector_add_code, sizeof(vector_add_code), 4, &kernel),
+		  "装载 Kernel") ||
+	    check(gpgpu_rt_buffer_alloc(rt, bytes, &x), "分配数组") ||
+	    check(gpgpu_rt_buffer_alloc(rt, bytes, &y), "分配数组") ||
+	    check(gpgpu_rt_buffer_alloc(rt, bytes, &z), "分配数组") ||
+	    check(gpgpu_rt_upload(rt, x, a, bytes), "上传数组") ||
+	    check(gpgpu_rt_upload(rt, y, b, bytes), "上传数组") ||
+	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组") ||
+	    check(gpgpu_rt_arg_address(x, &args[0]), "数组地址") ||
+	    check(gpgpu_rt_arg_address(y, &args[1]), "数组地址") ||
+	    check(gpgpu_rt_arg_address(z, &args[2]), "数组地址"))
+		goto out;
+	args[3] = count;
+
+	/* 2. 第一次派发建立队列。 */
+	if (check(gpgpu_rt_dispatch(rt, &kernel, args, 4, grid, block, DEMO_TIMEOUT_MS), "派发") ||
+	    check(gpgpu_rt_download(rt, z, out, bytes), "下载输出") ||
+	    verify("lifecycle first dispatch", out, ref, count))
+		goto out;
+
+	/* 3. 队列仍驻留：释放 Z，再分配写入 poison 的新输出区。 */
+	for (uint32_t i = 0; i < count; i++)
+		out[i] = DEMO_POISON;
+	if (check(gpgpu_rt_buffer_free(rt, z), "队列存活时释放数组") ||
+	    check(gpgpu_rt_buffer_alloc(rt, bytes, &z), "队列存活时分配数组") ||
+	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组") ||
+	    check(gpgpu_rt_arg_address(z, &args[2]), "数组地址"))
+		goto out;
+
+	/* 4. 同一队列第二次派发。 */
+	if (check(gpgpu_rt_dispatch(rt, &kernel, args, 4, grid, block, DEMO_TIMEOUT_MS), "派发") ||
+	    check(gpgpu_rt_download(rt, z, out, bytes), "下载输出"))
+		goto out;
+	rc = verify("lifecycle second dispatch", out, ref, count);
+out:
+	if (rt && check(gpgpu_rt_destroy(rt), "回收运行时"))
+		rc = -1;
+	free(a);
+	free(b);
+	free(out);
+	free(ref);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	GpgpuKmtContext *ctx = NULL;
@@ -251,13 +324,13 @@ int main(int argc, char **argv)
 		goto out;
 	printf("GPGPU DRM ABI=%u GPUVM=%s\n", info.version, info.range_count ? "on" : "off");
 
-	if (vector_add_demo(ctx) || matmul_demo(ctx) || relu_demo(ctx))
+	if (vector_add_demo(ctx) || matmul_demo(ctx) || relu_demo(ctx) || lifecycle_demo(ctx))
 		goto out;
 	rc = EXIT_SUCCESS;
 out:
 	if (check(gpgpuKmtClose(ctx), "关闭设备（相关资源继续保留）"))
 		rc = EXIT_FAILURE;
 	if (rc == EXIT_SUCCESS)
-		puts("GPGPU demos: 3/3 PASS");
+		puts("GPGPU demos: 4/4 PASS");
 	return rc;
 }

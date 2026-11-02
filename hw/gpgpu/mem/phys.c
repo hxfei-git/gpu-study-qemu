@@ -30,9 +30,9 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
  *
  * 1. 检查 [addr, addr + len) 完整落在 VRAM 或已使能的 Outbound 窗口内，
  *    不允许触及空洞或跨越边界；
- * 2. 增加在途访问计数。访问 Host 内存时 vfio-user DMA 可能暂时释放
- *    主锁，此时 Host 发起的设备复位和 Outbound 重配会因计数非零被拒绝，
- *    窗口配置不会在访问中途被改掉；
+ * 2. 增加在途访问计数。vfio-user DMA 同步等待回复，期间不释放主锁，
+ *    Host 寄存器写入暂存到访问结束后才处理；计数让设备复位和 Outbound
+ *    重配在访问期间被拒绝，作为这一前提的防御检查；
  * 3. VRAM 直接读写设备内部的后备 RAM；Outbound 把地址减去窗口起点、
  *    加上 Host 基址换算成 Host IOVA，再经 vfio-user DMA 读写。
  *    例：0xc100_2000 减去 0x8000_0000 得到 IOVA 0x4100_2000；

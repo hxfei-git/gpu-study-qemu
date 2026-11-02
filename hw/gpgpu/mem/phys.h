@@ -25,8 +25,8 @@
  * @size: 窗口字节数，固定为 GPGPU_OUTBOUND_SIZE。
  * @host_base: 窗口起点对应的 Host IOVA，固定为 0。
  * @status: 最近一次配置写入的 ACK 或 ERROR。
- * @accesses: 在途物理访问数。跨进程 DMA 可能暂时释放主锁，计数非零时
- *            拒绝设备复位和 Outbound 重配。
+ * @accesses: 在途物理访问数。DMA 同步等待期间不释放主锁，计数非零时
+ *            仍拒绝设备复位和 Outbound 重配，作为防御检查。
  * @enabled: 窗口已使能。
  */
 typedef struct GPGPUPhysState {

@@ -844,12 +844,13 @@ static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint32_t ou
 }
 
 /*
- * test_gpuvm_translation() - GPUVM 开启时的完整派发与失效限制
+ * test_gpuvm_translation() - GPUVM 开启时的完整派发与驻留队列的失效
  *
  * 准备：vm_prepare() 建好 VMID 1，代码页可读可执行，槽 2 使用 GPUVA。
  *
  * 期望：CP 读包、描述对象和 Signal，执行器取指、读参数、写数据都经
- * GPUVA 翻译；Kernel 写入 VM_DATA，落到 VRAM KERNEL_OUT。
+ * GPUVA 翻译；Kernel 写入 VM_DATA，落到 VRAM KERNEL_OUT。槽 2 仍激活时
+ * 失效照常完成，但上下文的使能不能修改。
  */
 static void test_gpuvm_translation(void)
 {
@@ -862,14 +863,13 @@ static void test_gpuvm_translation(void)
 	assert_retired(&s, 2, 0, 0);
 
 	/*
-	 * 槽 2 仍激活时，VMID 1 正在使用，失效整体拒绝，ACK 只有 ERROR；
-	 * 卸载槽 2 后该 VMID 没有激活队列，失效完成，ACK 为 VMID 1 的位。
+	 * 槽 2 仍激活时，VMID 1 的失效照常完成，ACK 为 VMID 1 的位；
+	 * 停用上下文仍被拒绝，使能保持 1。
 	 */
-	wr(&s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1));
-	g_assert_cmphex(rd(&s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
-	g_assert_cmpuint(queue_manage(&s, 1, GPGPU_UNMAP_QUEUES, GPA(QUEUE_MQD(2))), ==,
-			 GPGPU_MANAGEMENT_OK);
 	vm_invalidate(&s);
+	wr(&s, GPGPU_REG_VM_CONTEXT(1) + GPGPU_VM_ENABLE, 0);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_CONTEXT(1) + GPGPU_VM_ENABLE), ==, 1);
+	queue_unmap(&s, 2);
 	cp_stop(&s);
 }
 
@@ -987,8 +987,9 @@ static void vm_tlb_round(CPTest *s, uint32_t *number)
  * 期望：
  * b. 依次写五个数据页，第 2 组装不下全部翻译，EVICTIONS 至少加 1
  *    （参数页占一路，实际加 2）；
- * c. 卸载队列后把第 4 页改指新 VRAM 页，只失效这一页：再次写它时结果
- *    落到新页，MISSES 恰好加 1，说明同组其他翻译仍在 TLB 中；
+ * c. 队列保持驻留，把第 4 页改指新 VRAM 页，只失效这一页：再次写它时
+ *    结果落到新页，说明旧翻译已清除；MISSES 恰好加 1，说明同组其他翻译
+ *    仍在 TLB 中；
  * d. 整 VMID 失效后重复 b 的派发序列，MISSES 增量与 b 相同。
  * b、d 都从刚映射完队列时开始计量，两次起点的 TLB 内容一致。CP 轮询会
  * 持续命中，HITS 不作断言。
@@ -1015,17 +1016,15 @@ static void test_gpuvm_tlb(void)
 	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_EVICTIONS) - evictions, >=, 1);
 
 	/*
-	 * c. 第 4 页改指 VM_TLB_OUT(5)，按 VPN 只失效这一页。页已映射，
-	 *    vm_leaf() 只查找叶子项，不会分配新表页。
+	 * c. 队列仍驻留，第 4 页改指 VM_TLB_OUT(5)，按 VPN 只失效这一页。
+	 *    页已映射，vm_leaf() 只查找叶子项，不会分配新表页。
 	 */
-	queue_unmap(&s, 2);
 	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_TLB_DATA(last), &no_alloc),
 		       VM_TLB_OUT(VM_TLB_PAGES) | GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_VALID);
 	wr(&s, GPGPU_REG_VM_INV_VPN_START, vpn);
 	wr(&s, GPGPU_REG_VM_INV_VPN_END, vpn);
 	wr(&s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE);
 	g_assert_cmphex(rd(&s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_VMID(1));
-	queue_map(&s, 2);
 	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);
 	vm_submit(&s, number, VM_TLB_PAGES, VM_TLB_DATA(last));
 	wait_host32(&s, QUEUE_RPTR(2), ++number);

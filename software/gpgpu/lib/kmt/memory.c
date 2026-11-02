@@ -180,8 +180,8 @@ free_m:
 /*
  * gpgpuKmtFreeMemory() - 释放内存对象
  *
- * 连接中还有存活队列时地址空间冻结，返回 UNAVAILABLE；本对象被某条队列
- * 用作 Ring 或进度时同样拒绝。按与分配相反的顺序撤销：
+ * 本对象被某条队列用作 Ring 或进度时返回 UNAVAILABLE；其他对象在队列存活
+ * 期间也可以释放，调用者要先确认没有任务还在使用它。按与分配相反的顺序撤销：
  *
  * 1. GPGPU_DRM_UNMAP 解除 GPU 绑定，设备不能再经这个地址访问对象；
  * 2. 解除 CPU 映射；
@@ -205,8 +205,8 @@ GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory)
 		return status;
 	pthread_mutex_lock(&c->lock);
 
-	/* 队列存活期间地址空间冻结，任何对象都不能释放。 */
-	if (m->queue_users || c->queues) {
+	/* Ring 与进度对象要等所属队列卸载后才能释放。 */
+	if (m->queue_users) {
 		status = GPGPU_KMT_UNAVAILABLE;
 		goto out;
 	}

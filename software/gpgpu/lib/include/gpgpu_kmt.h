@@ -6,11 +6,14 @@
  * 不隐藏提交与等待的细节。对象由库分配，调用者只读其中的公开字段，用对应
  * 的 Free/Destroy 函数释放。
  *
- * 使用顺序（地址空间在队列存活期间冻结）：
+ * 使用顺序：
  *
- *   Open → AllocMemory（全部对象）→ CreateQueue → CreateEvent
+ *   Open → AllocMemory → CreateQueue → CreateEvent
  *        → Reserve → Publish → WaitSignal（可重复）
  *        → DrainQueue → DestroyQueue → DestroyEvent → FreeMemory → Close
+ *
+ * 队列存活期间仍可分配和释放其他对象；Ring 与进度对象要等队列卸载后才能
+ * 释放。驱动不知道哪些任务还在使用某个对象，释放前由调用者确认。
  *
  * 地址：gpu_address 是写进 AQL 包、Signal 与参数块的设备地址；GPUVM 开启时
  * 为 GPUVA，关闭时为 GPU 物理地址。应用无需区分两种模式。

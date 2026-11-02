@@ -7,7 +7,7 @@
   configure   配置两个 QEMU 目标，不需要客体内核
   module      在已保存的开发客体中重编驱动模块
   run         启动远端 CP 设备与开发客体，进入交互 shell
-  stack-test  GPUVM 开、关各运行一次三个计算示例，并核对结果
+  stack-test  GPUVM 开、关各运行一次全部计算示例，并核对结果
 
 configure 不依赖客体内核。
 其他子命令先用 kernel-build.py 准备内核环境。
@@ -380,8 +380,6 @@ def prepare_firmware(output):
     shutil.copy2(ROOT / "build/gpgpu-firmware/gpgpu-cp.bin", output / "gpgpu-cp.bin")
 
 
-# 三个示例在两种模式下都必须给出的逐元素比较结果。
-EXPECTED_VALUES = [("17003", "17003"), ("437", "437"), ("513", "513")]
 
 
 def protocol_version():
@@ -391,11 +389,11 @@ def protocol_version():
 
 
 def check_compute_log(log, mode):
-    """核对示例输出：数值比较、资源回收与设备报告的地址模式。"""
+    """核对示例输出：每次比较全部通过、示例全部完成回收，以及设备报告的地址模式。"""
     values = re.findall(r"^.*: (\d+)/(\d+) values PASS$", log, re.M)
-    if values != EXPECTED_VALUES:
-        raise RuntimeError("三个示例的数值比较结果不完整")
-    if not re.search(r"^GPGPU demos: 3/3 PASS$", log, re.M):
+    if not values or any(passed != total for passed, total in values):
+        raise RuntimeError("示例的数值比较结果不完整")
+    if not re.search(r"^GPGPU demos: (\d+)/\1 PASS$", log, re.M):
         raise RuntimeError("示例未正常完成回收")
     if f"GPGPU DRM ABI={protocol_version()} GPUVM={mode}" not in log:
         raise RuntimeError("设备返回的地址模式或接口版本与本次运行不符")
@@ -403,7 +401,7 @@ def check_compute_log(log, mode):
 
 
 def stack_test(output, device_qemu):
-    """在 A57、1 GiB、IOMMU=none 下运行 GPUVM 开和关的三个计算示例。
+    """在 A57、1 GiB、IOMMU=none 下运行 GPUVM 开和关的全部计算示例。
 
     1. 宿主机构建固件与 Kernel（客体没有 Python，Kernel 头文件经 9p 共享给客体）；
     2. 每种模式各启动一对远端设备与客体，运行 run-demo.sh 并核对输出与内核日志；

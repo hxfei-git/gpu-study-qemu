@@ -23,7 +23,7 @@ help:
 	@echo "  configure         配置 aarch64 Host 与 riscv64 CP，不需要客体内核"
 	@echo "  build             构建两个 QEMU、两个 QTest 程序和 RV64 CP 固件"
 	@echo "  test-gpgpu-qtest  运行设备寄存器与真实 CP 固件回归，核对 TAP"
-	@echo "  test-gpgpu-stack  在 Linux 客体中运行 GPUVM 开／关的三个计算示例"
+	@echo "  test-gpgpu-stack  在 Linux 客体中运行 GPUVM 开／关的全部计算示例"
 	@echo ""
 	@echo "  JOBS=N                    QEMU 并行构建任务数（默认 $(JOBS)）"
 	@echo "  GPGPU_BUILD_DIR=路径      QEMU 配置、构建与 QTest 目录"

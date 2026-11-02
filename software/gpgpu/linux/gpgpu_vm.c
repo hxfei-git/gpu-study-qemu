@@ -19,7 +19,10 @@
  *
  * 修改页表后必须同步失效 TLB 并读到 ACK，才能放下旧映射的引用。失效失败时
  * 无法确认设备是否仍在使用旧映射，VM 标记为 failed，保留全部资源。
- * 用户队列存活期间冻结整个地址空间。
+ *
+ * 队列存活期间也可以绑定和解绑对象，此时 VM 占有 VMID，按对象范围失效。
+ * Ring 与进度对象由 users 计数保护；其他对象有没有任务在用，驱动不知道，
+ * 由应用在解绑前确认。
  */
 #include <linux/slab.h>
 #include "gpgpu_drv.h"
@@ -237,16 +240,15 @@ static int map_args_valid(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo,
  * @fpriv: 会话；调用者持 dev->lock。
  * @args: ioctl 参数；输出最终 GPU 地址。
  *
- * 1. VM 已失败或有存活队列时返回 -EBUSY：队列存活期间冻结地址空间；
- *    再检查对象、权限和 GPUVA 区间；
+ * 1. VM 已失败时返回 -EBUSY；再检查对象、权限和 GPUVA 区间；
  * 2. 第一次绑定时建立地址空间（通知页与页表），不取 VMID；
  * 3. 记录绑定地址并取得绑定引用：此后即使句柄关闭，对象和存储
  *    也保留到 UNMAP 或会话清理。gpuvm=off 时 GPU 地址就是物理地址，
  *    到此结束；
- * 4. gpuvm=on 时写 PTE，VM 占有 VMID 时再按范围同步失效 TLB。队列存活
- *    期间禁止 MAP，这里实际不占 VMID，旧翻译由取得 VMID 时的整体失效
- *    清除。写入或失效失败时 VM 进入 failed，无法确认设备看到的映射，
- *    绑定引用保留到会话清理。
+ * 4. gpuvm=on 时写 PTE。队列驻留时 VM 占有 VMID，再按范围同步失效 TLB；
+ *    不占 VMID 时由下次取得 VMID 时的整体失效清除旧翻译。写入或失效
+ *    失败时 VM 进入 failed，无法确认设备看到的映射，绑定引用保留到
+ *    会话清理。
  */
 int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 {
@@ -255,8 +257,8 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	struct gpgpu_bo *bo = gpgpu_bo_lookup(fpriv, args->handle);
 	int ret;
 
-	/* 1. 先检查地址空间是否冻结，再检查参数。 */
-	if (vm->failed || gpgpu_queue_any_live(fpriv))
+	/* 1. 先检查 VM 状态，再检查参数。 */
+	if (vm->failed)
 		return -EBUSY;
 	ret = map_args_valid(fpriv, bo, args);
 	if (ret)
@@ -300,9 +302,9 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
  * @fpriv: 会话；调用者持 dev->lock。
  * @args: ioctl 参数；handle 与 permissions 必须为 0。
  *
- * 按地址查找，句柄已关闭的对象也能解绑。gpuvm=on 时先清 PTE；VM 占有
- * VMID 时再失效并读到 ACK，之后才放下绑定引用；句柄已关闭的对象同时
- * 放下列表引用。
+ * 按地址查找，句柄已关闭的对象也能解绑。队列的 Ring 与进度对象
+ * （users 非零）返回 -EBUSY。gpuvm=on 时先清 PTE；VM 占有 VMID 时再失效
+ * 并读到 ACK，之后才放下绑定引用；句柄已关闭的对象同时放下列表引用。
  */
 int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 {
@@ -310,7 +312,7 @@ int gpgpu_vm_unmap(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	struct gpgpu_bo *bo;
 	int ret;
 
-	if (fpriv->vm.failed || gpgpu_queue_any_live(fpriv) || dev->dma_uncertain)
+	if (fpriv->vm.failed || dev->dma_uncertain)
 		return -EBUSY;
 	if (args->handle || args->permissions || args->reserved)
 		return -EINVAL;

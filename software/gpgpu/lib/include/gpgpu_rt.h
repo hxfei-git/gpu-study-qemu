@@ -9,11 +9,13 @@
  *   gpgpu_rt_create()            分配暂存区、参数块、Ring、进度页与 Signal
  *   gpgpu_rt_kernel_load()       上传代码并生成 Kernel 描述对象（均在 VRAM）
  *   gpgpu_rt_buffer_alloc()      VRAM 数据区，可 upload/download
+ *   gpgpu_rt_buffer_free()       释放不再使用的数据区
  *   gpgpu_rt_dispatch()          写参数、组包、提交并等待完成
  *   gpgpu_rt_destroy()           按顺序回收
  *
- * 地址空间在队列存活期间冻结，所以全部对象都要在第一次 dispatch 之前分配；
- * gpgpu_rt_dispatch() 在第一次调用时才创建队列。
+ * gpgpu_rt_dispatch() 在第一次调用时才创建队列，每次派发使用新事件。
+ * 队列存活期间仍可分配、释放数据区；释放前须确认已经没有任务使用它。
+ * 同一运行时的各个调用由调用者串行执行。
  */
 #ifndef GPGPU_RT_H
 #define GPGPU_RT_H
@@ -65,6 +67,11 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 
 /* 分配一段可读写的 VRAM 数据区。 */
 GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **buffer);
+/*
+ * 释放由本运行时 buffer_alloc 分配的数据区；内部对象、Kernel 代码和描述对象
+ * 返回 INVALID_PARAMETER。不排空队列，调用者须确认已没有任务使用 buffer。
+ */
+GpgpuKmtStatus gpgpu_rt_buffer_free(GpgpuRt *rt, GpgpuKmtMemory *buffer);
 /* 经暂存区把 Host 数据上传到 VRAM。 */
 GpgpuKmtStatus gpgpu_rt_upload(GpgpuRt *rt, GpgpuKmtMemory *buffer, const void *data,
 			       size_t size);

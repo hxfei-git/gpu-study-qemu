@@ -30,7 +30,7 @@ struct gpgpu_queue *gpgpu_queue_lookup(struct gpgpu_fpriv *fpriv, u32 id)
 	return NULL;
 }
 
-/* 是否有尚未确认卸载的队列（包括出错和结果未知的）；存活期间冻结地址空间。 */
+/* 是否有尚未确认卸载的队列（包括出错和结果未知的）。 */
 bool gpgpu_queue_any_live(struct gpgpu_fpriv *fpriv)
 {
 	struct gpgpu_queue *q;

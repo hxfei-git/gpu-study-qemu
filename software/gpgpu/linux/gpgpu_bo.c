@@ -153,8 +153,8 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  * 从 gpu_buddy 分配连续块。存储在对象寿命内不迁移，绑定后的 GPU 地址
  * 因此不变。
  *
- * 1. VM 已失败或还有存活队列时返回 -EBUSY：队列存活期间冻结对象集合；
- *    之后才检查参数格式；
+ * 1. VM 已失败时返回 -EBUSY，之后才检查参数格式。新对象尚未绑定，
+ *    不改变任何队列能访问的地址，队列存活时也可以创建；
  * 2. 分配并清零存储，初始化 GEM。对象另取 DRM 与设备引用，句柄和会话
  *    都关闭后对象仍能安全释放存储；挂入会话链表即持有列表引用；
  * 3. 建立 mmap 偏移，Host 对象之后可经 render node 映射到用户态；
@@ -172,8 +172,8 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	u32 handle;
 	int ret;
 
-	/* 1. 先检查对象集合是否冻结，再检查参数。 */
-	if (args->reserved || fpriv->vm.failed || gpgpu_queue_any_live(fpriv))
+	/* 1. 先检查 VM 状态，再检查参数。 */
+	if (args->reserved || fpriv->vm.failed)
 		return -EBUSY;
 	if (!bo_args_valid(args))
 		return -EINVAL;

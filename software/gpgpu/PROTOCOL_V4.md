@@ -95,7 +95,7 @@ SYSTEM=1 时整页须在 2 GiB IOVA 窗口内，SYSTEM=0 时整页须在 VRAM �
 
 例：失效 VMID 1 的 GPUVA `0x0040_0000～0x0040_2fff`，依次写 START = `0x400`、END = `0x402`、REQ = `GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE`，ACK 读回 `0x2`。
 
-设备在写 REQ 的同一次寄存器访问中完成失效，没有忙状态。请求含保留位（包括 VMID 0 的 bit 0）、位图为空、RANGE=1 且 START 大于 END 或 END 不小于 2^20，或任一所选 VMID 仍有激活的队列或在途访问时，整体拒绝，不清任何项，ACK 只置 `GPGPU_VM_INV_ERROR`。未启用的 VMID 可以失效。gpuvm=off 时写 REQ、START、END 锁存 `INVALID_CMD`。
+设备在写 REQ 的同一次寄存器访问中完成失效，没有忙状态。请求含保留位（包括 VMID 0 的 bit 0）、位图为空、RANGE=1 且 START 大于 END 或 END 不小于 2^20 时，整体拒绝，不清任何项，ACK 只置 `GPGPU_VM_INV_ERROR`。所选 VMID 有激活的队列时失效照常完成，见第 6 节。未启用的 VMID 可以失效。gpuvm=off 时写 REQ、START、END 锁存 `INVALID_CMD`。
 
 驱动一次只请求一个 VMID，核对 ACK 等于 `GPGPU_VM_INV_VMID(vmid)`；VM 占有 VMID 时，绑定和解绑对象只失效该对象的 VPN 范围；取得和归还 VMID 时失效整个 VMID。
 
@@ -107,3 +107,17 @@ SYSTEM=1 时整页须在 2 GiB IOVA 窗口内，SYSTEM=0 时整页须在 VRAM �
 - MQD、管理命令与结果区、AQL 包、Kernel 描述对象、Signal、IH 记录的布局与字段偏移。
 - CP 私有地址空间（`gpgpu_cp_map.h`），包括 CP 本地访存窗口 `0x8000_0000～0x8000_ffff`。它属于 CP 自己的地址空间，与 GPU 物理地址中的 Outbound 起点没有关系。
 - DRM ioctl 编号与参数结构体布局；只有 `version` 字段改填 4。
+
+<a id="v4-live-mapping"></a>
+
+## 6. 队列存活期间修改映射
+
+本节变化发生在版本 4 之内，协议版本号、寄存器偏移和各结构布局都不变，改变的是设备和驱动接受哪些请求：
+
+- 设备：所选 VMID 有激活的 HQD 时，`VM_INV_REQ` 不再被拒绝，照常同步完成并写 ACK。修改上下文 ROOT、ENABLE 仍要求该 VMID 没有激活的 HQD。
+- 驱动：队列存活时 `BO_CREATE`、`MAP`、`UNMAP` 不再返回 `-EBUSY`。被队列用作 Ring 或进度的对象仍不能解绑。
+- 用户库：`gpgpuKmtFreeMemory()` 只拒绝正被队列使用的 Ring 和进度对象；运行时新增 `gpgpu_rt_buffer_free()`，每次派发使用新事件。
+
+驱动不知道哪些任务还在使用某个对象。解绑前，应用要先等用到它的任务完成，并停止提交引用旧地址的包。完整规则见 GPUVM 规格。
+
+版本号没有变化，旧设备与新驱动之间的不一致无法靠版本检查发现：旧设备在队列运行时会拒绝失效，驱动收到 ERROR 后把 VM 置为 failed。设备、固件、驱动和用户库须按同一源码一起构建。
