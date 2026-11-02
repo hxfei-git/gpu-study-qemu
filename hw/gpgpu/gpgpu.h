@@ -8,7 +8,7 @@
  *   gpgpu.c   QOM/PCI 组装、全局控制、复位编排
  *   bar0.c    BAR0 寄存器分组转发
  *   cp/       原生 CP 控制、CP 访存窗口、HQD、Doorbell
- *   compute/  Dispatch 寄存器、warp 调度、RV32 解释器、lane 访存
+ *   compute/  Dispatch 寄存器、warp 调度、RV64 解释器、lane 访存
  *   mem/      VRAM、GPU 物理地址路由、GPUVM 翻译、DMA
  *   irq/      中断锁存、IH 通知 Ring
  */

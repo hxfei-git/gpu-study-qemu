@@ -2,9 +2,9 @@
 /*
  * GPGPU RT：建立在 KMT 之上的小运行时
  *
- * KMT 只封装驱动接口；把一个 RV32 Kernel 跑起来还需要上传代码、生成描述对象、
- * 建队列与事件、组 AQL 包、准备 Signal 并等待。本层把这些固定步骤收起来，
- * 应用只描述“哪段代码、什么参数、多大网格”：
+ * KMT 只封装驱动接口；把一个 RV64 Kernel 跑起来还需要上传代码、生成描述
+ * 对象、建队列与事件、组 AQL 包、准备 Signal 并等待。本层把这些固定步骤
+ * 收起来，应用只描述“哪段代码、什么参数、多大网格”：
  *
  *   gpgpu_rt_create()            分配暂存区、参数块、Ring、进度页与 Signal
  *   gpgpu_rt_kernel_load()       上传代码并生成 Kernel 描述对象（均在 VRAM）
@@ -23,7 +23,7 @@
 #include "gpgpu/gpgpu_version.h"
 #include "gpgpu_kmt.h"
 
-/* 一次派发中参数块的最多 32 位参数个数。 */
+/* 一次派发中参数块的最多参数个数；每个参数占一个 8 字节槽。 */
 #define GPGPU_RT_MAX_ARGS 16
 
 typedef struct GpgpuRt GpgpuRt;
@@ -61,7 +61,10 @@ GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, Gp
 /* 按“队列 → 事件 → 内存”的顺序回收；队列未能确认卸载时返回错误并保留资源。 */
 GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt);
 
-/* 上传 RV32 代码并生成描述对象；code_size 须为 4 的倍数。 */
+/*
+ * 上传 RV64 代码并生成描述对象；code_size 须为 4 的倍数，参数块长度为
+ * args_count 个 8 字节槽。
+ */
 GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_size,
 				    uint32_t args_count, GpgpuRtKernel *kernel);
 
@@ -79,19 +82,11 @@ GpgpuKmtStatus gpgpu_rt_upload(GpgpuRt *rt, GpgpuKmtMemory *buffer, const void *
 GpgpuKmtStatus gpgpu_rt_download(GpgpuRt *rt, GpgpuKmtMemory *buffer, void *data, size_t size);
 
 /**
- * gpgpu_rt_arg_address() - 把对象的设备地址转成 32 位参数
- * @buffer: 对象。
- * @arg: 输出；RV32 Kernel 以 32 位读取地址。
- *
- * Return: 地址超出 32 位时返回 GPGPU_KMT_INVALID_PARAMETER。
- */
-GpgpuKmtStatus gpgpu_rt_arg_address(GpgpuKmtMemory *buffer, uint32_t *arg);
-
-/**
  * gpgpu_rt_dispatch() - 提交一次派发并等待完成
  * @rt: 运行时。
  * @kernel: 已装载的 Kernel。
- * @args: 参数块内容，依次放在 a0 指向的位置；个数须与装载时一致。
+ * @args: 参数块内容，每个 8 字节，依次放在 a0 指向的位置；个数须与
+ *        装载时一致。数组参数直接填对象的 gpu_address。
  * @args_count: 参数个数，至多 GPGPU_RT_MAX_ARGS。
  * @grid: 各维工作组数。
  * @block: 各维工作组尺寸。
@@ -99,7 +94,7 @@ GpgpuKmtStatus gpgpu_rt_arg_address(GpgpuKmtMemory *buffer, uint32_t *arg);
  *
  * 维度数取最高的非 1 维。总线程数为 grid × block。
  */
-GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const uint32_t *args,
+GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const uint64_t *args,
 				 uint32_t args_count, GpgpuRtDim3 grid, GpgpuRtDim3 block,
 				 uint32_t timeout_ms);
 

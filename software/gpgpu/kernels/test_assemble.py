@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""RV32 教学汇编器的编码回归。
+"""RV64 教学汇编器的编码回归。
 
 用 GNU 汇编器给出的标准编码核对每类指令，并检查 CSR 和寄存器的非法输入。
 运行：python3 software/gpgpu/kernels/test_assemble.py
@@ -19,12 +19,13 @@ def encode(line, pc=0, symbols=None):
 
 
 class EncodeTest(unittest.TestCase):
-    """期望值来自 riscv64-unknown-elf-as -march=rv32imf，浮点舍入位除外。"""
+    """期望值来自 riscv64-unknown-elf-as -march=rv64imf，浮点舍入位除外。"""
 
     def test_integer(self):
         self.assertEqual(encode("addi t0, zero, 5"), 0x00500293)
         self.assertEqual(encode("andi a1, a2, -1"), 0xFFF67593)
         self.assertEqual(encode("slli t1, t1, 2"), 0x00231313)
+        self.assertEqual(encode("slli t1, t1, 33"), 0x02131313)
         self.assertEqual(encode("add t1, t1, t2"), 0x00730333)
         self.assertEqual(encode("sub t1, t1, t2"), 0x40730333)
         self.assertEqual(encode("mul t1, t1, t2"), 0x02730333)
@@ -32,6 +33,8 @@ class EncodeTest(unittest.TestCase):
 
     def test_memory(self):
         self.assertEqual(encode("lw t0, 0(a0)"), 0x00052283)
+        self.assertEqual(encode("ld t2, 24(a0)"), 0x01853383)
+        self.assertEqual(encode("sd t1, 8(t0)"), 0x0062B423)
         self.assertEqual(encode("sw t1, 0(t0)"), 0x0062A023)
         self.assertEqual(encode("flw f0, 0(t2)"), 0x0003A007)
         self.assertEqual(encode("fsw f2, 0(t2)"), 0x0023A027)

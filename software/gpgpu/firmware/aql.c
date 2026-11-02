@@ -96,11 +96,13 @@ static int aql_shape_valid(AqlTask *t)
 /*
  * aql_read_descriptor() - 读取并检查 Kernel 描述对象
  *
- * 包中的 kernel_object 指向运行时生成的 16 字节描述对象。地址按 8 字节
+ * 包中的 kernel_object 指向运行时生成的 24 字节描述对象。地址按 8 字节
  * 对齐时，按队列的访问域把它复制到 t->desc，再检查：
  *
- * - ABI 版本与固件一致；
- * - 代码长度非零，入口和长度按 4 字节对齐，代码低于 GPUVA 上限；
+ * - ABI 版本与固件一致，保留字段为 0；
+ * - 代码长度非零，入口和长度按 4 字节对齐，代码低于 GPUVA 上限。入口
+ *   是 64 位值，先由 cp_range_ok() 确认入口本身低于上限，再算剩余长度，
+ *   越界入口不会让减法回绕；
  * - 参数长度在 4 字节到 64 KiB 之间且为 4 的倍数；包中的参数地址
  *   按 8 字节对齐，整段参数块低于 GPUVA 上限。
  *
@@ -117,9 +119,9 @@ static int aql_read_descriptor(u32 slot, AqlTask *t)
 	    !cp_queue_read_object(slot, GPGPU_QUEUE_ERROR_DESCRIPTOR, t->packet.kernel_object,
 				  &t->desc, sizeof(t->desc)))
 		return 0;
-	return d->kernel_abi_version == GPGPU_KERNEL_ABI_VERSION && d->code_size &&
-		!(d->code_size & 3) && !(d->code_entry & 3) &&
-		d->code_size <= GPGPU_VM_VA_LIMIT - d->code_entry && d->kernarg_size >= 4 &&
+	return d->kernel_abi_version == GPGPU_KERNEL_ABI_VERSION && !d->reserved &&
+		!(d->code_size & 3) && cp_range_ok(d->code_entry, d->code_size, 4) &&
+		d->kernarg_size >= 4 &&
 		d->kernarg_size <= GPGPU_KERNEL_ARGS_MAX && !(d->kernarg_size & 3) &&
 		cp_range_ok(t->packet.kernarg_address, d->kernarg_size, 8);
 }
@@ -222,8 +224,8 @@ static void aql_configure(u32 slot, const AqlTask *t)
 {
 	cp_reg_write(GPGPU_REG_DISPATCH_VMID, cp_slots[slot].vmid);
 	cp_reg_write(GPGPU_REG_DISPATCH_SLOT, slot);
-	cp_reg_write(GPGPU_REG_KERNEL_ADDR_LO, t->desc.code_entry);
-	cp_reg_write(GPGPU_REG_KERNEL_ADDR_HI, 0);
+	cp_reg_write(GPGPU_REG_KERNEL_ADDR_LO, (u32)t->desc.code_entry);
+	cp_reg_write(GPGPU_REG_KERNEL_ADDR_HI, t->desc.code_entry >> 32);
 	cp_reg_write(GPGPU_REG_KERNEL_CODE_SIZE, t->desc.code_size);
 	cp_reg_write(GPGPU_REG_KERNEL_ARGS_LO, (u32)t->packet.kernarg_address);
 	cp_reg_write(GPGPU_REG_KERNEL_ARGS_HI, t->packet.kernarg_address >> 32);

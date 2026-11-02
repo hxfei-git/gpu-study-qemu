@@ -4,7 +4,7 @@
  */
 #include "qemu/osdep.h"
 #include "compute_internal.h"
-#include "rv32.h"
+#include "rv64.h"
 #include "scheduler.h"
 
 /**
@@ -163,7 +163,7 @@ static GPGPUExecResult task_run_warp(GPGPUTask *task)
 		/* 每个活跃 lane 各执行一条指令，任一失败即任务失败。 */
 		for (unsigned int lane_id = 0; lane_id < GPGPU_WARP_SIZE; lane_id++)
 			if (warp->lanes[lane_id].active &&
-			    !gpgpu_rv32_step(&task->exec, warp, lane_id))
+			    !gpgpu_rv64_step(&task->exec, warp, lane_id))
 				return task_failed(task);
 	}
 	return (GPGPUExecResult) { .status = GPGPU_EXEC_COMPLETE };

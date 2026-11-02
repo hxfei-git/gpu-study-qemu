@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# 用户态部分：libgpgpu.a（KMT 薄层 + 小运行时）、三个 RV32 Kernel 与示例程序。
+# 用户态部分：libgpgpu.a（KMT 薄层 + 小运行时）、三个 RV64 Kernel 与示例程序。
 # 客体中构建时，Kernel 头文件由宿主机预先生成在 BUILD_DIR（客体没有 Python）。
 CC ?= cc
 AR ?= ar

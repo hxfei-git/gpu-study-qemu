@@ -73,7 +73,8 @@ static int verify(const char *name, const float *actual, const float *expected, 
  */
 static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 {
-	uint32_t args[GPGPU_RT_MAX_ARGS], arg_count = job->array_count + job->scalar_count;
+	uint32_t arg_count = job->array_count + job->scalar_count;
+	uint64_t args[GPGPU_RT_MAX_ARGS];
 	GpgpuKmtMemory *buffers[GPGPU_RT_MAX_ARGS];
 	DemoArray *out = &job->arrays[job->array_count - 1];
 	size_t staging = job->code_size;
@@ -92,7 +93,7 @@ static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 
 	/*
 	 * 2. 第一次派发前必须分配完所有对象。参数块前 array_count 个是
-	 *    数组的 32 位设备地址，后面接标量。
+	 *    数组的设备地址，后面接标量，每个参数占 8 字节。
 	 */
 	if (check(gpgpu_rt_kernel_load(rt, job->code, job->code_size, arg_count, &kernel),
 		  "装载 Kernel"))
@@ -100,11 +101,12 @@ static int run_job(GpgpuKmtContext *ctx, const DemoJob *job)
 	for (uint32_t i = 0; i < job->array_count; i++) {
 		if (check(gpgpu_rt_buffer_alloc(rt, job->arrays[i].bytes, &buffers[i]), "分配数组") ||
 		    check(gpgpu_rt_upload(rt, buffers[i], job->arrays[i].host, job->arrays[i].bytes),
-			  "上传数组") ||
-		    check(gpgpu_rt_arg_address(buffers[i], &args[i]), "数组地址"))
+			  "上传数组"))
 			goto out;
+		args[i] = buffers[i]->gpu_address;
 	}
-	memcpy(&args[job->array_count], job->scalars, job->scalar_count * sizeof(uint32_t));
+	for (uint32_t i = 0; i < job->scalar_count; i++)
+		args[job->array_count + i] = job->scalars[i];
 
 	/* 3. 派发是同步的，返回时输出已写完，再下载最后一个数组。 */
 	if (check(gpgpu_rt_dispatch(rt, &kernel, args, arg_count, job->grid, job->block,
@@ -253,7 +255,7 @@ static int lifecycle_demo(GpgpuKmtContext *ctx)
 	GpgpuKmtMemory *x, *y, *z;
 	GpgpuRtKernel kernel;
 	GpgpuRt *rt = NULL;
-	uint32_t args[4];
+	uint64_t args[4];
 	int rc = -1;
 
 	if (!a || !b || !out || !ref)
@@ -275,11 +277,11 @@ static int lifecycle_demo(GpgpuKmtContext *ctx)
 	    check(gpgpu_rt_buffer_alloc(rt, bytes, &z), "分配数组") ||
 	    check(gpgpu_rt_upload(rt, x, a, bytes), "上传数组") ||
 	    check(gpgpu_rt_upload(rt, y, b, bytes), "上传数组") ||
-	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组") ||
-	    check(gpgpu_rt_arg_address(x, &args[0]), "数组地址") ||
-	    check(gpgpu_rt_arg_address(y, &args[1]), "数组地址") ||
-	    check(gpgpu_rt_arg_address(z, &args[2]), "数组地址"))
+	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组"))
 		goto out;
+	args[0] = x->gpu_address;
+	args[1] = y->gpu_address;
+	args[2] = z->gpu_address;
 	args[3] = count;
 
 	/* 2. 第一次派发建立队列。 */
@@ -293,9 +295,9 @@ static int lifecycle_demo(GpgpuKmtContext *ctx)
 		out[i] = DEMO_POISON;
 	if (check(gpgpu_rt_buffer_free(rt, z), "队列存活时释放数组") ||
 	    check(gpgpu_rt_buffer_alloc(rt, bytes, &z), "队列存活时分配数组") ||
-	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组") ||
-	    check(gpgpu_rt_arg_address(z, &args[2]), "数组地址"))
+	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组"))
 		goto out;
+	args[2] = z->gpu_address;
 
 	/* 4. 同一队列第二次派发。 */
 	if (check(gpgpu_rt_dispatch(rt, &kernel, args, 4, grid, block, DEMO_TIMEOUT_MS), "派发") ||

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * lane 访存：取指与 LW/SW
+ * lane 访存：取指与 32/64 位数据访问
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -9,13 +9,13 @@
 #include "lane_mem.h"
 
 /* pc 必须 4 字节对齐，且整条指令位于本次派发的代码范围内。 */
-static bool fetch_in_code_range(const GPGPUKernelParams *p, uint32_t pc)
+static bool fetch_in_code_range(const GPGPUKernelParams *p, uint64_t pc)
 {
 	return !(pc & 3) && pc >= p->kernel_addr && p->code_size >= 4 &&
-		(uint64_t)pc - p->kernel_addr <= p->code_size - 4;
+		pc - p->kernel_addr <= p->code_size - 4;
 }
 
-bool gpgpu_lane_fetch(GPGPUExecContext *ctx, uint32_t pc, uint32_t *insn)
+bool gpgpu_lane_fetch(GPGPUExecContext *ctx, uint64_t pc, uint32_t *insn)
 {
 	const GPGPUKernelParams *p = &ctx->params;
 	uint8_t buf[4];
@@ -38,26 +38,29 @@ bool gpgpu_lane_fetch(GPGPUExecContext *ctx, uint32_t pc, uint32_t *insn)
 	return true;
 }
 
-bool gpgpu_lane_load(GPGPUExecContext *ctx, uint32_t addr, uint32_t *value)
+bool gpgpu_lane_load(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, uint64_t *value)
 {
 	const GPGPUKernelParams *p = &ctx->params;
-	uint8_t buf[4];
+	uint8_t buf[8];
 
-	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, sizeof(buf),
-			   GPGPU_VM_READ, GPGPU_VM_PHASE_DATA))
+	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, size, GPGPU_VM_READ,
+			   GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);
-	*value = ldl_le_p(buf);
+	*value = size == 8 ? ldq_le_p(buf) : ldl_le_p(buf);
 	return true;
 }
 
-bool gpgpu_lane_store(GPGPUExecContext *ctx, uint32_t addr, uint32_t value)
+bool gpgpu_lane_store(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, uint64_t value)
 {
 	const GPGPUKernelParams *p = &ctx->params;
-	uint8_t buf[4];
+	uint8_t buf[8];
 
-	stl_le_p(buf, value);
-	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, sizeof(buf),
-			   GPGPU_VM_WRITE, GPGPU_VM_PHASE_DATA))
+	if (size == 8)
+		stq_le_p(buf, value);
+	else
+		stl_le_p(buf, value);
+	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, size, GPGPU_VM_WRITE,
+			   GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);
 	return true;
 }

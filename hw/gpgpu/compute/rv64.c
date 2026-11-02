@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * RV32 解释器：解码与按类别执行
+ * RV64 解释器：解码与按类别执行
  *
- * 每条指令先由 rv32_decode() 拆出字段和立即数，再由 gpgpu_rv32_step()
+ * 每条指令先由 rv64_decode() 拆出字段和立即数，再由 gpgpu_rv64_step()
  * 按 opcode 分派到一个类别函数。类别函数检查本类编码是否合法，合法则
  * 执行并推进 PC。非法编码统一返回 GPGPU_EXEC_ERR_INSTRUCTION。
+ *
+ * 整数寄存器和 PC 为 64 位，立即数先符号扩展到 64 位再参与运算；
+ * 32 位结果（LW、LUI、FCVT.W.S）符号扩展后写回，CSR 值零扩展。
  */
 #include "qemu/osdep.h"
 #include "compute_internal.h"
 #include "lane_mem.h"
-#include "rv32.h"
+#include "rv64.h"
 
-/* RV32 主 opcode。 */
+/* 主 opcode；RV64 的 W 后缀指令（OP-IMM-32、OP-32）不在支持范围内。 */
 enum {
 	OP_LOAD = 0x03,
 	OP_LOAD_FP = 0x07,
@@ -28,6 +31,9 @@ enum {
 
 /* EBREAK 的完整编码。 */
 #define INSN_EBREAK 0x00100073u
+/* LOAD/STORE 的 funct3：32 位字与 64 位双字。 */
+#define MEM_WORD 2
+#define MEM_DOUBLE 3
 
 /* OP-FP 的 funct7。 */
 enum {
@@ -52,7 +58,7 @@ enum {
 #define RM_DYNAMIC 7
 
 /**
- * struct Rv32Insn - 解码后的指令字段
+ * struct Rv64Insn - 解码后的指令字段
  * @raw: 原始指令字。
  * @opcode: [6:0]。
  * @rd: [11:7]。
@@ -65,7 +71,7 @@ enum {
  * @imm_b: B 型符号扩展分支偏移。
  * @imm_j: J 型符号扩展跳转偏移。
  */
-typedef struct Rv32Insn {
+typedef struct Rv64Insn {
 	uint32_t raw;
 	uint32_t opcode;
 	uint32_t rd;
@@ -77,9 +83,9 @@ typedef struct Rv32Insn {
 	int32_t imm_s;
 	int32_t imm_b;
 	int32_t imm_j;
-} Rv32Insn;
+} Rv64Insn;
 
-static Rv32Insn rv32_decode(uint32_t raw)
+static Rv64Insn rv64_decode(uint32_t raw)
 {
 	uint32_t b = ((raw >> 31) << 12) | (((raw >> 7) & 1) << 11) |
 		(((raw >> 25) & 0x3f) << 5) | (((raw >> 8) & 0xf) << 1);
@@ -87,7 +93,7 @@ static Rv32Insn rv32_decode(uint32_t raw)
 		(((raw >> 20) & 1) << 11) | (((raw >> 21) & 0x3ff) << 1);
 	uint32_t s = ((raw >> 25) << 5) | ((raw >> 7) & 0x1f);
 
-	return (Rv32Insn) {
+	return (Rv64Insn) {
 		.raw = raw,
 		.opcode = raw & 0x7f,
 		.rd = (raw >> 7) & 0x1f,
@@ -103,7 +109,7 @@ static Rv32Insn rv32_decode(uint32_t raw)
 }
 
 /* 写整数寄存器，x0 保持为 0。 */
-static void set_gpr(GPGPULane *lane, uint32_t rd, uint32_t value)
+static void set_gpr(GPGPULane *lane, uint32_t rd, uint64_t value)
 {
 	if (rd)
 		lane->gpr[rd] = value;
@@ -137,7 +143,7 @@ static bool read_csr(const GPGPUWarp *warp, const GPGPULane *lane, uint32_t csr,
  * 也属于写请求。
  */
 static bool exec_system(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_id,
-			const Rv32Insn *in)
+			const Rv64Insn *in)
 {
 	GPGPULane *lane = &warp->lanes[lane_id];
 	uint32_t value;
@@ -162,23 +168,23 @@ static bool exec_system(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lan
 
 /* ---- 整数指令 ---- */
 
-/* OP-IMM：ADDI、SLLI、ANDI。 */
-static bool exec_imm(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+/* OP-IMM：ADDI、SLLI、ANDI。SLLI 的移位量占 [25:20] 共 6 位，[31:26] 须为 0。 */
+static bool exec_imm(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
 {
-	uint32_t src = lane->gpr[in->rs1];
-	uint32_t value;
+	uint64_t src = lane->gpr[in->rs1];
+	uint64_t value;
 
 	switch (in->funct3) {
 	case 0:
-		value = src + (uint32_t)in->imm_i;
+		value = src + (int64_t)in->imm_i;
 		break;
 	case 1:
-		if (in->funct7)
+		if (in->raw >> 26)
 			return illegal(ctx);
-		value = src << in->rs2;
+		value = src << ((in->raw >> 20) & 0x3f);
 		break;
 	case 7:
-		value = src & (uint32_t)in->imm_i;
+		value = src & (int64_t)in->imm_i;
 		break;
 	default:
 		return illegal(ctx);
@@ -188,12 +194,12 @@ static bool exec_imm(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 	return true;
 }
 
-/* OP：ADD、SUB、MUL（有无符号的乘积低 32 位相同）。 */
-static bool exec_reg(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+/* OP：ADD、SUB、MUL（有无符号的乘积低 64 位相同）。 */
+static bool exec_reg(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
 {
-	uint32_t a = lane->gpr[in->rs1];
-	uint32_t b = lane->gpr[in->rs2];
-	uint32_t value;
+	uint64_t a = lane->gpr[in->rs1];
+	uint64_t b = lane->gpr[in->rs2];
+	uint64_t value;
 
 	if (in->funct3)
 		return illegal(ctx);
@@ -215,11 +221,11 @@ static bool exec_reg(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 	return true;
 }
 
-/* 条件分支：每个 lane 独立保存 PC，不同 lane 可以走不同分支。 */
-static bool exec_branch(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+/* 条件分支：按 64 位比较；每个 lane 独立保存 PC，可以走不同分支。 */
+static bool exec_branch(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
 {
-	uint32_t a = lane->gpr[in->rs1];
-	uint32_t b = lane->gpr[in->rs2];
+	uint64_t a = lane->gpr[in->rs1];
+	uint64_t b = lane->gpr[in->rs2];
 	bool taken;
 
 	switch (in->funct3) {
@@ -230,10 +236,10 @@ static bool exec_branch(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *
 		taken = a != b;
 		break;
 	case 4:
-		taken = (int32_t)a < (int32_t)b;
+		taken = (int64_t)a < (int64_t)b;
 		break;
 	case 5:
-		taken = (int32_t)a >= (int32_t)b;
+		taken = (int64_t)a >= (int64_t)b;
 		break;
 	case 6:
 		taken = a < b;
@@ -244,37 +250,47 @@ static bool exec_branch(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *
 	default:
 		return illegal(ctx);
 	}
-	lane->pc += taken ? (uint32_t)in->imm_b : 4;
+	lane->pc += taken ? (int64_t)in->imm_b : 4;
 	return true;
 }
 
 /* ---- 访存指令 ---- */
 
-/* LW/FLW：只支持 32 位字（funct3=2）。 */
-static bool exec_load(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+/* 访存宽度合法：LW/SW、FLW/FSW 为 32 位字，LD/SD 只用于整数寄存器。 */
+static bool mem_width_valid(const Rv64Insn *in)
 {
-	uint32_t value;
+	bool fp = in->opcode == OP_LOAD_FP || in->opcode == OP_STORE_FP;
 
-	if (in->funct3 != 2)
+	return in->funct3 == MEM_WORD || (in->funct3 == MEM_DOUBLE && !fp);
+}
+
+/* LW/FLW/LD：LW 的结果符号扩展到 64 位，FLW 只取 32 位原始位。 */
+static bool exec_load(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
+{
+	bool dword = in->funct3 == MEM_DOUBLE;
+	uint64_t value;
+
+	if (!mem_width_valid(in))
 		return illegal(ctx);
-	if (!gpgpu_lane_load(ctx, lane->gpr[in->rs1] + (uint32_t)in->imm_i, &value))
+	if (!gpgpu_lane_load(ctx, lane->gpr[in->rs1] + (int64_t)in->imm_i, dword ? 8 : 4, &value))
 		return false;
 	if (in->opcode == OP_LOAD_FP)
 		lane->fpr[in->rd] = value;
 	else
-		set_gpr(lane, in->rd, value);
+		set_gpr(lane, in->rd, dword ? value : (uint64_t)(int32_t)value);
 	lane->pc += 4;
 	return true;
 }
 
-/* SW/FSW：只支持 32 位字（funct3=2）。 */
-static bool exec_store(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+/* SW/FSW/SD：SW、FSW 写低 32 位，SD 写整个 64 位寄存器。 */
+static bool exec_store(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
 {
-	uint32_t value = in->opcode == OP_STORE_FP ? lane->fpr[in->rs2] : lane->gpr[in->rs2];
+	uint64_t value = in->opcode == OP_STORE_FP ? lane->fpr[in->rs2] : lane->gpr[in->rs2];
 
-	if (in->funct3 != 2)
+	if (!mem_width_valid(in))
 		return illegal(ctx);
-	if (!gpgpu_lane_store(ctx, lane->gpr[in->rs1] + (uint32_t)in->imm_s, value))
+	if (!gpgpu_lane_store(ctx, lane->gpr[in->rs1] + (int64_t)in->imm_s,
+			      in->funct3 == MEM_DOUBLE ? 8 : 4, value))
 		return false;
 	lane->pc += 4;
 	return true;
@@ -453,14 +469,15 @@ static bool fp_rs2_valid(uint32_t funct7, uint32_t rs2)
  *
  * OP-FP 用 funct7 区分操作，用 rs2 区分转换方向，用 funct3 保存舍入模式：
  *
- * 1. FMV.W.X 把整数寄存器的位原样搬到浮点寄存器，不涉及舍入和异常，
+ * 1. FMV.W.X 把整数寄存器低 32 位原样搬到浮点寄存器，不涉及舍入和异常，
  *    rs2 与 funct3 必须为 0，单独处理后直接返回；
  * 2. 其余指令先检查 rs2 是否在该 funct7 允许的范围内，再设置本条指令
  *    的舍入模式并清除 SoftFloat 异常标志，保留的舍入编码视为非法；
- * 3. 按 funct7 计算并写回 rd；FCVT.W.S 的结果写整数寄存器；
+ * 3. 按 funct7 计算并写回 rd；FCVT.W.S 的 32 位结果符号扩展后写整数寄存器，
+ *    FCVT.S.W 只读整数寄存器的低 32 位；
  * 4. 把本条指令产生的异常累加到 fcsr.fflags，再推进 PC。
  */
-static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
+static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv64Insn *in)
 {
 	float_status *st = &lane->fp_status;
 	uint32_t a = lane->fpr[in->rs1];
@@ -469,7 +486,7 @@ static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 	if (in->funct7 == FP_MV_W_X) {
 		if (in->rs2 || in->funct3)
 			return illegal(ctx);
-		lane->fpr[in->rd] = lane->gpr[in->rs1];
+		lane->fpr[in->rd] = (uint32_t)lane->gpr[in->rs1];
 		lane->pc += 4;
 		return true;
 	}
@@ -497,7 +514,7 @@ static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 		lane->fpr[in->rd] = fp_convert_e2m1(lane, a, in->rs2);
 		break;
 	case FP_CVT_W_S:
-		set_gpr(lane, in->rd, (uint32_t)float32_to_int32(a, st));
+		set_gpr(lane, in->rd, (uint64_t)(int64_t)float32_to_int32(a, st));
 		break;
 	case FP_CVT_S_W:
 		lane->fpr[in->rd] = int32_to_float32((int32_t)lane->gpr[in->rs1], st);
@@ -512,18 +529,18 @@ static bool exec_fp(GPGPUExecContext *ctx, GPGPULane *lane, const Rv32Insn *in)
 
 /* ---- 入口 ---- */
 
-bool gpgpu_rv32_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_id)
+bool gpgpu_rv64_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_id)
 {
 	GPGPULane *lane = &warp->lanes[lane_id];
 	uint32_t raw;
-	Rv32Insn in;
+	Rv64Insn in;
 
 	/* 1. 取指：pc 越出代码范围、未对齐或读取失败时任务失败。 */
 	if (!gpgpu_lane_fetch(ctx, lane->pc, &raw))
 		return false;
 
 	/* 2. 拆出寄存器号、funct 字段和立即数，合法性留给第 3 步。 */
-	in = rv32_decode(raw);
+	in = rv64_decode(raw);
 
 	/*
 	 * 3. 按主 opcode 分派到类别函数，由它检查本类编码并执行；
@@ -537,14 +554,14 @@ bool gpgpu_rv32_step(GPGPUExecContext *ctx, GPGPUWarp *warp, unsigned int lane_i
 	case OP_REG:
 		return exec_reg(ctx, lane, &in);
 	case OP_LUI:
-		set_gpr(lane, in.rd, raw & 0xfffff000);
+		set_gpr(lane, in.rd, (uint64_t)(int32_t)(raw & 0xfffff000));
 		lane->pc += 4;
 		return true;
 	case OP_BRANCH:
 		return exec_branch(ctx, lane, &in);
 	case OP_JAL:
 		set_gpr(lane, in.rd, lane->pc + 4);
-		lane->pc += (uint32_t)in.imm_j;
+		lane->pc += (int64_t)in.imm_j;
 		return true;
 	case OP_LOAD:
 	case OP_LOAD_FP:

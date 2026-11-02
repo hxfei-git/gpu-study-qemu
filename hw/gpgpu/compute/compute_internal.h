@@ -12,9 +12,9 @@
 
 typedef struct GPGPUState GPGPUState;
 
-/* RV32 整数与浮点寄存器数。 */
+/* RV64 整数与浮点寄存器数。 */
 #define GPGPU_NUM_REGS 32
-/* RV32 的 a0 寄存器编号；启动时保存参数块地址。 */
+/* a0 寄存器编号；启动时保存 64 位参数块地址。 */
 #define GPGPU_REG_A0 10
 /* 启动 SGPR 个数：blockIdx、blockDim、gridDim 各 X/Y/Z。 */
 #define GPGPU_STARTUP_SGPRS 9
@@ -23,9 +23,9 @@ typedef struct GPGPUState GPGPUState;
 #define GPGPU_MHARTID(block, warp, lane) (((block) << 13) | ((warp) << 5) | ((lane) & 0x1f))
 
 /**
- * struct GPGPULane - 一个 RV32 线程
- * @gpr: 整数寄存器 x0～x31，x0 恒为 0。
- * @fpr: 浮点寄存器 f0～f31 的原始位。
+ * struct GPGPULane - 一个 RV64 线程
+ * @gpr: 64 位整数寄存器 x0～x31，x0 恒为 0。
+ * @fpr: 浮点寄存器 f0～f31 的 32 位原始位（只支持单精度）。
  * @thread_id: 只读启动值 threadIdx.x/y/z，经 CSR 读取。
  * @pc: 当前指令地址，与 kernel_addr 同一地址空间。
  * @mhartid: 只读线程身份，见 GPGPU_MHARTID()。
@@ -34,10 +34,10 @@ typedef struct GPGPUState GPGPUState;
  * @active: 尚未执行 EBREAK。
  */
 typedef struct GPGPULane {
-	uint32_t gpr[GPGPU_NUM_REGS];
+	uint64_t gpr[GPGPU_NUM_REGS];
 	uint32_t fpr[GPGPU_NUM_REGS];
 	uint32_t thread_id[3];
-	uint32_t pc;
+	uint64_t pc;
 	uint32_t mhartid;
 	uint32_t fcsr;
 	float_status fp_status;

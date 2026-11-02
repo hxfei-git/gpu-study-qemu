@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# __global__ void matmul(const { u32 a, b, out, rows, cols, inner; } *args)
+# __global__ void matmul(const { u64 a, b, out, rows, cols, inner; } *args)
 # 矩阵按行存储：A[rows][inner]、B[inner][cols]、C[rows][cols]。
 .include "gpgpu_kernel.inc"
 matmul:
@@ -13,16 +13,16 @@ matmul:
 	mul t1, t1, t2
 	csrr t2, THREAD_ID_Y
 	add s1, t1, t2
-	lw s2, 16(a0)
+	ld s2, 32(a0)
 	bgeu s0, s2, done
-	lw t1, 12(a0)
+	ld t1, 24(a0)
 	bgeu s1, t1, done
-	lw s3, 20(a0)
-	lw s4, 0(a0)
+	ld s3, 40(a0)
+	ld s4, 0(a0)
 	mul t1, s1, s3
 	slli t1, t1, 2
 	add s4, s4, t1
-	lw s5, 4(a0)
+	ld s5, 8(a0)
 	slli t1, s0, 2
 	add s5, s5, t1
 	slli s6, s2, 2
@@ -42,7 +42,7 @@ store:
 	mul t1, s1, s2
 	add t1, t1, s0
 	slli t1, t1, 2
-	lw t2, 8(a0)
+	ld t2, 16(a0)
 	add t2, t2, t1
 	fsw f0, 0(t2)
 done:

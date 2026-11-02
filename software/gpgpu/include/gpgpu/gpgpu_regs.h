@@ -104,11 +104,11 @@
 
 /* Kernel 代码入口低 32 位：GPUVM 开启时为 GPUVA，否则为 GPU 物理地址。 */
 #define GPGPU_REG_KERNEL_ADDR_LO 0x0300
-/* Kernel 代码入口高 32 位，须为零。 */
+/* Kernel 代码入口高 32 位。 */
 #define GPGPU_REG_KERNEL_ADDR_HI 0x0304
 /* 参数块地址低 32 位，按 8 字节对齐，与代码入口同一地址空间。 */
 #define GPGPU_REG_KERNEL_ARGS_LO 0x0308
-/* 参数块地址高 32 位，须为零。 */
+/* 参数块地址高 32 位。 */
 #define GPGPU_REG_KERNEL_ARGS_HI 0x030c
 /* X 方向工作组数（不是线程数）。 */
 #define GPGPU_REG_GRID_DIM_X 0x0310

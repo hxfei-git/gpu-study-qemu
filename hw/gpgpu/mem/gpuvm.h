@@ -2,7 +2,7 @@
 /*
  * GPUVM：用户地址的翻译与故障记录
  *
- * CP 用户域访问和 RV32 执行器的取指、数据访问都调用 gpgpu_user_rw()：
+ * CP 用户域访问和 RV64 执行器的取指、数据访问都调用 gpgpu_user_rw()：
  *
  *   gpuvm=on   GPUVA ─TLB/四级页表─▶ GPU 物理地址 ─▶ gpgpu_phys_rw()
  *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区 ─▶ gpgpu_phys_rw()

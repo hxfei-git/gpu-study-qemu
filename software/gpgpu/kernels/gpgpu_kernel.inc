@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# 启动状态通过只读 CSR 获取；a0 保存参数的 GPUVA 或 GPU 物理地址。
+# 启动状态通过只读 CSR 获取；a0 保存参数块的 64 位 GPUVA 或 GPU 物理地址，
+# 参数块每项 8 字节，用 ld 读取。
 .equ THREAD_ID_X, 0xCC0
 .equ THREAD_ID_Y, 0xCC1
 .equ THREAD_ID_Z, 0xCC2

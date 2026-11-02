@@ -6,7 +6,7 @@
  *
  *   CP 写 0x300 寄存器组 ─▶ dispatch.c 检查并锁存 GPGPUKernelParams
  *     ─▶ scheduler.c 创建任务，按 warp 分段推进（定时器驱动）
- *       ─▶ rv32.c 逐 lane 执行一条 RV32 指令
+ *       ─▶ rv64.c 逐 lane 执行一条 RV64 指令
  *         ─▶ lane_mem.c 取指与 LW/SW，经 gpgpu_user_rw() 访问用户地址
  *     ─▶ dispatch.c 发布 DONE/FAILED，等待 CP 写 ACK
  */

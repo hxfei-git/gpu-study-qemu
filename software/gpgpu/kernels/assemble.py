@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """汇编文档中约定的教学指令子集，支持只读 CSR 的 csrr 伪指令。
 
-每条指令使用 32 位 RV32 编码；本工具不编译 C，
+每条指令按 RV64 编码成 32 位指令字；本工具不编译 C，
 也不实现完整的 GNU 汇编语言。
 """
 import argparse
@@ -57,12 +57,12 @@ def memory(text, symbols):
 
 
 def encode(line, pc, symbols):
-    """按助记符校验操作数，并将一条教学指令编码成 32 位 RV32 指令字。"""
+    """按助记符校验操作数，并将一条教学指令编码成 32 位的 RV64 指令字。"""
     fields = line.replace(",", " ").split()
     op, operands = fields[0], fields[1:]
     counts = {"ebreak": 0, "lui": 2, "jal": 2, "csrr": 2}
     expected = counts.get(op, 3)
-    if op in ("lw", "sw", "flw", "fsw"):
+    if op in ("lw", "ld", "sw", "sd", "flw", "fsw"):
         expected = 2
     if len(operands) != expected:
         raise ValueError(f"{op} expects {expected} operands")
@@ -85,8 +85,8 @@ def encode(line, pc, symbols):
         rd, rs1 = map(register, operands[:2])
         imm = immediate(operands[2], symbols)
         if op == "slli":
-            if not 0 <= imm < 32:
-                raise ValueError("slli shift must be in 0..31")
+            if not 0 <= imm < 64:
+                raise ValueError("slli shift must be in 0..63")
         else:
             imm = signed(imm, 12)
         funct3 = {"addi": 0, "andi": 7, "slli": 1}[op]
@@ -98,14 +98,16 @@ def encode(line, pc, symbols):
                   "fadd.s": 0, "fmul.s": 8}[op]
         return ((funct7 << 25) | (rs2 << 20) | (rs1 << 15) |
                 (rd << 7) | (0x53 if fp else 0x33))
-    if op in ("lw", "sw", "flw", "fsw"):
+    if op in ("lw", "ld", "sw", "sd", "flw", "fsw"):
         reg = register(operands[0], op.startswith("f"))
         imm, base = memory(operands[1], symbols)
-        opcode = {"lw": 0x03, "sw": 0x23, "flw": 0x07, "fsw": 0x27}[op]
-        if op.endswith("sw") or op == "sw":
+        opcode = {"lw": 0x03, "ld": 0x03, "sw": 0x23, "sd": 0x23,
+                  "flw": 0x07, "fsw": 0x27}[op]
+        funct3 = 3 if op in ("ld", "sd") else 2
+        if op in ("sw", "sd", "fsw"):
             return ((imm >> 5) << 25 | reg << 20 | base << 15 |
-                    2 << 12 | (imm & 31) << 7 | opcode)
-        return imm << 20 | base << 15 | 2 << 12 | reg << 7 | opcode
+                    funct3 << 12 | (imm & 31) << 7 | opcode)
+        return imm << 20 | base << 15 | funct3 << 12 | reg << 7 | opcode
     if op in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
         rs1, rs2 = map(register, operands[:2])
         imm = signed(immediate(operands[2], symbols) - pc, 13, 4)

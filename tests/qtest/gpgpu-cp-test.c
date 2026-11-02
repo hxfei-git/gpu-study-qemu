@@ -25,9 +25,11 @@
  * 槽号 0～3 依次是 KIQ、HIQ 和两个用户队列；每个槽有 0x100 字节的
  * MQD 位置、一页 Ring，以及 16 字节进度区（W 在前、R 在后）。
  * task 是测试内的任务编号，每个任务独占 Signal、通知槽和
- * 8 字节参数块。QUEUE_RESULT 是管理请求的 16 字节结果区，
+ * ARGS_BYTES 字节参数块。QUEUE_RESULT 是管理请求的 16 字节结果区，
  * 测试串行提交管理命令，所以全部请求复用这一份。
  */
+/* 测试 Kernel 的参数块：目标地址与待写值各占一个 8 字节槽。 */
+#define ARGS_BYTES 16
 #define QUEUE_HOST 0x41000000ULL
 #define QUEUE_MQD(slot) (QUEUE_HOST + (slot) * 0x100)
 #define QUEUE_RING(slot) (QUEUE_HOST + 0x1000 + (slot) * 0x1000)
@@ -36,7 +38,7 @@
 #define QUEUE_IH (QUEUE_HOST + 0x8000)
 #define QUEUE_SIGNAL(task) (QUEUE_HOST + 0x9000 + (task) * 32)
 #define QUEUE_MAILBOX(task) (QUEUE_HOST + 0xa000 + (task) * 8)
-#define QUEUE_ARGS(task) (QUEUE_HOST + 0xb000 + (task) * 8)
+#define QUEUE_ARGS(task) (QUEUE_HOST + 0xb000 + (task) * ARGS_BYTES)
 #define QUEUE_RESULT (QUEUE_HOST + 0xc000)
 /* Ring 容量：管理 Ring 8 个 32 字节槽，AQL Ring 4 个 64 字节槽。 */
 #define QUEUE_RING_BYTES 256
@@ -165,10 +167,15 @@ static void cp_stop(CPTest *s)
 	g_free(s->directory);
 }
 
-/* BAR0 寄存器读写：设备只接受对齐的 32 位访问，64 位分两次写。 */
+/* BAR0 寄存器读写：设备只接受对齐的 32 位访问，64 位分两次读写。 */
 static uint32_t rd(CPTest *s, uint64_t reg)
 {
 	return qpci_io_readl(s->dev, s->regs, reg);
+}
+
+static uint64_t rd64(CPTest *s, uint64_t reg)
+{
+	return rd(s, reg) | (uint64_t)rd(s, reg + 4) << 32;
 }
 
 static void wr(CPTest *s, uint64_t reg, uint32_t value)
@@ -386,19 +393,20 @@ static void queue_map(CPTest *s, unsigned int slot)
  * @code_entry: 描述对象中的代码入口；GPUVM 关闭时为 VRAM 偏移，
  *              开启时为 GPUVA。
  *
- * 参数块为 { 目标地址, 值 }，Kernel 执行 *(u32 *)args[0] = args[1]：
- *   lw t0, 0(a0); lw t1, 4(a0); sw t1, 0(t0); ebreak
+ * 参数块为两个 8 字节槽 { 目标地址, 值 }，Kernel 执行
+ * *(u32 *)args[0] = args[1]：
+ *   ld t0, 0(a0); ld t1, 8(a0); sw t1, 0(t0); ebreak
  *
- * a0 是 RV32 计算执行器传给线程的参数块地址。代码总放在 VRAM 的
- * KERNEL_CODE，描述对象放在 KERNEL_DESC，参数长度固定为 8 字节。
+ * a0 是 RV64 计算执行器传给线程的参数块地址。代码总放在 VRAM 的
+ * KERNEL_CODE，描述对象放在 KERNEL_DESC，参数长度固定为 ARGS_BYTES。
  */
-static void kernel_load(CPTest *s, uint32_t code_entry)
+static void kernel_load(CPTest *s, uint64_t code_entry)
 {
-	const uint32_t code[] = { 0x00052283, 0x00452303, 0x0062a023, 0x00100073 };
+	const uint32_t code[] = { 0x00053283, 0x00853303, 0x0062a023, 0x00100073 };
 	GpgpuKernelDescriptor desc = {
-		.code_entry = cpu_to_le32(code_entry),
+		.code_entry = cpu_to_le64(code_entry),
 		.code_size = cpu_to_le32(sizeof(code)),
-		.kernarg_size = cpu_to_le32(8),
+		.kernarg_size = cpu_to_le32(ARGS_BYTES),
 		.kernel_abi_version = cpu_to_le32(GPGPU_KERNEL_ABI_VERSION),
 	};
 
@@ -421,7 +429,7 @@ static void kernel_load(CPTest *s, uint32_t code_entry)
  */
 static void aql_submit(CPTest *s, unsigned int slot, uint32_t number, unsigned int task,
 		       uint64_t desc, uint64_t args, uint64_t signal, uint64_t mailbox,
-		       uint32_t out)
+		       uint64_t out)
 {
 	GpgpuSignal sig = {
 		.value = cpu_to_le64(1),
@@ -449,8 +457,8 @@ static void aql_submit(CPTest *s, unsigned int slot, uint32_t number, unsigned i
 	 */
 	qtest_memwrite(s->host, QUEUE_SIGNAL(task), &sig, sizeof(sig));
 	qtest_writeq(s->host, QUEUE_MAILBOX(task), 0);
-	qtest_writel(s->host, QUEUE_ARGS(task), out);
-	qtest_writel(s->host, QUEUE_ARGS(task) + 4, 0xaabb0000 + task);
+	qtest_writeq(s->host, QUEUE_ARGS(task), out);
+	qtest_writeq(s->host, QUEUE_ARGS(task) + 8, 0xaabb0000 + task);
 
 	/*
 	 * 2. 整包以 INVALID Header 写入。此时 CP 即使读到这个槽，也会当作
@@ -692,18 +700,23 @@ static void test_fault_scope(void)
  * GPUVM 测试的 GPUVA 布局与 VRAM 页表根。每个 GPUVA 映射一页：Ring、
  * 进度、参数和 Signal 映射到 Host RAM 中槽 2 或 task 0 使用的对象；
  * 描述对象、代码和数据映射到 VRAM。页表从 VM_ROOT 开始连续分配。
+ *
+ * 所有 GPUVA 都加上 VM_BASE：它高于 4 GiB，L0 索引为 0xff、L1 索引为
+ * 0x1fc，地址高 32 位非零，翻译要走完整的 48 位路径。VM_BASE 按 64 页
+ * 对齐，各页的 TLB 组号与不加基址时相同。
  */
 #define VM_ROOT 0x20000U
-#define VM_RING 0x00100000U
-#define VM_PROGRESS 0x00101000U
-#define VM_ARGS 0x00102000U
-#define VM_SIGNAL 0x00103000U
+#define VM_BASE 0x00007fff00000000ULL
+#define VM_RING (VM_BASE + 0x00100000U)
+#define VM_PROGRESS (VM_BASE + 0x00101000U)
+#define VM_ARGS (VM_BASE + 0x00102000U)
+#define VM_SIGNAL (VM_BASE + 0x00103000U)
 /* 通知页由用户态创建，GPUVA 不固定；测试把它放在 Signal 之后。 */
-#define VM_NOTIFY 0x00104000U
-#define VM_DESC 0x00400000U
-#define VM_CODE 0x00401000U
-#define VM_DATA 0x00402000U
-/* test_gpuvm_system() 把一张 L2 表搬到这个 Host 页，经 SYSTEM 中间项访问。 */
+#define VM_NOTIFY (VM_BASE + 0x00104000U)
+#define VM_DESC (VM_BASE + 0x00400000U)
+#define VM_CODE (VM_BASE + 0x00401000U)
+#define VM_DATA (VM_BASE + 0x00402000U)
+/* test_gpuvm_system() 把一张 L3 叶表搬到这个 Host 页，经 SYSTEM 中间项访问。 */
 #define VM_HOST_TABLE (QUEUE_HOST + 0xd000)
 /*
  * test_gpuvm_tlb() 的数据页：比一组的路数多一页，第 k 页的 GPUVA 比 VM_DATA
@@ -845,9 +858,9 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
  * 包中所有地址都是 VMID 1 下的 GPUVA；task 的 Signal、通知槽和参数块
  * 与 QUEUE_SIGNAL()、QUEUE_MAILBOX()、QUEUE_ARGS() 同页同偏移。
  */
-static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint32_t out)
+static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint64_t out)
 {
-	aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + 8 * task, VM_SIGNAL + 32 * task,
+	aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + ARGS_BYTES * task, VM_SIGNAL + 32 * task,
 		   VM_NOTIFY + 8 * task, out);
 }
 
@@ -900,7 +913,7 @@ static void test_gpuvm_exec_fault(void)
 	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_PERMISSION);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_VMID), ==, 1);
-	g_assert_cmphex(rd(&s, fault + GPGPU_VM_FAULT_ADDR_LO), ==, VM_CODE);
+	g_assert_cmphex(rd64(&s, fault + GPGPU_VM_FAULT_ADDR_LO), ==, VM_CODE);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_ACCESS), ==, GPGPU_VM_EXEC);
 	g_assert_cmphex(rd(&s, fault + GPGPU_VM_FAULT_PHASE), ==, GPGPU_VM_PHASE_FETCH);
 	g_assert_cmphex(qtest_readq(s.host, QUEUE_SIGNAL(0)), ==, 1);
@@ -959,7 +972,7 @@ static void test_gpuvm_system(void)
 	vm_submit(&s, 1, 1, VM_DATA);
 	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_TABLE);
-	g_assert_cmphex(rd(&s, fault + GPGPU_VM_FAULT_ADDR_LO), ==, VM_ARGS + 8);
+	g_assert_cmphex(rd64(&s, fault + GPGPU_VM_FAULT_ADDR_LO), ==, VM_ARGS + ARGS_BYTES);
 
 	/*
 	 * 3. 故障队列卸载后清除故障记录，重写 MQD 去掉 saved_error，
@@ -990,8 +1003,9 @@ static void vm_tlb_round(CPTest *s, uint32_t *number)
  * test_gpuvm_tlb() - 组相联 TLB 的替换、范围失效与整 VMID 失效
  *
  * 准备：vm_prepare() 映射的五个数据页 VM_TLB_DATA(0..4) 都落在第 2 组，
- * 各自指向不同 VRAM 页。参数页 VM_ARGS（VPN 0x102）也在第 2 组；每次派发
- * 都先读参数页再写数据页，参数页总比数据页更近被使用，不会被替换。
+ * 各自指向不同 VRAM 页。参数页 VM_ARGS（VPN 低位 0x102）也在第 2 组；
+ * 每次派发都先读参数页再写数据页，参数页总比数据页更近被使用，
+ * 不会被替换。
  *
  * 期望：
  * b. 依次写五个数据页，第 2 组装不下全部翻译，EVICTIONS 至少加 1

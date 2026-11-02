@@ -8,7 +8,7 @@
  * 队列提交的整体关系：
  *
  *   Host ── 管理命令 ──▶ KIQ(槽0) ──映射──▶ HIQ(槽1) ──映射──▶ 用户 AQL(槽2/3)
- *   Host ── AQL 包 ───▶ 用户 Ring ──CP 取包──▶ RV32 执行器
+ *   Host ── AQL 包 ───▶ 用户 Ring ──CP 取包──▶ RV64 执行器
  *                        │ kernel_object ─▶ GpgpuKernelDescriptor ─▶ 代码
  *                        │ kernarg_address ─▶ 参数块（a0）
  *                        └ completion_signal ─▶ GpgpuSignal ─▶ 通知槽 ─▶ IH
@@ -209,18 +209,20 @@ typedef struct GpgpuAqlPacket {
 } GpgpuAqlPacket;
 
 /**
- * struct GpgpuKernelDescriptor - 16 字节 Kernel 描述对象，CP 经用户域读取
- * @code_entry: RV32 代码入口的用户地址，按 4 字节对齐。
+ * struct GpgpuKernelDescriptor - 24 字节 Kernel 描述对象，CP 经用户域读取
+ * @code_entry: RV64 代码入口的 64 位用户地址，按 4 字节对齐。
  * @code_size: 代码字节数，非零且为 4 的倍数。
  * @kernarg_size: 参数块字节数，4 到 GPGPU_KERNEL_ARGS_MAX，按 4 字节对齐。
  * @kernel_abi_version: 必须为 GPGPU_KERNEL_ABI_VERSION。
+ * @reserved: 必须为零。
  */
 typedef struct GpgpuKernelDescriptor {
-	gpgpu_q_u32 code_entry;
+	gpgpu_q_u64 code_entry;
 	gpgpu_q_u32 code_size;
 	gpgpu_q_u32 kernarg_size;
 	gpgpu_q_u32 kernel_abi_version;
-} __attribute__((aligned(8))) GpgpuKernelDescriptor;
+	gpgpu_q_u32 reserved;
+} GpgpuKernelDescriptor;
 
 /**
  * struct GpgpuSignal - 24 字节完成对象，至少按 8 字节对齐
@@ -243,8 +245,8 @@ GPGPU_LAYOUT_ASSERT(GpgpuManagementPacket, 32, value, 0x10);
 GPGPU_LAYOUT_ASSERT(GpgpuManagementResult, 16, status, 0x08);
 GPGPU_LAYOUT_ASSERT(GpgpuAqlPacket, 64, kernel_object, 0x20);
 GPGPU_LAYOUT_ASSERT(GpgpuAqlPacket, 64, completion_signal, 0x38);
-GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 16, kernarg_size, 0x08);
-GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 16, kernel_abi_version, 0x0c);
+GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 24, kernarg_size, 0x0c);
+GPGPU_LAYOUT_ASSERT(GpgpuKernelDescriptor, 24, kernel_abi_version, 0x10);
 GPGPU_LAYOUT_ASSERT(GpgpuSignal, 24, event_mailbox_ptr, 0x10);
 
 #endif /* GPGPU_QUEUE_ABI_H */

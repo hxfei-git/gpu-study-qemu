@@ -106,7 +106,7 @@ GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, Gp
 	 */
 	status = rt_alloc(rt, GPGPU_MEMORY_HOST, staging_size, rw, &rt->staging);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_HOST, GPGPU_RT_MAX_ARGS * sizeof(uint32_t),
+		status = rt_alloc(rt, GPGPU_MEMORY_HOST, GPGPU_RT_MAX_ARGS * sizeof(uint64_t),
 				  GPGPU_VM_READ, &rt->args);
 	if (status == GPGPU_KMT_SUCCESS)
 		status = rt_alloc(rt, GPGPU_MEMORY_HOST, RT_RING_BYTES, rw, &rt->ring);
@@ -177,14 +177,6 @@ GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 	return GPGPU_KMT_SUCCESS;
 }
 
-GpgpuKmtStatus gpgpu_rt_arg_address(GpgpuKmtMemory *buffer, uint32_t *arg)
-{
-	if (!buffer || !arg || buffer->gpu_address > UINT32_MAX)
-		return GPGPU_KMT_INVALID_PARAMETER;
-	*arg = (uint32_t)buffer->gpu_address;
-	return GPGPU_KMT_SUCCESS;
-}
-
 GpgpuKmtStatus gpgpu_rt_upload(GpgpuRt *rt, GpgpuKmtMemory *buffer, const void *data,
 			       size_t size)
 {
@@ -221,13 +213,13 @@ GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **
 /*
  * gpgpu_rt_kernel_load() - 装载 Kernel
  *
- * CP 经 AQL 包的 kernel_object 找到描述对象，再按其中的入口和长度让 RV32
+ * CP 经 AQL 包的 kernel_object 找到描述对象，再按其中的入口和长度让 RV64
  * 计算执行器取指，所以代码和描述对象都放在 VRAM：
  *
- * 1. 分配代码区（读 + 执行）和描述对象区（只读），取代码区的 32 位设备
- *    地址作为入口；
+ * 1. 分配代码区（读 + 执行）和描述对象区（只读），代码区的 64 位设备
+ *    地址就是入口；
  * 2. 经暂存区把代码上传到代码区；
- * 3. 填写描述对象：入口、代码长度、参数块长度（args_count 个 32 位参数）
+ * 3. 填写描述对象：入口、代码长度、参数块长度（args_count 个 8 字节槽）
  *    和 ABI 版本，再上传。
  *
  * 失败时已分配的对象仍登记在 rt 中，随 gpgpu_rt_destroy() 释放。
@@ -237,33 +229,30 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 {
 	GpgpuKernelDescriptor desc;
 	GpgpuKmtStatus status;
-	uint32_t entry;
 
 	if (!rt || !code || !code_size || (code_size & 3) || !args_count ||
 	    args_count > GPGPU_RT_MAX_ARGS || !kernel)
 		return GPGPU_KMT_INVALID_PARAMETER;
 
-	/* 1. 代码区可执行，描述对象只读；入口地址必须能放进 32 位。 */
+	/* 1. 代码区可执行，描述对象只读。 */
 	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, code_size, GPGPU_VM_READ | GPGPU_VM_EXEC,
 			  &kernel->code);
 	if (status == GPGPU_KMT_SUCCESS)
 		status = rt_alloc(rt, GPGPU_MEMORY_VRAM, sizeof(desc), GPGPU_VM_READ,
 				  &kernel->descriptor);
-	if (status == GPGPU_KMT_SUCCESS)
-		status = gpgpu_rt_arg_address(kernel->code, &entry);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 
-	/* 2. 上传 RV32 机器码。 */
+	/* 2. 上传 RV64 机器码。 */
 	status = gpgpu_rt_upload(rt, kernel->code, code, code_size);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
 
 	/* 3. 多字节字段按小端写入，与设备端读取方式一致。 */
 	desc = (GpgpuKernelDescriptor) {
-		.code_entry = htole32(entry),
+		.code_entry = htole64(kernel->code->gpu_address),
 		.code_size = htole32(code_size),
-		.kernarg_size = htole32(args_count * sizeof(uint32_t)),
+		.kernarg_size = htole32(args_count * sizeof(uint64_t)),
 		.kernel_abi_version = htole32(GPGPU_KERNEL_ABI_VERSION),
 	};
 	return gpgpu_rt_upload(rt, kernel->descriptor, &desc, sizeof(desc));
@@ -336,8 +325,8 @@ static GpgpuAqlPacket rt_packet(const GpgpuRt *rt, const GpgpuRtKernel *kernel,
  *
  * 1. 确保队列存在，回收旧事件；待回收事件已满时返回 OUT_OF_RESOURCES；
  * 2. 创建本次事件。失败时还没有改动参数和 Signal，可以重试；
- * 3. 把参数按小端写进参数块。RV32 执行器把参数块地址放进 a0，
- *    Kernel 用普通 LW 读取；
+ * 3. 把参数按小端写进参数块，每个参数一个 8 字节槽。RV64 执行器把
+ *    参数块地址放进 a0，Kernel 用普通 LD 读取；
  * 4. 把 Signal 置为 1，填入本次事件的编号与通知槽地址。CP 完成后把值减为 0，
  *    再写通知槽，驱动随后唤醒事件等待者；
  * 5. 组包，经 Reserve 取号并等到空槽，再由 Publish 发布 Header、敲 Doorbell；
@@ -347,11 +336,11 @@ static GpgpuAqlPacket rt_packet(const GpgpuRt *rt, const GpgpuRtKernel *kernel,
  * 第 5、6 步失败时 CP 可能仍在读写参数块和 Signal，运行时标记为失败并保留
  * 本次事件，此后只能 gpgpu_rt_destroy()。
  */
-GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const uint32_t *args,
+GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const uint64_t *args,
 				 uint32_t args_count, GpgpuRtDim3 grid, GpgpuRtDim3 block,
 				 uint32_t timeout_ms)
 {
-	uint32_t *block_args;
+	uint64_t *block_args;
 	GpgpuSignal *signal;
 	GpgpuAqlPacket packet;
 	GpgpuKmtStatus status;
@@ -381,7 +370,7 @@ GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const
 	 */
 	block_args = rt->args->cpu;
 	for (uint32_t i = 0; i < args_count; i++)
-		block_args[i] = htole32(args[i]);
+		block_args[i] = htole64(args[i]);
 
 	/*
 	 * 4. 必须在发布包之前写好 Signal：
