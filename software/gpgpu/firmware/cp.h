@@ -111,11 +111,15 @@ static inline void cp_hqd_write64(u32 slot, u32 lo, u64 value)
 	cp_hqd_write(slot, lo + 4, value >> 32);
 }
 
-/* 地址按 align 对齐、长度非零，且 [addr, addr + size) 在 32 位 GPU 地址空间内。 */
+/*
+ * 地址按 align 对齐、长度非零，且 [addr, addr + size) 低于 GPUVA 上限。
+ * 管理域地址同样用这个上限粗查，超出 4 GiB 的物理地址在访问时路由
+ * 失败。
+ */
 static inline int cp_range_ok(u64 addr, u64 size, u32 align)
 {
-	return !(addr & (align - 1)) && size && addr < GPGPU_VM_ADDRESS_LIMIT &&
-		size <= GPGPU_VM_ADDRESS_LIMIT - addr;
+	return !(addr & (align - 1)) && size && addr < GPGPU_VM_VA_LIMIT &&
+		size <= GPGPU_VM_VA_LIMIT - addr;
 }
 
 /* Ring 容量合法：2 的幂，GPGPU_QUEUE_RING_MIN 到 GPGPU_QUEUE_RING_MAX。 */

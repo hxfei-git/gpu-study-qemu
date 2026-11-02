@@ -141,7 +141,7 @@ struct gpgpu_event_request {
 /**
  * struct gpgpu_va_range - 可分配的 GPUVA 半开区间
  * @start: 起始字节地址，包含此值。
- * @end: 结束字节地址，不包含此值；64 位可表示 4 GiB。
+ * @end: 结束字节地址，不包含此值。
  */
 struct gpgpu_va_range {
 	gpgpu_u64 start;
@@ -152,7 +152,8 @@ struct gpgpu_va_range {
  * struct gpgpu_vm_info - GPUVM 能力及当前绑定数量
  * @version: 输入输出接口版本，必须为 GPGPU_DRM_VERSION。
  * @flags: 保留，输入必须为零。
- * @address_bits: GPUVA 的有效位数。
+ * @address_bits: 设备地址的有效位数：GPUVM 开启时为 GPUVA 位数，关闭时
+ *                为 GPU 物理地址位数。
  * @page_size: 页大小，单位为字节。
  * @user_vmids: 全设备用户 VMID 数量。
  * @queues_per_vm: 每个 VM 可同时持有的用户队列数量。

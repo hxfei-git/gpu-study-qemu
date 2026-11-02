@@ -118,11 +118,16 @@ static void kmt_reset(GpgpuKmtContext *c)
 	c->uncertain = false;
 }
 
-/* 驱动必须是本库支持的版本：4 KiB 页、32 位 GPUVA、至多一个可分配区间。 */
+/*
+ * 驱动必须是本库支持的版本：4 KiB 页、至多一个可分配区间；地址位数在
+ * GPUVM 开启时为 GPUVA 位数，关闭时为 GPU 物理地址位数。
+ */
 static bool kmt_vm_info_supported(const struct gpgpu_vm_info *info)
 {
+	unsigned int bits = info->range_count ? GPGPU_VM_VA_BITS : GPGPU_PHYS_ADDRESS_BITS;
+
 	return info->version == GPGPU_DRM_VERSION && info->page_size == KMT_PAGE_SIZE &&
-		info->address_bits == 32 && info->range_count <= 1;
+		info->address_bits == bits && info->range_count <= 1;
 }
 
 /*

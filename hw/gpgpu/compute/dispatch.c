@@ -88,9 +88,9 @@ uint32_t gpgpu_dispatch_read(GPGPUState *s, hwaddr reg)
  *
  * 1. 设备已使能；第一版不支持工作组共享存储，shared_mem_size 必须为 0；
  * 2. 代码：入口 4 字节对齐，长度为 4 的非零倍数，
- *    [入口, 入口 + 长度) 不越过 32 位 GPU 地址空间；
+ *    [入口, 入口 + 长度) 低于 GPUVA 上限；
  * 3. 参数块：地址 8 字节对齐，长度 4 B～64 KiB 且为 4 的倍数，
- *    范围同样不越过 32 位地址空间；
+ *    范围同样低于 GPUVA 上限；
  * 4. 来源槽是已激活的用户槽，且绑定的 VMID 与配置一致；
  *    gpuvm=on 时该 VMID 的上下文已启用，否则执行器无法翻译地址。
  *
@@ -104,13 +104,13 @@ static bool config_valid(GPGPUState *s, const GPGPUKernelParams *c)
 
 	/* 2. 代码入口、长度与范围。 */
 	if ((c->kernel_addr & 3) || !c->code_size || (c->code_size & 3) ||
-	    !gpgpu_range_ok(c->kernel_addr, c->code_size, GPGPU_VM_ADDRESS_LIMIT))
+	    !gpgpu_range_ok(c->kernel_addr, c->code_size, GPGPU_VM_VA_LIMIT))
 		return false;
 
 	/* 3. 参数块地址、长度与范围。 */
 	if ((c->kernel_args & 7) || c->args_size < 4 || c->args_size > GPGPU_KERNEL_ARGS_MAX ||
 	    (c->args_size & 3) ||
-	    !gpgpu_range_ok(c->kernel_args, c->args_size, GPGPU_VM_ADDRESS_LIMIT))
+	    !gpgpu_range_ok(c->kernel_args, c->args_size, GPGPU_VM_VA_LIMIT))
 		return false;
 
 	/* 4. 来源队列绑定的 VMID 与配置一致，gpuvm=on 时上下文可用。 */

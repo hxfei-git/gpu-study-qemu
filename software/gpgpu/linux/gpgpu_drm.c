@@ -19,8 +19,6 @@
 #include <drm/drm_ioctl.h>
 #include "gpgpu_drv.h"
 
-/* INFO 报告的 GPUVA 位数。 */
-#define GPGPU_GPUVA_BITS 32
 /* INFO 报告的每个 VM 用户队列数。 */
 #define GPGPU_QUEUES_PER_VM 1
 
@@ -178,14 +176,14 @@ static int gpgpu_info(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_info *args)
 		return -EINVAL;
 	*args = (struct gpgpu_vm_info) {
 		.version = GPGPU_DRM_VERSION,
-		.address_bits = GPGPU_GPUVA_BITS,
+		.address_bits = dev->gpuvm ? GPGPU_VM_VA_BITS : GPGPU_PHYS_ADDRESS_BITS,
 		.page_size = PAGE_SIZE,
 		.user_vmids = GPGPU_VM_USERS,
 		.queues_per_vm = GPGPU_QUEUES_PER_VM,
 		.range_count = dev->gpuvm ? 1 : 0,
 		.bindings = hweight_long(dev->vmids),
 		.ranges = { { dev->gpuvm ? PAGE_SIZE : 0,
-				dev->gpuvm ? GPGPU_VM_ADDRESS_LIMIT : 0 } },
+				dev->gpuvm ? GPGPU_VM_VA_LIMIT : 0 } },
 	};
 	return 0;
 }

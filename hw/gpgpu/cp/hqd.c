@@ -46,10 +46,10 @@ static uint64_t hqd_get64(const uint32_t *hqd, hwaddr lo)
 	return hqd_get(hqd, lo) | (uint64_t)hqd_get(hqd, lo + 4) << 32;
 }
 
-/* 地址按 align 对齐，且 [addr, addr + len) 位于 32 位 GPU 地址空间内。 */
-static bool hqd_range_ok(uint64_t addr, uint64_t len, uint64_t align)
+/* 地址按 align 对齐，且 [addr, addr + len) 低于 limit。 */
+static bool hqd_range_ok(uint64_t addr, uint64_t len, uint64_t align, uint64_t limit)
 {
-	return !(addr & (align - 1)) && gpgpu_range_ok(addr, len, GPGPU_VM_ADDRESS_LIMIT);
+	return !(addr & (align - 1)) && gpgpu_range_ok(addr, len, limit);
 }
 
 /* Ring 容量：GPGPU_QUEUE_RING_MIN～MAX 之间的 2 的幂字节数。 */
@@ -66,7 +66,8 @@ static bool ring_size_valid(uint32_t size)
  * 激活后这些字段只读，CP 取包期间配置不会再变：
  *
  * 所有槽：Ring 容量合法；MQD 按 8 字节、Ring 按 64 字节、R/W 进度地址
- * 按 8 字节对齐，且整段范围不越出 32 位 GPU 地址空间。
+ * 按 8 字节对齐。MQD 和管理队列的 Ring、进度是 GPU 物理地址，整段须在
+ * 4 GiB 内；用户队列的 Ring、进度是用户地址，整段须低于 GPUVA 上限。
  * 用户槽另需：VMID 为 1 或 2；gpuvm=on 时该 VM 的上下文已启用，
  * 否则 CP 无法翻译用户地址。KIQ、HIQ 使用 VMID 0，不经翻译。
  */
@@ -74,12 +75,14 @@ static bool hqd_ready_to_activate(GPGPUState *s, unsigned int slot, const uint32
 {
 	uint32_t size = hqd_get(hqd, GPGPU_HQD_CONTROL);
 	uint32_t vmid = hqd_get(hqd, GPGPU_HQD_VMID);
+	uint64_t limit = slot < GPGPU_HQD_USER_FIRST ? GPGPU_PHYS_ADDRESS_LIMIT : GPGPU_VM_VA_LIMIT;
 
 	/* MQD 64 字节，Ring 为 size 字节，R、W 进度各 4 字节。 */
-	if (!ring_size_valid(size) || !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_MQD_LO), 64, 8) ||
-	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_RING_LO), size, 64) ||
-	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_RPTR_ADDR_LO), 4, 8) ||
-	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_WPTR_ADDR_LO), 4, 8))
+	if (!ring_size_valid(size) ||
+	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_MQD_LO), 64, 8, GPGPU_PHYS_ADDRESS_LIMIT) ||
+	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_RING_LO), size, 64, limit) ||
+	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_RPTR_ADDR_LO), 4, 8, limit) ||
+	    !hqd_range_ok(hqd_get64(hqd, GPGPU_HQD_WPTR_ADDR_LO), 4, 8, limit))
 		return false;
 
 	/* KIQ、HIQ 到此为止；用户槽再检查 VMID 与上下文。 */

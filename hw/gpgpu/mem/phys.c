@@ -13,7 +13,7 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
 {
 	GPGPUPhysState *p = &s->phys;
 
-	if (!len || !gpgpu_range_ok(addr, len, GPGPU_VM_ADDRESS_LIMIT))
+	if (!len || !gpgpu_range_ok(addr, len, GPGPU_PHYS_ADDRESS_LIMIT))
 		return false;
 	if (addr < s->vram_size)
 		return gpgpu_vram_contains(s, addr, len);

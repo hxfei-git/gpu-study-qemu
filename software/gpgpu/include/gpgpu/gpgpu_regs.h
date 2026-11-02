@@ -317,16 +317,20 @@ enum GpgpuDispatchError {
 #define GPGPU_REG_VM_INV_REQ 0x0910
 /* 只读：最近一次失效完成的 VMID 位图，或拒绝时的 GPGPU_VM_INV_ERROR。 */
 #define GPGPU_REG_VM_INV_ACK 0x0914
-/* 范围失效的起始 VPN（GPUVA / GPGPU_VM_PAGE_SIZE）。 */
-#define GPGPU_REG_VM_INV_VPN_START 0x0918
-/* 范围失效的结束 VPN，闭区间。 */
-#define GPGPU_REG_VM_INV_VPN_END 0x091c
 /* 只读：TLB 命中次数。三个计数全设备共用，32 位回绕，失效不清零。 */
 #define GPGPU_REG_VM_TLB_HITS 0x0920
 /* 只读：TLB 未命中次数，每次未命中随后遍历一次页表。 */
 #define GPGPU_REG_VM_TLB_MISSES 0x0924
 /* 只读：遍历成功后替换有效项的次数。 */
 #define GPGPU_REG_VM_TLB_EVICTIONS 0x0928
+/* 范围失效的起始 VPN（GPUVA / GPGPU_VM_PAGE_SIZE，36 位）低 32 位。 */
+#define GPGPU_REG_VM_INV_VPN_START_LO 0x0930
+/* 起始 VPN 高 32 位。 */
+#define GPGPU_REG_VM_INV_VPN_START_HI 0x0934
+/* 范围失效的结束 VPN 低 32 位，闭区间。 */
+#define GPGPU_REG_VM_INV_VPN_END_LO 0x0938
+/* 结束 VPN 高 32 位。 */
+#define GPGPU_REG_VM_INV_VPN_END_HI 0x093c
 /* 用户 VMID 的上下文寄存器组，每组 0x20 字节。 */
 #define GPGPU_REG_VM_CONTEXT(vmid) (0x0940 + (vmid) * 0x20)
 /* 上下文内：页表根 GPU 物理地址低 32 位，按页对齐。 */
@@ -342,7 +346,7 @@ enum GpgpuDispatchError {
 #define GPGPU_VM_INV_RANGE (1U << 16)
 /*
  * VM_INV_ACK：请求被整体拒绝，没有清除任何项。原因是含保留位、
- * 位图为空、范围非法，或被选 VMID 仍有激活的队列或在途访问。
+ * 位图为空，或范围非法（起点大于终点、终点不低于 2^36）。
  */
 #define GPGPU_VM_INV_ERROR (1U << 31)
 

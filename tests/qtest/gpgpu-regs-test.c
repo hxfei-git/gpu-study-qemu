@@ -297,8 +297,8 @@ static void test_gpuvm_context(void)
 	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
 	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_RANGE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
-	wr(&t, GPGPU_REG_VM_INV_VPN_START, 0x402);
-	wr(&t, GPGPU_REG_VM_INV_VPN_END, 0x400);
+	wr(&t, GPGPU_REG_VM_INV_VPN_START_LO, 0x402);
+	wr(&t, GPGPU_REG_VM_INV_VPN_END_LO, 0x400);
 	wr(&t, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE);
 	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_ERROR);
 	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
@@ -308,8 +308,8 @@ static void test_gpuvm_context(void)
 	g_assert_cmpuint(rd(&t, ctx + GPGPU_VM_ENABLE), ==, 0);
 	g_assert_cmphex(rd(&t, ctx + GPGPU_VM_ROOT_LO), ==, 0);
 	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_ACK), ==, 0);
-	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_START), ==, 0);
-	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_END), ==, 0);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_START_LO), ==, 0);
+	g_assert_cmphex(rd(&t, GPGPU_REG_VM_INV_VPN_END_LO), ==, 0);
 	regs_stop(&t);
 
 	/* 6. gpuvm=off 时写上下文的根或失效请求都锁存 INVALID_CMD。 */

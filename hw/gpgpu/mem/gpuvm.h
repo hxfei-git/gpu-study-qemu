@@ -4,7 +4,7 @@
  *
  * CP 用户域访问和 RV32 执行器的取指、数据访问都调用 gpgpu_user_rw()：
  *
- *   gpuvm=on   GPUVA ─TLB/三级页表─▶ GPU 物理地址 ─▶ gpgpu_phys_rw()
+ *   gpuvm=on   GPUVA ─TLB/四级页表─▶ GPU 物理地址 ─▶ gpgpu_phys_rw()
  *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区 ─▶ gpgpu_phys_rw()
  *
  * 两种模式下用户都不能访问 VRAM 首页和固件保留区。访问失败时按来源
@@ -31,14 +31,14 @@ typedef struct GPGPUVMContext {
 /**
  * struct GPGPUVMTlbEntry - TLB 中的一项叶子翻译
  * @phys: 目标页的 GPU 物理基址，按 4 KiB 对齐；SYSTEM 已换算完毕。
- * @vpn: GPU 虚拟页号，即 GPUVA / GPGPU_VM_PAGE_SIZE。
+ * @vpn: GPU 虚拟页号，即 GPUVA / GPGPU_VM_PAGE_SIZE，有效 36 位。
  * @vmid: 所属 VMID。
  * @perms: 叶子项的 R/W/X 位，取值为 GPGPU_VM_PERMS 的子集。
  * @valid: 本项有效。
  */
 typedef struct GPGPUVMTlbEntry {
 	uint64_t phys;
-	uint32_t vpn;
+	uint64_t vpn;
 	uint32_t vmid;
 	uint32_t perms;
 	bool valid;
@@ -74,8 +74,8 @@ typedef struct GPGPUVMFault {
  * struct GPGPUVMState - GPUVM 模块状态
  * @firmware: CP 固件本次启动写回的协议版本；0 表示尚未握手。
  * @inv_ack: VM_INV_ACK：最近一次失效完成的 VMID 位图或 GPGPU_VM_INV_ERROR。
- * @inv_vpn_start: VM_INV_VPN_START，范围失效的起始 VPN。
- * @inv_vpn_end: VM_INV_VPN_END，范围失效的结束 VPN（含）。
+ * @inv_vpn_start: VM_INV_VPN_START_LO/HI，范围失效的起始 VPN。
+ * @inv_vpn_end: VM_INV_VPN_END_LO/HI，范围失效的结束 VPN（含）。
  * @hits: TLB 命中次数，32 位回绕，失效不清零。
  * @misses: TLB 未命中次数，同上。
  * @evictions: 遍历成功后替换有效项的次数，同上。
@@ -86,8 +86,8 @@ typedef struct GPGPUVMFault {
 typedef struct GPGPUVMState {
 	uint32_t firmware;
 	uint32_t inv_ack;
-	uint32_t inv_vpn_start;
-	uint32_t inv_vpn_end;
+	uint64_t inv_vpn_start;
+	uint64_t inv_vpn_end;
 	uint32_t hits;
 	uint32_t misses;
 	uint32_t evictions;

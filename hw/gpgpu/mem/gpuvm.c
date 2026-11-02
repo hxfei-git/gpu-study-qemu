@@ -10,23 +10,15 @@
 #include "gpuvm.h"
 #include "phys.h"
 
-/* GPUVA 中页内偏移的位数。 */
-#define VM_PAGE_SHIFT 12
-/* 页表级数：L0 由 VA[31:30] 索引 4 项，L1、L2 由 9 位索引 512 项。 */
-#define VM_LEVELS 3
 /* 每个页表项的字节数。 */
 #define VM_PTE_SIZE 8
 /* 每个用户上下文、每个故障组在 BAR0 中占用的字节数。 */
 #define VM_CONTEXT_STRIDE (GPGPU_REG_VM_CONTEXT(1) - GPGPU_REG_VM_CONTEXT(0))
 #define VM_FAULT_STRIDE (GPGPU_REG_VM_FAULT(1) - GPGPU_REG_VM_FAULT(0))
-/* VPN 的上界（不含）：32 位 GPUVA 共 2^20 页。 */
-#define VM_VPN_LIMIT (GPGPU_VM_ADDRESS_LIMIT >> VM_PAGE_SHIFT)
+/* VPN 的上界（不含）：48 位 GPUVA 共 2^36 页。 */
+#define VM_VPN_LIMIT (GPGPU_VM_VA_LIMIT >> GPGPU_VM_PAGE_SHIFT)
 /* VM_INV_REQ 中用户 VMID 1～GPGPU_VM_USERS 的位图。 */
 #define VM_INV_VMIDS (((1U << GPGPU_VM_USERS) - 1) * GPGPU_VM_INV_VMID(1))
-
-/* 每级索引在 GPUVA 中的起始位与掩码，依次为 L0、L1、L2。 */
-static const unsigned int vm_level_shift[VM_LEVELS] = { 30, 21, 12 };
-static const unsigned int vm_level_mask[VM_LEVELS] = { 3, 511, 511 };
 
 void gpgpu_vm_record_fault(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addr,
 			   uint32_t access, uint32_t phase, uint32_t reason)
@@ -113,23 +105,24 @@ static uint32_t vm_entry_page(GPGPUState *s, uint64_t entry, uint64_t *phys)
 }
 
 /*
- * vm_walk() - 同步遍历 vmid 的三级页表，取得 va 所在页的物理页与权限
+ * vm_walk() - 同步遍历 vmid 的四级页表，取得 va 所在页的物理页与权限
  *
- * TLB 未命中时由 vm_lookup() 调用。32 位 GPUVA 按下面的方式拆成三级索引
- * 和页内偏移，每级页表都占一个 4 KiB 物理页，表项为 8 字节小端值：
+ * TLB 未命中时由 vm_lookup() 调用。调用者已保证 va 低于 GPGPU_VM_VA_LIMIT，
+ * 48 位 GPUVA 按下面的方式拆成四级索引和页内偏移，每级页表都占一个
+ * 4 KiB 物理页、512 项，表项为 8 字节小端值：
  *
- *   va 位    31..30     29..21     20..12     11..0
- *   用途     L0 索引    L1 索引    L2 索引    页内偏移（本函数不用）
- *   项数     4          512        512
+ *   va 位    47..39     38..30     29..21     20..12     11..0
+ *   用途     L0 索引    L1 索引    L2 索引    L3 索引    页内偏移（不用）
  *
- * 表项格式：位 31..12 是下一级页表页（L0、L1）或目标数据页（L2）的
+ * 表项格式：位 31..12 是下一级页表页（L0～L2）或目标数据页（L3）的
  * 地址域，由位 1 SYSTEM 决定是 Host IOVA 还是 VRAM 偏移（见
  * vm_entry_page()）；
- * 位 0 为 VALID；只有 L2 叶子项可以带 X(4)、R(5)、W(6) 权限位，其余位
+ * 位 0 为 VALID；只有 L3 叶子项可以带 X(4)、R(5)、W(6) 权限位，其余位
  * 必须为 0。
  *
- * 例：va = 0x8000_1234 依次取 L0[2]、L1[0]、L2[1]。L2[1] 给出数据页基址，
- * 调用者再加上页内偏移 0x234 得到最终物理地址。
+ * 例：va = 0x0000_ffff_8a40_2234 依次取 L0[0x1ff]、L1[0x1fe]、L2[0x52]、
+ * L3[2]。L3[2] 给出数据页基址，调用者再加上页内偏移 0x234 得到最终
+ * 物理地址。
  *
  * 从上下文寄存器 ROOT 指向的 L0 页开始，每级执行同样的步骤：
  *
@@ -140,7 +133,7 @@ static uint32_t vm_entry_page(GPGPUState *s, uint64_t entry, uint64_t *phys)
  * 3. VALID 为 0 说明这段地址没有映射，记 UNMAPPED 故障；
  * 4. 表项带有本级不允许的位（中间项带权限位，或任一级带保留位）
  *    说明页表内容损坏，记 TABLE 故障；
- * 5. 按 SYSTEM 把地址域换算成 GPU 物理页，作为下一级表页；到 L2 时它是
+ * 5. 按 SYSTEM 把地址域换算成 GPU 物理页，作为下一级表页；到 L3 时它是
  *    数据页，换算后连同权限交给调用者。地址域与 SYSTEM 不符记 TABLE
  *    故障。
  *
@@ -153,15 +146,15 @@ static uint32_t vm_entry_page(GPGPUState *s, uint64_t entry, uint64_t *phys)
  * Return: 0 表示成功并写入 *pte，否则为 GPGPU_VM_FAULT_TABLE 或
  * GPGPU_VM_FAULT_UNMAPPED。
  */
-static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *pte)
+static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte)
 {
 	/* 从 L0 开始，table 始终保存当前这一级表页的 GPU 物理基址。 */
 	uint64_t table = s->vm.contexts[vmid].root;
 
-	for (unsigned int level = 0; level < VM_LEVELS; level++) {
-		bool leaf = level == VM_LEVELS - 1;
-		/* 1. L0 取 va[31:30]，L1 取 va[29:21]，L2 取 va[20:12]。 */
-		uint32_t index = (va >> vm_level_shift[level]) & vm_level_mask[level];
+	for (unsigned int level = 0; level < GPGPU_VM_LEVELS; level++) {
+		bool leaf = level == GPGPU_VM_LEVELS - 1;
+		/* 1. 依次取 va[47:39]、va[38:30]、va[29:21]、va[20:12]。 */
+		uint32_t index = (va >> GPGPU_VM_LEVEL_SHIFT(level)) & GPGPU_VM_INDEX_MASK;
 		/* 本级允许的位：中间项为地址、VALID、SYSTEM，叶子加 R/W/X。 */
 		uint64_t allowed = GPGPU_VM_ADDR_MASK |
 				   (leaf ? GPGPU_VM_FLAGS : GPGPU_VM_DIR_FLAGS);
@@ -219,7 +212,7 @@ static void tlb_touch(GPGPUVMTlbSet *set, uint8_t way)
  * 四路都有效时替换 order[3] 记录的 LRU 路并计一次 EVICTIONS。
  * 新项成为 MRU。
  */
-static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint32_t vpn,
+static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint64_t vpn,
 		     uint64_t pte)
 {
 	uint8_t way = set->order[GPGPU_VM_TLB_WAYS - 1];
@@ -248,12 +241,12 @@ static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint32
  * TLB 共 GPGPU_VM_TLB_SETS 组、每组 GPGPU_VM_TLB_WAYS 路，标签为 VMID 与
  * VPN，组号由 VPN 的低位决定：
  *
- *   va 位    31..18           17..12       11..0
+ *   va 位    47..18           17..12       11..0
  *   用途     VPN 高位         组号         页内偏移（本函数不用）
- *            （VPN = va[31:12]，组号 = VPN % 64）
+ *            （VPN = va[47:12]，组号 = VPN % 64）
  *
- * 例：va = 0x0040_2000 的 VPN 为 0x402，组号 2；va = 0x0044_2000 的 VPN
- * 为 0x442，也落在第 2 组，两者占用同组的不同路。
+ * 例：va = 0x0000_ffff_8a40_2000 的 VPN 为 0xf_fff8_a402，组号 2；
+ * va = 0x0040_2000 的 VPN 为 0x402，也落在第 2 组，两者占用同组的不同路。
  *
  * 1. 在本组各路中找 VMID 与 VPN 都相同的有效项；命中时 HITS 加 1，该路
  *    成为 MRU，返回保存的物理页与权限；
@@ -266,9 +259,9 @@ static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint32
  * Return: 0 并写入 *pte（GPU 物理页 | VALID | 权限），或 vm_walk() 返回的
  * 故障原因。
  */
-static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *pte)
+static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte)
 {
-	uint32_t vpn = va >> VM_PAGE_SHIFT;
+	uint64_t vpn = va >> GPGPU_VM_PAGE_SHIFT;
 	GPGPUVMTlbSet *set = &s->vm.sets[vpn % GPGPU_VM_TLB_SETS];
 	uint32_t reason;
 
@@ -297,12 +290,12 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint32_t va, uint64_t *p
 /*
  * vm_translated_rw() - gpuvm=on 时按 VMID 翻译并访问用户地址
  *
- * CP 或计算执行器给出的是 32 位 GPUVA，必须先经 vmid 的三级页表
- * 换成 GPU 物理地址才能访问。一次请求可能跨越多个 4 KiB 页，
- * 所以按页拆开逐段处理：
+ * CP 或计算执行器给出的是 GPUVA，必须先经 vmid 的四级页表换成 GPU
+ * 物理地址才能访问。一次请求可能跨越多个 4 KiB 页，所以按页拆开逐段
+ * 处理：
  *
- * 1. 检查 vmid 的上下文已启用，请求不越过 GPUVA 上限，
- *    长度与对齐合法；
+ * 1. 检查 vmid 的上下文已启用，请求不越过 GPUVA 上限 2^48（位 63..48
+ *    非零的地址记 RANGE 故障），长度与对齐合法；
  * 2. 增加上下文的在途访问计数。整次访问在主锁下完成：访问 Host 内存的
  *    vfio-user DMA 同步等待回复，期间不释放主锁，收到的 Host 寄存器写入
  *    暂存到访问结束后才处理。计数让上下文修改在访问期间被拒绝，也让
@@ -326,7 +319,7 @@ static bool vm_translated_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64
 		reason = GPGPU_VM_FAULT_CONTEXT;
 		goto fail;
 	}
-	if (!gpgpu_range_ok(addr, len, GPGPU_VM_ADDRESS_LIMIT) ||
+	if (!gpgpu_range_ok(addr, len, GPGPU_VM_VA_LIMIT) ||
 	    !user_request_valid(addr, len, access)) {
 		reason = GPGPU_VM_FAULT_RANGE;
 		goto fail;
@@ -465,10 +458,12 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr reg)
 		return s->vm.firmware;
 	case GPGPU_REG_VM_INV_ACK:
 		return s->vm.inv_ack;
-	case GPGPU_REG_VM_INV_VPN_START:
-		return s->vm.inv_vpn_start;
-	case GPGPU_REG_VM_INV_VPN_END:
-		return s->vm.inv_vpn_end;
+	case GPGPU_REG_VM_INV_VPN_START_LO:
+	case GPGPU_REG_VM_INV_VPN_START_HI:
+		return gpgpu_reg64_read(s->vm.inv_vpn_start, reg - GPGPU_REG_VM_INV_VPN_START_LO);
+	case GPGPU_REG_VM_INV_VPN_END_LO:
+	case GPGPU_REG_VM_INV_VPN_END_HI:
+		return gpgpu_reg64_read(s->vm.inv_vpn_end, reg - GPGPU_REG_VM_INV_VPN_END_LO);
 	case GPGPU_REG_VM_TLB_HITS:
 		return s->vm.hits;
 	case GPGPU_REG_VM_TLB_MISSES:
@@ -491,7 +486,7 @@ uint32_t gpgpu_vm_read(GPGPUState *s, hwaddr reg)
 }
 
 /* 清除 vmids 位图所选 VMID 中 VPN 落在 [start, end] 内的项；各组顺序不变。 */
-static void tlb_invalidate(GPGPUVMState *vm, uint32_t vmids, uint32_t start, uint32_t end)
+static void tlb_invalidate(GPGPUVMState *vm, uint32_t vmids, uint64_t start, uint64_t end)
 {
 	for (unsigned int set = 0; set < GPGPU_VM_TLB_SETS; set++) {
 		for (unsigned int way = 0; way < GPGPU_VM_TLB_WAYS; way++) {
@@ -514,14 +509,13 @@ static void tlb_invalidate(GPGPUVMState *vm, uint32_t vmids, uint32_t start, uin
  *   用途     保留     RANGE   保留    VMID 位图    保留（VMID 0）
  *
  * RANGE=1 时只清 VPN 落在 [VM_INV_VPN_START, VM_INV_VPN_END] 内的项，
- * 否则清所选 VMID 的全部项。例：START = 0x400、END = 0x402、
- * REQ = 0x0001_0002 只清 VMID 1 中 GPUVA 0x0040_0000～0x0040_2fff 的
- * 翻译，完成后 ACK = 0x2。
+ * 否则清所选 VMID 的全部项；两个 VPN 各由一对 LO/HI 寄存器给出。
+ * 例：START = 0xf_fff8_a400、END = 0xf_fff8_a402、REQ = 0x0001_0002 只清
+ * VMID 1 中 GPUVA 0x0000_ffff_8a40_0000～0x0000_ffff_8a40_2fff 的翻译，
+ * 完成后 ACK = 0x2。
  *
  * 1. 先完成全部检查，任一项不满足就整体拒绝，不清除任何项，ACK 只置
- *    ERROR：REQ 含保留位或位图为空；范围起点大于终点或终点超出 2^20 页；
- *    任一所选 VMID 仍有激活的队列或在途访问。最后一项若放行，在途访问
- *    会按旧页表重新填入翻译，失效之后仍可能用到旧映射；
+ *    ERROR：REQ 含保留位或位图为空；范围起点大于终点或终点超出 2^36 页；
  * 2. 遍历全部组和路，清除所选 VMID 中落在范围内的项；
  * 3. ACK 写入本次完成的 VMID 位图。
  *
@@ -533,8 +527,8 @@ static void vm_invalidate(GPGPUState *s, uint32_t req)
 	GPGPUVMState *vm = &s->vm;
 	uint32_t vmids = req & VM_INV_VMIDS;
 	bool range = req & GPGPU_VM_INV_RANGE;
-	uint32_t start = range ? vm->inv_vpn_start : 0;
-	uint32_t end = range ? vm->inv_vpn_end : VM_VPN_LIMIT - 1;
+	uint64_t start = range ? vm->inv_vpn_start : 0;
+	uint64_t end = range ? vm->inv_vpn_end : VM_VPN_LIMIT - 1;
 
 	/*
 	 * 1. 请求本身合法才改动 TLB。所选 VMID 可以有激活的队列：失效在主锁下
@@ -599,16 +593,18 @@ void gpgpu_vm_write(GPGPUState *s, hwaddr reg, uint32_t value)
 	hwaddr field;
 	int slot;
 
-	if (reg == GPGPU_REG_VM_INV_REQ || reg == GPGPU_REG_VM_INV_VPN_START ||
-	    reg == GPGPU_REG_VM_INV_VPN_END) {
+	if (reg == GPGPU_REG_VM_INV_REQ ||
+	    (reg >= GPGPU_REG_VM_INV_VPN_START_LO && reg <= GPGPU_REG_VM_INV_VPN_END_HI)) {
 		if (!s->gpuvm)
 			goto invalid;
 		if (reg == GPGPU_REG_VM_INV_REQ)
 			vm_invalidate(s, value);
-		else if (reg == GPGPU_REG_VM_INV_VPN_START)
-			s->vm.inv_vpn_start = value;
+		else if (reg < GPGPU_REG_VM_INV_VPN_END_LO)
+			gpgpu_reg64_write(&s->vm.inv_vpn_start, reg - GPGPU_REG_VM_INV_VPN_START_LO,
+					  value);
 		else
-			s->vm.inv_vpn_end = value;
+			gpgpu_reg64_write(&s->vm.inv_vpn_end, reg - GPGPU_REG_VM_INV_VPN_END_LO,
+					  value);
 		return;
 	}
 

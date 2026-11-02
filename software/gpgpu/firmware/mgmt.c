@@ -35,7 +35,7 @@ static u32 cp_target_slots(u32 source, u32 *begin, u32 *end)
  * 所以装载前必须一次查完，避免运行中才发现地址或格式非法：
  *
  * 1. VMID：用户队列只能用 1 或 2，gpuvm=on 时该 VM 的上下文须已启用，
- *    Ring 与 R/W 进度地址都在 32 位 GPUVA 内；管理队列不翻译，VMID 须为 0；
+ *    Ring 与 R/W 进度地址都低于 GPUVA 上限；管理队列不翻译，VMID 须为 0；
  * 2. Ring 容量是允许范围内的 2 的幂，Ring 按 64 字节对齐，
  *    R/W 进度按 8 字节对齐；
  * 3. Doorbell 控制字只含使能位和偏移，偏移按 8 字节对齐，
@@ -51,14 +51,14 @@ static int cp_mqd_valid(const GpgpuMqd *mqd, u32 kind)
 	u32 db_offset = db & GPGPU_DOORBELL_OFFSET_MASK;
 	u32 capacity = mqd->pq_control;
 
-	/* 1. 用户队列检查 VMID 与 32 位地址范围；管理队列只允许 VMID 0。 */
+	/* 1. 用户队列检查 VMID 与 GPUVA 范围；管理队列只允许 VMID 0。 */
 	if (kind == GPGPU_QUEUE_USER_AQL) {
 		if (mqd->vmid < 1 || mqd->vmid > GPGPU_VM_USERS ||
 		    (cp_gpuvm && !cp_reg_read(GPGPU_REG_VM_CONTEXT(mqd->vmid) + GPGPU_VM_ENABLE)) ||
-		    mqd->ring_base >= GPGPU_VM_ADDRESS_LIMIT ||
-		    capacity > GPGPU_VM_ADDRESS_LIMIT - mqd->ring_base ||
-		    mqd->rptr_report_addr >= GPGPU_VM_ADDRESS_LIMIT ||
-		    mqd->wptr_poll_addr >= GPGPU_VM_ADDRESS_LIMIT)
+		    mqd->ring_base >= GPGPU_VM_VA_LIMIT ||
+		    capacity > GPGPU_VM_VA_LIMIT - mqd->ring_base ||
+		    mqd->rptr_report_addr >= GPGPU_VM_VA_LIMIT ||
+		    mqd->wptr_poll_addr >= GPGPU_VM_VA_LIMIT)
 			return 0;
 	} else if (mqd->vmid) {
 		return 0;

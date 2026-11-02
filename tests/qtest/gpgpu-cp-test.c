@@ -720,28 +720,28 @@ static void test_fault_scope(void)
  * 按 GPA() 访问。
  */
 typedef struct VmMapping {
-	uint32_t va;
+	uint64_t va;
 	uint64_t target;
 	uint64_t flags;
 } VmMapping;
 
 /*
- * vm_leaf() - 返回 GPUVA 叶子项所在的 VRAM 偏移，按需创建中间表
+ * vm_entry() - 返回 GPUVA 在第 level 级表项所在的 VRAM 偏移，按需创建中间表
+ * @level: 0 为根，GPGPU_VM_LEVELS - 1 为叶子。
  * @next_table: 下一个可用表页的 VRAM 偏移，创建表页后向后推进一页。
  *
- * 三级 4 KiB 页表：L0 按 VA[31:30] 有 4 项，L1 按 VA[29:21]、L2 按 VA[20:12]
- * 各 512 项。中间项只保存下一级表页地址和 VALID 位。
+ * 四级 4 KiB 页表，每级 512 项，L0～L3 依次按 VA[47:39]、[38:30]、
+ * [29:21]、[20:12] 索引。中间项只保存下一级表页地址和 VALID 位。
  *
- * 循环只走 L0、L1 两级：某项无效时取 next_table 作为新表页并写回该项。
- * 新表页依赖 vm_prepare() 预先清零，所以其中各项都是无效项。
+ * 循环走过 level 之前的各级：某项无效时取 next_table 作为新表页并写回
+ * 该项。新表页依赖 vm_prepare() 预先清零，所以其中各项都是无效项。
  */
-static uint32_t vm_leaf(CPTest *s, uint32_t va, uint32_t *next_table)
+static uint32_t vm_entry(CPTest *s, uint64_t va, unsigned int level, uint32_t *next_table)
 {
-	const unsigned int shifts[] = { 30, 21 };
 	uint32_t table = VM_ROOT;
 
-	for (unsigned int level = 0; level < 2; level++) {
-		uint32_t index = (va >> shifts[level]) & (level ? 511 : 3);
+	for (unsigned int i = 0; i < level; i++) {
+		uint32_t index = (va >> GPGPU_VM_LEVEL_SHIFT(i)) & GPGPU_VM_INDEX_MASK;
 		uint32_t entry_at = table + index * 8;
 		uint64_t entry = qpci_io_readq(s->dev, s->vram, entry_at);
 
@@ -752,7 +752,13 @@ static uint32_t vm_leaf(CPTest *s, uint32_t va, uint32_t *next_table)
 		}
 		table = entry & GPGPU_VM_ADDR_MASK;
 	}
-	return table + ((va >> 12) & 511) * 8;
+	return table + ((va >> GPGPU_VM_LEVEL_SHIFT(level)) & GPGPU_VM_INDEX_MASK) * 8;
+}
+
+/* 返回 GPUVA 叶子项所在的 VRAM 偏移，按需创建中间表。 */
+static uint32_t vm_leaf(CPTest *s, uint64_t va, uint32_t *next_table)
+{
+	return vm_entry(s, va, GPGPU_VM_LEVELS - 1, next_table);
 }
 
 /* 同步失效 VMID 1 的全部 TLB 项并要求确认；调用时槽 2 不能激活。 */
@@ -908,7 +914,7 @@ static void test_gpuvm_exec_fault(void)
  * test_gpuvm_system() - 页表项 SYSTEM 位的地址解释
  *
  * 准备：vm_prepare() 建好 VMID 1 后卸载槽 2，把 Ring、进度、参数和 Signal
- * 所在的 L2 表从 VRAM 复制到 Host 页 VM_HOST_TABLE，L1 项改为
+ * 所在的 L3 叶表从 VRAM 复制到 Host 页 VM_HOST_TABLE，指向它的 L2 项改为
  * “IOVA | SYSTEM | VALID”。之后每次改表都先卸载槽 2，失效后再映射。
  *
  * 期望：
@@ -921,23 +927,24 @@ static void test_gpuvm_exec_fault(void)
 static void test_gpuvm_system(void)
 {
 	const uint64_t fault = GPGPU_REG_VM_FAULT(2);
-	const uint64_t args_leaf = VM_HOST_TABLE + ((VM_ARGS >> 12) & 511) * 8;
+	const uint64_t args_leaf = VM_HOST_TABLE +
+		((VM_ARGS >> GPGPU_VM_PAGE_SHIFT) & GPGPU_VM_INDEX_MASK) * 8;
 	const uint64_t args_ok = QUEUE_ARGS(0) | GPGPU_VM_SYSTEM | GPGPU_VM_READ | GPGPU_VM_VALID;
 	CPTest s = { 0 };
 	uint8_t table[GPGPU_VM_PAGE_SIZE];
-	uint64_t l1_entry;
-	uint64_t l2;
+	uint32_t no_alloc = 0;
+	uint32_t dir_entry;
+	uint64_t leaf_table;
 
 	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
 	queue_unmap(&s, 2);
 
-	/* 1. L0[0] 指向 L1 表，L1[0] 指向覆盖 VA [0, 2 MiB) 的 L2 表。 */
-	l1_entry = (qpci_io_readq(s.dev, s.vram, VM_ROOT + ((VM_RING >> 30) & 3) * 8) &
-		    GPGPU_VM_ADDR_MASK) + ((VM_RING >> 21) & 511) * 8;
-	l2 = qpci_io_readq(s.dev, s.vram, l1_entry) & GPGPU_VM_ADDR_MASK;
-	qpci_memread(s.dev, s.vram, l2, table, sizeof(table));
+	/* 1. 找到指向 VM_RING 所在叶表的 L2 项；路径已建立，不分配表页。 */
+	dir_entry = vm_entry(&s, VM_RING, GPGPU_VM_LEVELS - 2, &no_alloc);
+	leaf_table = qpci_io_readq(s.dev, s.vram, dir_entry) & GPGPU_VM_ADDR_MASK;
+	qpci_memread(s.dev, s.vram, leaf_table, table, sizeof(table));
 	qtest_memwrite(s.host, VM_HOST_TABLE, table, sizeof(table));
-	qpci_io_writeq(s.dev, s.vram, l1_entry, VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_VALID);
+	qpci_io_writeq(s.dev, s.vram, dir_entry, VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_VALID);
 	vm_invalidate(&s);
 	queue_map(&s, 2);
 	vm_submit(&s, 0, 0, VM_DATA);
@@ -999,7 +1006,7 @@ static void vm_tlb_round(CPTest *s, uint32_t *number)
 static void test_gpuvm_tlb(void)
 {
 	const uint32_t last = VM_TLB_PAGES - 1;
-	const uint32_t vpn = VM_TLB_DATA(last) / GPGPU_VM_PAGE_SIZE;
+	const uint64_t vpn = VM_TLB_DATA(last) / GPGPU_VM_PAGE_SIZE;
 	CPTest s = { 0 };
 	uint32_t number = 0;
 	uint32_t no_alloc = 0;
@@ -1023,8 +1030,8 @@ static void test_gpuvm_tlb(void)
 	 */
 	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_TLB_DATA(last), &no_alloc),
 		       VM_TLB_OUT(VM_TLB_PAGES) | GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_VALID);
-	wr(&s, GPGPU_REG_VM_INV_VPN_START, vpn);
-	wr(&s, GPGPU_REG_VM_INV_VPN_END, vpn);
+	wr64(&s, GPGPU_REG_VM_INV_VPN_START_LO, vpn);
+	wr64(&s, GPGPU_REG_VM_INV_VPN_END_LO, vpn);
 	wr(&s, GPGPU_REG_VM_INV_REQ, GPGPU_VM_INV_VMID(1) | GPGPU_VM_INV_RANGE);
 	g_assert_cmphex(rd(&s, GPGPU_REG_VM_INV_ACK), ==, GPGPU_VM_INV_VMID(1));
 	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);

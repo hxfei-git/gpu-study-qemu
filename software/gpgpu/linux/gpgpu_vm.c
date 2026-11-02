@@ -3,7 +3,7 @@
  * GPGPU 驱动：GPU 地址空间
  *
  * 每个会话在第一次绑定对象时建立地址空间：
- *   gpuvm=on   建立三级页表（表页从 VRAM 分配），对象绑定到应用给出的
+ *   gpuvm=on   建立四级页表（表页从 VRAM 分配），对象绑定到应用给出的
  *              GPUVA。Host 页的叶子项写 IOVA 并置 SYSTEM，VRAM 页写 VRAM 偏移；
  *   gpuvm=off  不建页表，对象的 GPU 地址就是它的 GPU 物理地址。
  *
@@ -29,10 +29,6 @@
  */
 #include <linux/slab.h>
 #include "gpgpu_drv.h"
-
-/* 页表中间级的移位与索引宽度：L0 由 VA[31:30] 索引 4 项，L1 由 VA[29:21] 索引 512 项。 */
-static const unsigned int vm_dir_shift[2] = { 30, 21 };
-static const unsigned int vm_dir_mask[2] = { 3, 511 };
 
 /**
  * struct gpgpu_vm_table - 一页驱动私有页表
@@ -73,18 +69,19 @@ static int vm_table_alloc(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 *of
  * vm_leaf() - 取得 va 的叶子项在 VRAM 中的偏移
  * @create: 中间级缺失时是否分配新表页；为 false 时缺失返回 -ENOENT。
  *
- * 经 BAR2 读写页表：从根开始依次用 VA[31:30]、VA[29:21] 索引 L0、L1，
- * 中间项有效就进入下一级表页，缺失时按 @create 分配新表页（已清零）并
- * 写入只含 VALID 的中间项。驱动的表页都在 VRAM，中间项不带 SYSTEM，
- * 地址域就是 BAR2 偏移。最后用 VA[20:12] 算出 L2 叶子项的偏移。
+ * 经 BAR2 读写页表：从根开始依次用 VA[47:39]、VA[38:30]、VA[29:21] 索引
+ * L0、L1、L2，中间项有效就进入下一级表页，缺失时按 @create 分配新表页
+ * （已清零）并写入只含 VALID 的中间项。驱动的表页都在 VRAM，中间项不带
+ * SYSTEM，地址域就是 BAR2 偏移。最后用 VA[20:12] 算出 L3 叶子项的偏移。
  */
-static int vm_leaf(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 va, bool create,
+static int vm_leaf(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, bool create,
 		   u32 *offset)
 {
 	u32 table = vm->root;
 
-	for (unsigned int level = 0; level < ARRAY_SIZE(vm_dir_shift); level++) {
-		u32 entry_at = table + ((va >> vm_dir_shift[level]) & vm_dir_mask[level]) * 8;
+	for (unsigned int level = 0; level < GPGPU_VM_LEVELS - 1; level++) {
+		u32 index = (va >> GPGPU_VM_LEVEL_SHIFT(level)) & GPGPU_VM_INDEX_MASK;
+		u32 entry_at = table + index * 8;
 		u64 entry = readq(dev->vram + entry_at);
 		int ret;
 
@@ -100,8 +97,8 @@ static int vm_leaf(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 va, bool c
 		writeq((u64)table | GPGPU_VM_VALID, dev->vram + entry_at);
 	}
 
-	/* L2 由 VA[20:12] 索引 512 项。 */
-	*offset = table + ((va >> PAGE_SHIFT) & 511) * 8;
+	/* L3 由 VA[20:12] 索引 512 项。 */
+	*offset = table + ((va >> GPGPU_VM_PAGE_SHIFT) & GPGPU_VM_INDEX_MASK) * 8;
 	return 0;
 }
 
@@ -128,17 +125,18 @@ static int vm_invalidate(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 
 /*
  * 只失效 [va, va + size) 覆盖的页，用于绑定和解绑一个对象，不影响同一 VM
- * 其他对象的翻译。例：va = 0x0040_0000、size = 0x3000 时 VPN 范围为
- * 0x400～0x402。size 非零。没有驻留队列时 VM 不占 VMID，TLB 中也没有
- * 它的翻译，直接返回；下次取得 VMID 时会失效整个 VMID。
+ * 其他对象的翻译。例：va = 0x0000_ffff_8a40_0000、size = 0x3000 时 VPN
+ * 范围为 0xf_fff8_a400～0xf_fff8_a402，经两对 LO/HI 寄存器写入。size 非零。
+ * 没有驻留队列时 VM 不占 VMID，TLB 中也没有它的翻译，直接返回；下次取得
+ * VMID 时会失效整个 VMID。
  */
 static int vm_invalidate_range(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size)
 {
 	if (!vm->vmid)
 		return 0;
 
-	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_START, va / GPGPU_VM_PAGE_SIZE);
-	gpgpu_wreg(dev, GPGPU_REG_VM_INV_VPN_END, (va + size - 1) / GPGPU_VM_PAGE_SIZE);
+	gpgpu_wreg64(dev, GPGPU_REG_VM_INV_VPN_START_LO, va >> GPGPU_VM_PAGE_SHIFT);
+	gpgpu_wreg64(dev, GPGPU_REG_VM_INV_VPN_END_LO, (va + size - 1) >> GPGPU_VM_PAGE_SHIFT);
 	return vm_invalidate_req(dev, vm, GPGPU_VM_INV_VMID(vm->vmid) | GPGPU_VM_INV_RANGE);
 }
 
@@ -190,11 +188,11 @@ static int vm_init(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 	return ret;
 }
 
-/* 用户 GPUVA 区间：页对齐，不含零页。 */
+/* 用户 GPUVA 区间：页对齐，不含零页，整段低于 GPUVA 上限 2^48。 */
 static bool vm_range_ok(u64 va, u64 size)
 {
 	return va >= PAGE_SIZE && !(va & (PAGE_SIZE - 1)) && size &&
-		size <= GPGPU_VM_ADDRESS_LIMIT && va <= GPGPU_VM_ADDRESS_LIMIT - size;
+		size <= GPGPU_VM_VA_LIMIT && va <= GPGPU_VM_VA_LIMIT - size;
 }
 
 /* [va, va + size) 是否与会话中已绑定的对象重叠。 */

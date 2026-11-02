@@ -100,9 +100,9 @@ static int aql_shape_valid(AqlTask *t)
  * 对齐时，按队列的访问域把它复制到 t->desc，再检查：
  *
  * - ABI 版本与固件一致；
- * - 代码长度非零，入口和长度按 4 字节对齐，代码不越过 32 位地址空间；
+ * - 代码长度非零，入口和长度按 4 字节对齐，代码低于 GPUVA 上限；
  * - 参数长度在 4 字节到 64 KiB 之间且为 4 的倍数；包中的参数地址
- *   按 8 字节对齐，整段参数块在 32 位地址空间内。
+ *   按 8 字节对齐，整段参数块低于 GPUVA 上限。
  *
  * 这些是提交执行器前的静态检查，运行中的取指和参数读取越界仍由
  * 执行器检查。
@@ -119,7 +119,7 @@ static int aql_read_descriptor(u32 slot, AqlTask *t)
 		return 0;
 	return d->kernel_abi_version == GPGPU_KERNEL_ABI_VERSION && d->code_size &&
 		!(d->code_size & 3) && !(d->code_entry & 3) &&
-		d->code_size <= GPGPU_VM_ADDRESS_LIMIT - d->code_entry && d->kernarg_size >= 4 &&
+		d->code_size <= GPGPU_VM_VA_LIMIT - d->code_entry && d->kernarg_size >= 4 &&
 		d->kernarg_size <= GPGPU_KERNEL_ARGS_MAX && !(d->kernarg_size & 3) &&
 		cp_range_ok(t->packet.kernarg_address, d->kernarg_size, 8);
 }
