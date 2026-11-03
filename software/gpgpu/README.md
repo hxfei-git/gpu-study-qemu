@@ -231,13 +231,17 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-下列结果对应协议版本 4，本说明所在的提交只更新验证记录，不改代码。记录复制在 `build/gpgpu-validation/`，不会被下一次运行覆盖：
+下列结果对应协议版本 5，本说明所在的提交只更新验证记录，不改代码。各入口运行时的代码都与提交 `e2db1a2`（版本号升为 5）相同，之后的 `fff9908` 只改文档。记录复制在 `build/gpgpu-validation/protocol-v5/`，不会被下一次运行覆盖：
 
-- QTest 13/13，教学汇编器 7/7，基础环境引导回归 6/6。这三个入口在提交 `0f38bff` 的干净工作树上运行；之后的代码改动只涉及 Linux 驱动，这三个入口不经过驱动，没有重跑。
-- Linux 全栈在提交 `ea16e1f` 的干净工作树上运行。驱动最后一次改动在 `0e7b8e7`（VMID 改为在队列驻留时绑定），`ea16e1f` 只增加文档。全栈复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块按该提交的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0；示例输出 `GPGPU DRM ABI=4`，GPUVM 状态和客体内核日志检查通过。三个示例在同一会话中依次建队列、销毁队列，用户 VMID 只有两个，第三次建队列成功说明前两次卸载都归还了 VMID。
-- 两种模式的组件 SHA-256 相同：固件 `d2415a71ca2c91c34325727c70b49416ebbd2db5ef815684ac2edefd60bb4a53`，模块 `3d8b38c3cc8769806eba1367e57ce0a0a426d27d4b02f3cdfe8149a39ce7ed81`，示例 `93f6ce4409fb16bba77a493b3c440304797dc6db9ab61609c312f21d4f768c49`。固件和示例的散列与 `0f38bff` 的记录相同。
+- QTest 13/13，教学汇编器 7/7，基础环境引导回归 6/6。驱动另用宿主机交叉编译器以 `W=1` 编译，无警告。
+- Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块按 `e2db1a2` 的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003，客体退出码为 0；示例输出 `GPGPU DRM ABI=5`，GPUVM 状态和客体内核日志检查通过。
+- 两种模式的组件 SHA-256 相同：固件 `d05b805d666df7dac5fc4bc9c3b56fb7235a55650cc7742dcd4a90a6f4d1c9f2`，模块 `b60e4bb56a3cec46f91161dc05b760f8adf2e6c669b8bbfb833b6629b660c966`，示例 `386fd4c4e5b0eee137d823fec2d840e41ece70bc0c25e0bf75922578cce4997e`。
 
-> **[SOURCE]** 本地运行记录：`0f38bff` 的[命令与结果汇总](../../build/gpgpu-validation/runtime-verification.json)、[QTest 输出](../../build/gpgpu-validation/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/bootstrap-check.log)；`ea16e1f` 的[全栈输出](../../build/gpgpu-validation/vmid-residency/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/vmid-residency/core/summary.json)。`build/` 产物不纳入 Git。
+QTest 的 GPUVM 用例给所有 GPUVA 加上 `0x0000_7fff_0000_0000` 的基址，L0 索引为 `0xff`，直接覆盖了四级页表中 L0 非零的翻译路径。
+
+**[INFERENCE]** 全栈日志不打印 GPUVA。GPUVM 开启时库以 `mmap` 返回的 CPU 地址作 GPUVA，48 位 ARM64 用户空间的 `mmap` 地址通常位于高端，所以全栈运行很可能也经过了 L0 非零的路径，但本次记录没有直接核对实际地址。
+
+> **[SOURCE]** 本地运行记录：[QTest 输出](../../build/gpgpu-validation/protocol-v5/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/protocol-v5/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/protocol-v5/bootstrap-check.log)、[全栈输出](../../build/gpgpu-validation/protocol-v5/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/protocol-v5/core/summary.json)。版本 4 的记录保留在 `build/gpgpu-validation/vmid-residency/`。`build/` 产物不纳入 Git。
 
 **[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在禁止 socket 的沙箱中运行会失败。上述结果不覆盖从零引导开发环境、SMMUv3、多进程或资源生命周期专项。
 
