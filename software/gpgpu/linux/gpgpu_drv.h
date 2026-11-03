@@ -194,7 +194,8 @@ struct gpgpu_event {
  * @vmid: 队列驻留期间占用的用户 VMID；0 表示当前没有占用。
  * @root: 页表根的 VRAM 偏移；GPUVM 关闭时不使用。
  * @ready: 第一次 MAP 已建立地址空间，gpuvm=on 时包括根表。
- * @failed: 页表写入或失效结果未知，禁止继续修改并禁止建队列。
+ * @failed: TLB 失效、上下文启用或停用的结果未知，禁止继续修改
+ *          并禁止建队列；表页分配失败不设置它。
  * @tables: 驱动私有的页表页。
  * @notify: 带 GPGPU_BO_EVENT_PAGE 创建的通知页，事件的通知槽都在这一页内；
  *          登记期间持有它的一个 users 计数。NULL 表示尚未登记。

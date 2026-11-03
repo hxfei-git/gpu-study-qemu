@@ -77,10 +77,14 @@ static GpgpuKmtStatus gem_close(GpgpuKmtContext *c, uint32_t handle)
 	return kmt_ioctl(c, GPGPU_DRM_GEM_CLOSE, &args);
 }
 
-/* 绑定失败的错误中，这些表示驱动可能已写入部分页表，相关资源会被保留。 */
+/*
+ * 绑定失败的错误中，这些表示驱动已写页表但失效未确认，相关资源
+ * 会被保留。ENOSPC、ENOMEM 来自绑定前的表页分配，对象未绑定，
+ * 可以直接撤销。
+ */
 static bool map_error_uncertain(int error)
 {
-	return error == EIO || error == ETIMEDOUT || error == ENOMEM;
+	return error == EIO || error == ETIMEDOUT;
 }
 
 /*
@@ -95,8 +99,8 @@ static bool map_error_uncertain(int error)
  * 3. 用 MAP_FIXED 把对象映射到 va，替换占位：Host 对象可读写；VRAM 对象
  *    只能是 PROT_NONE，CPU 访问这段地址会触发段错误；
  * 4. GPGPU_DRM_MAP 绑定 GPU：GPUVM 开启时 address 就是 va，GPUVA 与 CPU
- *    地址相同；关闭时 address 为 0，驱动填回 GPU 物理地址。绑定失败且
- *    驱动可能已写入部分页表时标记 uncertain；
+ *    地址相同；关闭时 address 为 0，驱动填回 GPU 物理地址。驱动已写页表
+ *    但失效未确认时标记 uncertain；
  * 5. 填写 m 的公开信息与句柄。
  *
  * 第 2～4 步失败时解除 va 处的映射并关闭 GEM 句柄。绑定结果未知时页表

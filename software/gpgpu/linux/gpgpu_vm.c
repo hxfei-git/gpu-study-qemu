@@ -171,21 +171,43 @@ static int vm_set_ptes(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u6
  * 上下文寄存器。gpuvm=on 时分配根表页；gpuvm=off 时设备直接使用物理地址，
  * 不需要页表。
  *
- * 失败后 VM 进入 failed，已取得的表页留到会话清理时回收。
+ * 根表分配失败时 VM 保持未建立，不进入 failed：此时还没有绑定，根也
+ * 没有交给设备，下次 MAP 重新分配。
  */
 static int vm_init(struct gpgpu_device *dev, struct gpgpu_vm *vm)
 {
-	int ret = 0;
+	int ret;
 
 	if (vm->ready)
 		return vm->failed ? -EIO : 0;
-	vm->ready = true;
-
-	if (dev->gpuvm)
+	if (dev->gpuvm) {
 		ret = vm_table_alloc(dev, vm, &vm->root);
-	if (ret)
-		vm->failed = true;
-	return ret;
+		if (ret)
+			return ret;
+	}
+	vm->ready = true;
+	return 0;
+}
+
+/*
+ * 为 [va, va + size) 建好全部中间级表页，不写叶子项。一张 L3 表覆盖
+ * 一个 L2 项的 2 MiB，所以从 va 向下对齐到这个边界，再逐段取叶子位置。
+ * 例：va = 0x1f_f000、size = 0x2000 时依次准备 0x0 与 0x20_0000 两段，
+ * 跨界的第二页也有叶表。失败时已建的空表页留在 tables 中，叶子项
+ * 不变。
+ */
+static int vm_prepare_tables(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size)
+{
+	const u64 span = 1ULL << GPGPU_VM_LEVEL_SHIFT(GPGPU_VM_LEVELS - 2);
+
+	for (u64 addr = ALIGN_DOWN(va, span); addr < va + size; addr += span) {
+		u32 leaf;
+		int ret = vm_leaf(dev, vm, addr, true, &leaf);
+
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /* 用户 GPUVA 区间：页对齐，不含零页，整段低于 GPUVA 上限 2^48。 */
@@ -235,12 +257,15 @@ static int map_args_valid(struct gpgpu_fpriv *fpriv, struct gpgpu_bo *bo,
  *
  * 1. VM 已失败时返回 -EBUSY；再检查对象、权限和 GPUVA 区间；
  * 2. 第一次绑定时建立地址空间（gpuvm=on 时为根表），不取 VMID；
- * 3. 记录绑定地址并取得绑定引用：此后即使句柄关闭，对象和存储
+ * 3. gpuvm=on 时建好这段 GPUVA 的全部中间级表页。第 2、3 步分配失败时
+ *    返回 -ENOSPC 或 -ENOMEM，对象保持未绑定，VM 仍可使用，调用者释放
+ *    空间后可以重试；已建的空表页留在 VM 中，会话清理时归还；
+ * 4. 记录绑定地址并取得绑定引用：此后即使句柄关闭，对象和存储
  *    也保留到 UNMAP 或会话清理。gpuvm=off 时 GPU 地址就是物理地址，
  *    到此结束；
- * 4. gpuvm=on 时写 PTE。队列驻留时 VM 占有 VMID，再按范围同步失效 TLB；
- *    不占 VMID 时由下次取得 VMID 时的整体失效清除旧翻译。写入或失效
- *    失败时 VM 进入 failed，无法确认设备看到的映射，绑定引用保留到
+ * 5. 写叶子 PTE。队列驻留时 VM 占有 VMID，再按范围同步失效 TLB；
+ *    不占 VMID 时由下次取得 VMID 时的整体失效清除旧翻译。失效未确认时
+ *    返回 -EIO，VM 进入 failed，无法确认设备看到的映射，绑定引用保留到
  *    会话清理。
  */
 int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
@@ -262,7 +287,14 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	if (ret)
 		return ret;
 
-	/* 3. 绑定引用让对象在句柄关闭后继续存活。 */
+	/* 3. 绑定前分配全部表页，失败时不留下这个对象的任何叶子项。 */
+	if (dev->gpuvm) {
+		ret = vm_prepare_tables(dev, vm, args->address, bo->mapped_size);
+		if (ret)
+			return ret;
+	}
+
+	/* 4. 绑定引用让对象在句柄关闭后继续存活。 */
 	bo->gpu_addr = dev->gpuvm ? args->address : bo->phys_addr;
 	bo->permissions = args->permissions;
 	bo->bound = true;
@@ -273,20 +305,17 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 		return 0;
 
 	/*
-	 * 4. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
+	 * 5. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
 	 *    IOVA 并置 SYSTEM，VRAM 对象写 VRAM 偏移；bo->phys_addr 仍是
-	 *    GPU 物理地址。
+	 *    GPU 物理地址。中间级已在第 3 步建好，vm_set_ptes() 不再分配
+	 *    表页，不会失败。
 	 */
 	if (bo->kind == GPGPU_MEMORY_HOST)
-		ret = vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
-				  GPGPU_VM_SYSTEM | args->permissions);
+		vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
+			    GPGPU_VM_SYSTEM | args->permissions);
 	else
-		ret = vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
-				  args->permissions);
-	if (ret) {
-		vm->failed = true;
-		return ret;
-	}
+		vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
+			    args->permissions);
 	return vm_invalidate_range(dev, vm, bo->gpu_addr, bo->mapped_size);
 }
 

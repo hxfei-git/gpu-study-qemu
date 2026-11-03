@@ -8,12 +8,15 @@
  *   2. 分配会话的 Doorbell 页和页内入口；
  *   3. 分配 MQD；
  *   4. 取得 VMID（gpgpu_vm_attach()），填写 MQD，Ring 全部置为 INVALID；
- *   5. 经 HIQ 发送 MAP_QUEUES。结果未知时队列保留为 FAULTED，CP 可能仍在
- *      访问它，VMID 也一并保留；确认失败时直接删除并归还 VMID。
+ *   5. 经 HIQ 发送 MAP_QUEUES。CP 可能仍持有队列时（结果未知、重复映射、
+ *      需要恢复）队列保留为 FAULTED，VMID 也一并保留；CP 明确拒绝且没有
+ *      保留槽位时直接删除并归还 VMID。
  *
  * 销毁队列（gpgpu_queue_destroy）：正常队列必须已排空（R == W），经 HIQ 发送
  * UNMAP_QUEUES，确认后消费旧 IH，再放下 Ring 与进度的使用计数并归还 VMID。
- * 队列对象本身等事件和 Doorbell 映射都不再引用时才回收。
+ * CP 明确拒绝时队列仍驻留，资源保留，调用者处理后可以再次卸载；只有
+ * 结果未知时才禁止再次发送。队列对象本身等事件和 Doorbell 映射都不再
+ * 引用时才回收。
  */
 #include <linux/log2.h>
 #include <linux/mm.h>
@@ -166,25 +169,40 @@ static void queue_init_mqd(struct gpgpu_queue *q, const struct gpgpu_queue_creat
 }
 
 /*
- * 第 5 步：MAP_QUEUES 失败后的处理。从未发布、或 CP 明确拒绝（未占用槽）
- * 时删除队列并归还 VMID；MQD 访问失败、需要恢复或结果未知时，CP 可能仍
- * 持有该队列，队列和 VMID 都保留。
+ * queue_map_failed() - 第 5 步：MAP_QUEUES 失败后的处理
+ *
+ * 按 CP 是否可能仍持有这份 MQD 决定删除还是保留：
+ *
+ * 1. 从未发布，或 CP 明确拒绝且没有为它保留槽位时，删除队列并归还
+ *    VMID。名额已满、参数非法、读 MQD 或读 W 失败（MQD_FAULT）都属于后者：
+ *    固件在写入 HQD 之前失败，已撤销占用登记；
+ * 2. 重复映射说明 CP 已绑定同一 MQD 地址，需要恢复或结果未知时 CP 可能
+ *    仍持有该队列，这三种情况保留队列与 VMID。
+ *
+ * 用户库把 -EIO、-ETIMEDOUT、-EPROTO 当作结果未知并保留资源，所以 CP
+ * 明确拒绝时返回 -ENOSPC 或 -EINVAL。
+ *
+ * Return: 从未发布时为管理提交的错误；CP 明确拒绝时为 -ENOSPC（名额已满）
+ * 或 -EINVAL；保留队列时为管理提交的错误或 -EIO。
  */
 static int queue_map_failed(struct gpgpu_queue *q, int ret, u32 status, bool published)
 {
 	struct gpgpu_fpriv *fpriv = q->fpriv;
-	bool cp_may_hold = published && (ret || status == GPGPU_MANAGEMENT_MQD_FAULT ||
+	bool cp_may_hold = published && (ret || status == GPGPU_MANAGEMENT_DUPLICATE ||
 					 status == GPGPU_MANAGEMENT_RECOVERY_REQUIRED);
 
+	/* 2. 保留队列；uncertain 不清除，资源留到设备确认停止。 */
 	if (cp_may_hold) {
 		q->state = GPGPU_QUEUE_FAULTED;
-	} else {
-		gpgpu_queue_free(q);
-		gpgpu_vm_detach(fpriv);
+		return ret ? ret : -EIO;
 	}
+
+	/* 1. CP 没有收到命令或没有持有这份 MQD。 */
+	gpgpu_queue_free(q);
+	gpgpu_vm_detach(fpriv);
 	if (ret)
 		return ret;
-	return status == GPGPU_MANAGEMENT_NO_SLOT ? -ENOSPC : -EIO;
+	return status == GPGPU_MANAGEMENT_NO_SLOT ? -ENOSPC : -EINVAL;
 }
 
 /*
@@ -326,20 +344,66 @@ int gpgpu_queue_query(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 }
 
 /*
+ * queue_unmap_rejected() - CP 返回了有效结果，但没有卸载队列
+ *
+ * gpgpu_queue_destroy() 第 5 步调用，队列仍占着 HQD 槽，资源一律保留。
+ * 等待管理结果时 dev->lock 曾被释放，IH 可能已经或即将把本队列置为
+ * FAULTED，所以先消费旧 IH，再决定状态：
+ *
+ * 1. MQD_FAULT：CP 读 W 或保存 MQD 失败，已停止取包，队列为 FAULTED。
+ *    再次卸载走出错队列的路径，不要求排空；
+ * 2. 设备故障时同样为 FAULTED；
+ * 3. 其余结果（RECOVERY_REQUIRED、INVALID 等）CP 没有改动队列，期间
+ *    没有出错就恢复卸载前的状态。
+ *
+ * 例：驱动看到 R == W 后另一线程又发布了包，CP 看到 R != W，返回
+ * RECOVERY_REQUIRED；队列恢复为 READY，调用者停止提交、排空后重试。
+ *
+ * Return: 恢复为 READY 的 RECOVERY_REQUIRED 返回 -EBUSY，其余为 -EIO。
+ */
+static int queue_unmap_rejected(struct gpgpu_queue *q, u32 previous, u32 status)
+{
+	struct gpgpu_device *dev = q->fpriv->dev;
+
+	gpgpu_ih_drain(dev);
+
+	/* 1. 2. CP 已停止取包或设备故障：队列保持出错。 */
+	if (status == GPGPU_MANAGEMENT_MQD_FAULT || dev->fatal)
+		q->state = GPGPU_QUEUE_FAULTED;
+	/* 3. 等待期间 IH 已置 FAULTED 时不再覆盖。 */
+	else if (q->state == GPGPU_QUEUE_UNLOADING)
+		q->state = previous;
+
+	if (status == GPGPU_MANAGEMENT_RECOVERY_REQUIRED && q->state == GPGPU_QUEUE_READY)
+		return -EBUSY;
+	return -EIO;
+}
+
+/*
  * gpgpu_queue_destroy() - 正常卸载一条队列
  *
  * 调用者持 vm_serial 与 dev->lock；第 2 步等待时会暂时释放 dev->lock。
+ *
+ * uncertain 只表示上一条管理命令的结果未知；拿到 CP 的有效结果后
+ * 就清除，队列可以再次卸载。是否回收 Ring、进度和 VMID 另看 CP 是否
+ * 已经放开队列，只有第 5 步的 OK 与 NOT_MAPPED 回收。
  *
  * 1. 上一次管理结果未知或正在卸载时返回 -EBUSY。READY 队列必须已排空
  *    （R == W），CP 卸载时不处理未消费的包；FAULTED 队列不要求排空；
  * 2. 先把队列置为 UNLOADING + uncertain，再经 HIQ 发送 UNMAP_QUEUES。
  *    等待期间文件关闭时，会话因这条队列保留为 orphan；
- * 3. 确认成功：先消费旧 IH，让本队列已发布的通知和错误都处理完，
- *    再放下 Ring 与进度的使用计数并标记 dead，最后归还 VMID，队列对象
- *    留待 queue_collect() 回收。VMID 归还失败只让 VM 进入 failed，队列
- *    已经卸载，仍按成功返回；
- *    从未发布：恢复原状态；已发布但 CP 拒绝：队列视为出错；
- *    已发布但结果未知：保持 UNLOADING 与 uncertain，资源全部保留。
+ * 3. 已发布却没有取得有效结果，如超时、通道故障、结果码非法或设备
+ *    移除：CP 可能已经卸载，也可能仍在运行，保持 uncertain 与全部资源；
+ * 4. 从未发布：CP 没有收到命令，恢复原状态；
+ * 5. OK 或 NOT_MAPPED：CP 当前不再持有这条队列。NOT_MAPPED 只说明此刻
+ *    没有绑定，不说明队列从未运行，因此和 OK 一样先消费旧 IH，让已
+ *    发布的通知和错误都处理完，再放下 Ring 与进度的使用计数并标记
+ *    dead，最后归还 VMID，队列对象留待 queue_collect() 回收。VMID 归还
+ *    失败只让 VM 进入 failed，队列已经卸载，仍按成功返回。其余有效结果
+ *    交给 queue_unmap_rejected()。
+ *
+ * 第 4 步和 queue_unmap_rejected() 恢复原状态时，等待期间 IH 已置为
+ * FAULTED 的队列保持 FAULTED。
  */
 int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 {
@@ -360,7 +424,7 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 	if (q->state == GPGPU_QUEUE_READY && READ_ONCE(*q->rptr) != READ_ONCE(*q->wptr))
 		return -EBUSY;
 
-	/* 2. 记下原状态，从未发布时可以恢复。 */
+	/* 2. 记下原状态，从未发布或 CP 拒绝时可以恢复。 */
 	previous = q->state;
 	q->state = GPGPU_QUEUE_UNLOADING;
 	q->uncertain = true;
@@ -368,21 +432,30 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 				q->mqd.addr, &status, &published);
 	q->management_status = status;
 
-	/* 3. 分确认成功、从未发布、CP 拒绝、结果未知四种情况收尾。 */
-	if (!ret && status == GPGPU_MANAGEMENT_OK) {
-		gpgpu_ih_drain(dev);
-		q->ring->users--;
-		q->progress->users--;
-		q->dead = true;
-		q->uncertain = false;
-		gpgpu_vm_detach(fpriv);
-	} else if (!published) {
-		q->uncertain = false;
-		q->state = dev->fatal ? GPGPU_QUEUE_FAULTED : previous;
-	} else if (!ret) {
-		q->state = GPGPU_QUEUE_FAULTED;
-		ret = -EIO;
+	/* 3. 结果未知，不能判断 CP 是否还持有队列。 */
+	if (published && ret)
+		goto out;
+	q->uncertain = false;
+
+	/* 4. 从未发布；设备移除或故障时队列已被置为 FAULTED，不再覆盖。 */
+	if (!published) {
+		if (q->state == GPGPU_QUEUE_UNLOADING)
+			q->state = dev->fatal ? GPGPU_QUEUE_FAULTED : previous;
+		goto out;
 	}
+
+	/* 5. ret == 0 时设备仍在，可以访问寄存器。 */
+	if (status != GPGPU_MANAGEMENT_OK && status != GPGPU_MANAGEMENT_NOT_MAPPED) {
+		ret = queue_unmap_rejected(q, previous, status);
+		goto out;
+	}
+	gpgpu_ih_drain(dev);
+	q->ring->users--;
+	q->progress->users--;
+	q->dead = true;
+	gpgpu_vm_detach(fpriv);
+
+out:
 	queue_report(q, args);
 	return ret;
 }

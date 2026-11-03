@@ -54,7 +54,9 @@ enum GpgpuManagementOpcode {
  * @GPGPU_MANAGEMENT_DUPLICATE: 同一 MQD 地址已经绑定。
  * @GPGPU_MANAGEMENT_NOT_MAPPED: 指定 MQD 当前没有绑定。
  * @GPGPU_MANAGEMENT_INVALID: 参数、MQD 内容或保存的错误状态非法。
- * @GPGPU_MANAGEMENT_MQD_FAULT: 访问或保存 MQD 失败，槽可能仍被占用。
+ * @GPGPU_MANAGEMENT_MQD_FAULT: 读取 MQD、读取 W 或保存 MQD 失败。映射时固件
+ *                             在写入 HQD 前失败，已撤销占用；卸载时槽仍
+ *                             被占用。
  * @GPGPU_MANAGEMENT_RECOVERY_REQUIRED: 当前状态不允许普通操作（如队列未排空）。
  */
 enum GpgpuManagementStatus {

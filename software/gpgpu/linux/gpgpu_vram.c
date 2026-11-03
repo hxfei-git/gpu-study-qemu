@@ -5,7 +5,12 @@
  * gpu_buddy 只管理固件区之前的 60 MiB（GPGPU_VRAM_USABLE_SIZE），VRAM 首页
  * 预先分配出去，保证 GPU 物理地址 0 永远不会分给用户或页表。
  */
+#include <linux/sched.h>
+#include <linux/sizes.h>
 #include "gpgpu_drv.h"
+
+/* 每段清零的字节数；段间让出 CPU。 */
+#define VRAM_CLEAR_CHUNK SZ_64K
 
 int gpgpu_vram_init(struct gpgpu_device *dev)
 {
@@ -30,10 +35,15 @@ void gpgpu_vram_fini(struct gpgpu_device *dev)
 
 /**
  * gpgpu_vram_alloc() - 分配一段连续 VRAM 并清零
- * @dev: 设备；调用者持 dev->lock。
+ * @dev: 设备；调用者持 dev->lock，处在可睡眠的上下文。
  * @size: 字节数，2 的幂且不小于 PAGE_SIZE；对齐等于 size。
  * @blocks: 输出：持有的 buddy 块，用 gpgpu_vram_free() 归还。
  * @offset: 输出：VRAM 字节偏移，也是 GPU 物理地址。
+ *
+ * 清零经 BAR2 逐次写入。设备在另一进程、经 vfio-user 连接时每次写都要
+ * 往返一次 socket，4 MiB 要几十秒，一次写完会触发 soft lockup，所以按
+ * VRAM_CLEAR_CHUNK 分段，段间 cond_resched()。清零期间仍持 dev->lock，
+ * 其他 ioctl 与 IH 处理要等它结束。
  *
  * Return: 0 或 gpu_buddy 的错误码。
  */
@@ -48,7 +58,10 @@ int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *block
 		return ret;
 	block = list_first_entry(blocks, struct gpu_buddy_block, link);
 	*offset = gpu_buddy_block_offset(block);
-	memset_io(dev->vram + *offset, 0, size);
+	for (u64 done = 0; done < size; done += VRAM_CLEAR_CHUNK) {
+		memset_io(dev->vram + *offset + done, 0, min_t(u64, size - done, VRAM_CLEAR_CHUNK));
+		cond_resched();
+	}
 	return 0;
 }
 

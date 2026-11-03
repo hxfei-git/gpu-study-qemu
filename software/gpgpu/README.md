@@ -165,11 +165,15 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 执行器的整数寄存器与 PC 为 64 位，现有指令子集按 RV64 语义执行，另有 LD、SD 读写 64 位指针。`a0` 直接保存 64 位 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数块每项 8 字节，Kernel 用 `ld` 读取。24 字节 Kernel 描述对象在偏移 `0x00` 保存 64 位代码入口，在 `0x10` 保存 `kernel_abi_version=5`，`0x14` 的保留字段为 0，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 5，组件必须一起更新。
 
+<a id="stack-runtime"></a>
+
 ## 4. 公共库与三个计算示例
 
 `GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。参数块每项 8 字节，`gpgpu_rt_dispatch()` 接收 `uint64_t` 数组，对象的 `gpu_address` 原样写入，不截断。
 
 KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` 和 `gpgpuKmtDrainQueue()` 分别负责槽位预留、Header 与 Doorbell 发布、Signal 与事件等待、排空。运行时 `gpgpu_rt_dispatch()` 按顺序调用它们完成一次派发。默认等待先主动检查约 200 μs，再进入事件等待，唤醒后复查 Signal。
+
+驱动的事件是一次性的，被通知后不会回到等待状态，所以运行时每次派发都创建新事件，计算完成后销毁。Signal 归零可能早于驱动处理完对应的通知，这时驱动暂不允许销毁，旧事件留到下一次派发前再试。提交或等待失败后，CP 可能仍在读写参数块和 Signal，运行时不再派发，只能由 `gpgpu_rt_destroy()` 卸载队列后回收。
 
 `gpgpu-demo` 链接 `libgpgpu.a`，经运行时把代码、描述符和计算数组放在 VRAM；参数、Ring、进度和 Signal 放在 Host BO，经 Outbound 访问。用于 COPY 的 Host BO 也在 Queue 创建前准备。三个例子保持原输入和比较规则：
 
@@ -233,17 +237,25 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-下列结果对应协议版本 5，本说明所在的提交只更新验证记录，不改代码。记录复制在 `build/gpgpu-validation/protocol-v5/`，不会被下一次运行覆盖：
+下列结果对应协议版本 5。设备模型与 CP 固件的执行逻辑自提交 `e2db1a2`（版本号升为 5）起没有改动。本轮修正了 MAP 表页不足、卸载被 CP 明确拒绝、COPY 未启动时的计数（[第三阶段规格评审](<../../docs/第三阶段规格评审.md#review-index>) D1、D4、D5），以及建队列失败后的资源回收，并将 VRAM 清零分段以允许调度。版本 5 首次验证的记录在 `build/gpgpu-validation/protocol-v5/`，本轮最终记录在 `build/gpgpu-validation/d1-d4-d5-final/`，都不会被下一次运行覆盖：
 
-- QTest 13/13 与基础环境引导回归 6/6 在与提交 `e2db1a2`（版本号升为 5）相同的代码上运行；之后的 `dca7909` 只改示例程序，这两个入口不经过它，没有重跑。教学汇编器 7/7 在 `dca7909` 上重跑。驱动另用宿主机交叉编译器以 `W=1` 编译，无警告。
-- Linux 全栈在提交 `dca7909` 的干净工作树上运行，复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块按该提交的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003，客体退出码为 0；示例输出 `GPGPU DRM ABI=5`，GPUVM 状态和客体内核日志检查通过。
-- 两种模式的组件 SHA-256 相同：固件 `d05b805d666df7dac5fc4bc9c3b56fb7235a55650cc7742dcd4a90a6f4d1c9f2`，模块 `b60e4bb56a3cec46f91161dc05b760f8adf2e6c669b8bbfb833b6629b660c966`，示例 `b0891e7ec3ccef8adc22200c36e317b172ab0182ba303d69b5c92a125c1f2de0`。
+- QTest 13/13 与基础环境引导回归 6/6 在与提交 `e2db1a2` 相同的代码上运行。之后的行为改动只涉及示例程序、驱动和用户库，这两个入口不执行这些代码，没有重跑；共享协议头仅修改注释，协议值与布局不变。教学汇编器 7/7 在 `dca7909` 上重跑。修正后的驱动另用宿主机交叉编译器以 `W=1` 编译，无警告；用户库与示例以 `-Wall -Wextra -Werror` 构建通过。
+- Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块与用户库在客体中按修正后的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003，客体退出码为 0；示例输出 `GPGPU DRM ABI=5`，GPUVM 状态和客体内核日志检查通过。
+- 两种模式的组件 SHA-256 相同：固件 `d05b805d666df7dac5fc4bc9c3b56fb7235a55650cc7742dcd4a90a6f4d1c9f2`，模块 `e6543456d1cccb5e449b0b96b685628d6d7cf7321759db2e0b442dbaa6982ae7`，示例 `a97bc5f7efd0c216b1fa66a03305b2f48617480011b1a26f6babaeefd4b541cc`。
 
-GPUVM 开启时，生命周期示例打印的 X、Y、Z 地址为 `0x0000_ffff_8d42_8000`、`0x0000_ffff_8d41_7000`、`0x0000_ffff_8d40_5000`。这些值是库从 `mmap` 取得的 CPU 地址，四级索引的 L0、L1、L2 依次为 `0x1ff`、`0x1fe`、`0x6a`，L3 分别为 `0x28`、`0x17`、`0x5`，所以全栈的翻译经过了 L0 索引非零的路径。GPUVM 关闭时，三个地址是 VRAM 物理偏移 `0x2_0000`、`0x6_0000`、`0x4_0000`。QTest 的 GPUVM 用例另以 `0x0000_7fff_0000_0000` 为基址覆盖同一条路径。
+失败路径另用一次性程序在同一开发环境中核对，程序与日志一并保存在本轮记录的 `directed/` 下，不纳入仓库。三次运行均返回 0，客体内核日志检查都通过：
 
-> **[SOURCE]** 本地运行记录：[QTest 输出](../../build/gpgpu-validation/protocol-v5/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/protocol-v5/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/protocol-v5/bootstrap-check.log)、[全栈输出](../../build/gpgpu-validation/protocol-v5/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/protocol-v5/core/summary.json)。版本 4 的记录保留在 `build/gpgpu-validation/vmid-residency/`。`build/` 产物不纳入 Git。
+- MAP 表页不足（GPUVM 开启）：先用未绑定的 VRAM 对象占满 VRAM。新会话第一次 MAP 时根表分配失败，返回 `-ENOSPC`；已有会话把 Host 对象映射到需要三张新表的地址，连续两次都返回资源不足，而不是“暂不可用”。释放 88 KiB 后，两个会话都在原会话中重试成功；GPU 把向量加法结果写到重试得到的地址，核对通过，连接正常关闭。
+- 卸载被 CP 拒绝（GPUVM 开、关各一次）：另一进程约 2 秒的矩阵乘法占住 CP 时卸载队列，并在 CP 处理卸载前再发布一个包。CP 返回结果码 6，驱动报告忙，队列保持 READY；这个包完成、队列排空后重试卸载成功。随后在另一个 VMID 仍被占用时，第三个进程建队列并完成计算。
+- 建队列被 CP 拒绝（GPUVM 开启）：进度对象只有 GPU 写权限，CP 装载时读 W 失败。用户库收到确定的参数错误；同一会话改用可读写的进度对象后建队列、卸载成功，Ring 和两个进度对象都能释放，连接正常关闭。
+- COPY 未启动时的计数：在正式源码上加一个只丢弃一次 DMA 完成中断的临时桩。COPY A 超时，返回 `-ETIMEDOUT`；随后的 COPY B 未启动，返回 `-EIO`。关闭 B 的句柄后，它的 4 MiB VRAM 可以重新分配；关闭 A 的句柄后存储仍然保留。表页不足的核对与这项在同一次运行中使用该桩模块，桩不经过 MAP 路径。
+- VRAM 分段清零：占满 VRAM 时使用了多个 4 MiB 对象，COPY B 回收后也重新分配了同样大小的对象，均完成清零，未出现 soft lockup。分段之间只让出 CPU，清零期间仍持有设备锁。
 
-**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在禁止 socket 的沙箱中运行会失败。上述结果不覆盖从零引导开发环境、SMMUv3、多进程或资源生命周期专项。
+GPUVM 开启时，本轮全栈中生命周期示例打印的 X、Y、Z 地址为 `0x0000_ffff_84f1_d000`、`0x0000_ffff_84f0_c000`、`0x0000_ffff_84ef_a000`。这些值是库从 `mmap` 取得的 CPU 地址，每次运行可能不同；本次四级索引的 L0、L1、L2 依次为 `0x1ff`、`0x1fe`、`0x27`，L3 分别为 `0x11d`、`0x10c`、`0xfa`，所以全栈的翻译经过了 L0 索引非零的路径。GPUVM 关闭时，三个地址是 VRAM 物理偏移 `0x2_0000`、`0x6_0000`、`0x4_0000`。QTest 的 GPUVM 用例另以 `0x0000_7fff_0000_0000` 为基址覆盖同一条路径。
+
+> **[SOURCE]** 本地运行记录：[QTest 输出](../../build/gpgpu-validation/protocol-v5/qtest-build.log)、[用户库与汇编器](../../build/gpgpu-validation/protocol-v5/userspace-build-check.log)、[引导回归](../../build/gpgpu-validation/protocol-v5/bootstrap-check.log)、[全栈输出](../../build/gpgpu-validation/protocol-v5/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/protocol-v5/core/summary.json)；本轮的[全栈输出](../../build/gpgpu-validation/d1-d4-d5-final/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/d1-d4-d5-final/core/summary.json)与[定向核对输出](../../build/gpgpu-validation/d1-d4-d5-final/directed/run.log)。版本 4 的记录保留在 `build/gpgpu-validation/vmid-residency/`。`build/` 产物不纳入 Git。
+
+**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在禁止 socket 的沙箱中运行会失败。上述结果不覆盖从零引导开发环境与 SMMUv3；失败收尾只核对了各自的核心结果，没有在修正前的代码上对照运行。VRAM 分段清零消除了本次核对中的 soft lockup，但没有减少经 BAR2 的写入量；双进程下大对象清零仍慢，其他 ioctl 与 IH 处理仍须等待设备锁。
 
 <a id="offline-materials"></a>
 

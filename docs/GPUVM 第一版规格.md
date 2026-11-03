@@ -371,9 +371,9 @@ TLB 按 VMID 和 VPN（GPUVA 的 `[47:12]`，36 位）缓存叶子翻译，组�
 
 驱动每次只请求一个 VMID。VPN 有 36 位，范围的起点和终点各用一对 LO/HI 寄存器。以失效 VMID 1 中 GPUVA `0x0000_ffff_8a40_0000～0x0000_ffff_8a40_2fff` 为例：先把 `0xf_fff8_a400` 写入 `VM_INV_VPN_START_LO/HI`，把 `0xf_fff8_a402` 写入 `VM_INV_VPN_END_LO/HI`，再写 `VM_INV_REQ` 为 VMID 1 的位加 RANGE。设备在这次寄存器写入内清除 VMID 1 中 VPN 落在这一范围的项，`VM_INV_ACK` 读回 `0x2`。请求含保留位、位图为空，或范围非法（起点大于终点、终点不低于 2^36）时，设备整体拒绝，不清任何项，ACK 只置 ERROR。所选上下文有激活的队列时失效照常完成：设备在主锁下处理请求，此时没有进行到一半的翻译。失效结束保证后续请求使用更新后的翻译。
 
-失败或结果未知时禁止该上下文继续创建 Queue，保留相关页表、映射和存储。本期不增加异步更新。
+失效请求被拒绝或 ACK 不符时，驱动无法确认设备看到的是哪份映射，这个地址空间不再接受绑定、解绑和创建 Queue，相关页表、映射和存储全部保留。表页不足发生在写入叶子项之前，按[第 8.2 节](#gpuvm-device-host-interface)明确失败，地址空间仍可使用。本期不增加异步更新。
 
-> **[SOURCE]** 固定 Linux 源码：[amdgpu_vm_cpu.c，第 73～135 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.c#L73-L135)提供 CPU 写表与发布路径；[gmc_v9_0.c，第 776～879 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L776-L879)通过失效请求与 ACK 等待完成。本设备采用 CPU 同步更新，并额外限制为卸载队列后更新，省去运行中页表依赖管理。
+> **[SOURCE]** 固定 Linux 源码：[amdgpu_vm_cpu.c，第 73～135 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.c#L73-L135)提供 CPU 写表与发布路径；[gmc_v9_0.c，第 776～879 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L776-L879)通过失效请求与 ACK 等待完成。本设备采用 CPU 同步更新，队列存活期间也可更新；应用须保证被解绑的对象已不再被任务访问。
 
 > **[SOURCE]** 按 VMID 位图请求、按位确认的参考：固定 Linux 源码 [gmc_v9_0.c，第 707～724 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L707-L724)用 `1 << vmid` 组成 `PER_VMID_INVALIDATE_REQ`；[第 810～875 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L810-L875)写请求寄存器并等待 ACK 中本 VMID 的位；[gc_9_4_3_sh_mask.h，第 10326～10343 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10326-L10343)与[第 10668～10671 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h#L10668-L10671)给出 REQ、ACK 的位域。本设备沿用“VMID 位图请求、按位确认”的关系；RANGE 位、VPN 范围寄存器和同步完成方式是本设备设计，不与 AMD 寄存器逐位兼容。
 
@@ -544,6 +544,8 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
 
 故障队列按第 5.2 节清理，不等待所有包成功完成。进程异常退出、等待超时、管理结果未知或失效未确认时，保留设备仍可能访问的对象、页表和编号。允许返回错误并暂时占用资源，不增加自动复位或挂死恢复；超时只结束本次等待。
 
+保留范围按本次操作的实际状态确定。以 COPY 为例，某次搬运已经启动、等待超时，驱动无法确认 DMA 是否结束，这次搬运的两端对象继续保留，此后驱动拒绝新的 COPY、解绑和会话回收，直到设备确认停止。随后另一次 COPY 因此被拒绝时，它的搬运从未启动，不保留自己的两端对象；已确认结束的搬运，无论成功还是报告 DMA 错误，也不保留。
+
 [第二阶段未知管理结果码问题](<./QEMU GPGPU 实验大纲.md#stage-two-spec-review>)已修复：完成标记匹配后仍须校验结果属于 `0～6`，未知值按协议错误保留资源。原独立注入结果作为历史记录保留，不再作为当前验收项目。强制中止与运行中复位恢复归第四阶段，不用它们替代正常寿命管理。
 
 <a id="gpuvm-device-host-interface"></a>
@@ -563,6 +565,8 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
 保留设备、内存、队列和事件四组调用。内存申请返回对象句柄、逻辑大小、`cpu` 与 `gpu_address`，内部顺序为预留 CPU 地址、创建 BO、把对象映射到这段 CPU 地址、同步 `MAP`（第 1.2 节），全部成功后才返回；中途失败按实际完成状态撤销或保留，不能遗留可误用的半成品。
 
 `MAP` 是双向 ioctl，输入对象句柄、地址和权限，输出最终 `gpu_address`。开启时地址是库为对象申请的 CPU 地址，驱动校验归属、对齐、重叠与完整范围后建立页表；关闭时地址输入必须为 0，驱动返回对象固定的 GPU 物理地址。两者都建立独立绑定引用，已绑定对象再次绑定失败。
+
+开启时驱动按“分配表页 → 登记绑定 → 写叶子项 → 失效旧翻译”的顺序执行。会话第一次绑定时先分配根表；之后为整段地址建好所需的全部中间级表页，再登记绑定。例如 VRAM 只剩两页，而新地址需要 L1、L2、L3 三张新表时，`MAP` 返回 `-ENOSPC`：对象保持未绑定，已建的空表页留在这个地址空间中，地址空间仍可使用，释放空间后同一会话可以重试。库把 `-ENOSPC`、`-ENOMEM` 当作确定失败，撤销这次创建的对象与 CPU 地址。叶子项写入后失效未确认时才返回 `-EIO`，此时绑定保留，库把这段 CPU 地址换回 `PROT_NONE` 占位，不归还给进程。
 
 `UNMAP` 用绑定起始地址定位整对象，句柄、权限和保留字段填零，支持 GEM handle 已关闭的对象。开启时等待同步失效后才解除引用，关闭时直接解除绑定。Ring、进度对象和通知页仍被使用时返回 `-EBUSY`，访问结果未知时保留绑定与存储；CPU mmap 另有 GEM 引用，VRAM 对象的 `PROT_NONE` 映射也持有这一引用。创建 Queue 使用已绑定对象，不增加逐任务 Launch ioctl。
 
