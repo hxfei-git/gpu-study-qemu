@@ -16,7 +16,8 @@
  * 释放。驱动不知道哪些任务还在使用某个对象，释放前由调用者确认。
  *
  * 地址：gpu_address 是写进 AQL 包、Signal 与参数块的设备地址；GPUVM 开启时
- * 为 GPUVA，关闭时为 GPU 物理地址。应用无需区分两种模式。
+ * 为 GPUVA，与对象在本进程中的 CPU 地址相同，关闭时为 GPU 物理地址。应用
+ * 无需区分两种模式。
  */
 #ifndef GPGPU_KMT_H
 #define GPGPU_KMT_H
@@ -66,7 +67,8 @@ typedef struct GpgpuKmtQueue GpgpuKmtQueue;
  * @size: 请求的字节数。
  * @mapped_size: 页对齐后的字节数，即 CPU 映射与 GPU 绑定的长度。
  * @cpu: Host 对象的用户态映射；VRAM 对象为 NULL，经 CopyMemory 访问。
- * @gpu_address: 设备地址。
+ * @gpu_address: 设备地址。GPUVM 开启时等于对象的 CPU 地址：Host 对象与
+ *               @cpu 相同；VRAM 对象的这段 CPU 地址被占住但不可访问。
  */
 typedef struct GpgpuKmtMemory {
 	uint32_t kind;
@@ -102,9 +104,11 @@ const char *gpgpuKmtStatusString(GpgpuKmtStatus status);
 /* ---- 内存 ---- */
 
 /*
- * 创建并绑定一个整对象。permissions 为 GPGPU_VM_READ/WRITE/EXEC 的组合；
- * fixed_va 为 0 时由库在可分配区间中挑选 GPUVA，GPUVM 关闭时必须为 0。
- * 队列存活期间不能创建或释放内存。
+ * 创建并绑定一个整对象。permissions 为 GPGPU_VM_READ/WRITE/EXEC 的组合。
+ * 库先申请一段 CPU 地址，把对象映射到这里，GPUVM 开启时再以同一数值
+ * 绑定 GPU。fixed_va 非零时要求使用这一 CPU 地址，已被占用则失败；
+ * GPUVM 关闭时必须为 0。队列存活期间也可以创建和释放内存，释放前由
+ * 调用者确认已没有任务使用该对象。
  */
 GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
 				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,

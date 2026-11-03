@@ -183,7 +183,9 @@ struct gpgpu_vm_info {
  * @flags: 输入 0 或 GPGPU_BO_EVENT_PAGE；带后者时驱动把对象登记为会话的
  *         通知页，每个会话只能有一个，登记后不能解绑。
  * @mapped_size: 输出的整页映射大小，包含已清零的尾部。
- * @mmap_offset: Host 对象的 CPU 映射偏移；VRAM 对象通过 COPY 访问。
+ * @mmap_offset: CPU 映射偏移。Host 对象可读写映射；VRAM 对象只能以
+ *               PROT_NONE 映射，用来占住与 GPUVA 相同的 CPU 地址，内容经
+ *               COPY 访问。
  */
 struct gpgpu_bo_create {
 	gpgpu_u32 version;

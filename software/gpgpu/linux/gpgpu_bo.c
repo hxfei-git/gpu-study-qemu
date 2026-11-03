@@ -92,19 +92,31 @@ static const struct vm_operations_struct bo_vm_ops = {
 	.close = drm_gem_vm_close,
 };
 
-/* 只允许整页、共享、不可执行地映射 Host 对象；VRAM 对象经 COPY 访问。 */
+/*
+ * 只允许整个对象、共享、不可执行地映射。Host 对象映射一致性内存，
+ * 可以读写。VRAM 对象只接受 PROT_NONE：用户库借它占住与 GPUVA 相同的
+ * CPU 地址，这里不映射任何页，并清除 VM_MAYREAD/VM_MAYWRITE，之后也
+ * 不能 mprotect 成可访问；VRAM 内容仍经 COPY 读写。
+ */
 static int bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
 	struct gpgpu_bo *bo = to_bo(obj);
 	int ret;
 
-	if (bo->kind != GPGPU_MEMORY_HOST || vma->vm_end - vma->vm_start != bo->mapped_size ||
-	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
+	if (vma->vm_end - vma->vm_start != bo->mapped_size || !(vma->vm_flags & VM_SHARED) ||
+	    (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
 
 	vma->vm_pgoff = 0;
 	vm_flags_clear(vma, VM_PFNMAP | VM_MAYEXEC);
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
+	if (bo->kind == GPGPU_MEMORY_VRAM) {
+		if (vma->vm_flags & (VM_READ | VM_WRITE))
+			return -EACCES;
+		vm_flags_clear(vma, VM_MAYREAD | VM_MAYWRITE);
+		vma->vm_ops = &bo_vm_ops;
+		return 0;
+	}
 	ret = dma_mmap_coherent(&bo->dev->pdev->dev, vma, bo->host.cpu, bo->host.dma,
 				bo->host.size);
 	if (!ret)
@@ -166,11 +178,12 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  *    都关闭后对象仍能安全释放存储；挂入会话链表即持有列表引用。
  *    通知页在第 4 步解锁之前登记，并发的第二个通知页请求会在第 1 步
  *    失败；
- * 3. 建立 mmap 偏移，Host 对象之后可经 render node 映射到用户态；
+ * 3. 建立 mmap 偏移，对象之后可经 render node 映射到用户态：Host 对象
+ *    可读写，VRAM 对象只能以 PROT_NONE 映射；
  * 4. 创建 GEM 句柄。句柄一出现，其他线程就可能用它关闭对象，GEM 核心
  *    随即回调要取 dev->lock 的 bo_close()。因此先取临时引用保住对象，
  *    解锁后再创建；重新加锁后若句柄已被关闭，按失败处理；
- * 5. 记录句柄，返回映射长度和 mmap 偏移（VRAM 对象为 0，不可映射）。
+ * 5. 记录句柄，返回映射长度和 mmap 偏移。
  *
  * 失败时撤销通知页登记并放下列表引用；GEM 的最后一个引用会经 bo_free()
  * 释放存储。
@@ -248,8 +261,7 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	bo->handle = handle;
 	args->handle = handle;
 	args->mapped_size = bo->mapped_size;
-	args->mmap_offset = bo->kind == GPGPU_MEMORY_HOST ?
-		drm_vma_node_offset_addr(&bo->gem.vma_node) : 0;
+	args->mmap_offset = drm_vma_node_offset_addr(&bo->gem.vma_node);
 	return 0;
 
 drop:

@@ -143,8 +143,9 @@ static bool kmt_vm_info_supported(const struct gpgpu_vm_info *info)
  * 1. 以 O_CLOEXEC 打开 render node；
  * 2. 用 GPGPU_DRM_INFO 查询 GPUVM 能力，核对版本、页大小和地址位数，
  *    不支持时关闭 fd 并返回 VERSION_MISMATCH；
- * 3. 记录 fd、进程号和能力。range_count 为 1 表示 GPUVM 开启，之后由库
- *    挑选 GPUVA；为 0 时设备地址就是驱动返回的 GPU 物理地址；
+ * 3. 记录 fd、进程号和地址模式。range_count 为 1 表示 GPUVM 开启，之后
+ *    对象的 GPUVA 取它在本进程中的 CPU 地址；为 0 时设备地址就是驱动返回
+ *    的 GPU 物理地址；
  * 4. 创建会话的通知页：一页可读写的 Host 对象，BO_CREATE 带
  *    GPGPU_BO_EVENT_PAGE，驱动据此登记；事件的通知槽都分配在这一页内。
  *    失败时关闭 fd，驱动在文件关闭时回收已建立的部分。
@@ -198,7 +199,6 @@ GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context)
 	c->process = getpid();
 	c->references = 1;
 	c->gpuvm = info.range_count == 1;
-	c->vm_info = info;
 
 	/* 4. 通知页创建失败时撤销第 3 步并关闭 fd。 */
 	c->notify = calloc(1, sizeof(*c->notify));
@@ -310,7 +310,7 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 	}
 
 	/* 3. 通知页的 CPU 映射也引用 DRM 文件，先解除映射再关闭 fd。 */
-	munmap(c->notify->pub.cpu, c->notify->pub.mapped_size);
+	munmap(c->notify->map, c->notify->pub.mapped_size);
 	close(c->fd);
 	kmt_reset(c);
 	status = GPGPU_KMT_SUCCESS;

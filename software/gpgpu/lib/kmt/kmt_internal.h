@@ -27,6 +27,8 @@
  * @context: 所属连接。
  * @next: 连接 memory 链表的下一项。
  * @handle: GEM 句柄。
+ * @map: 对象在本进程的 CPU 映射地址，GPUVM 开启时也是 GPUVA；VRAM 对象
+ *       的映射为 PROT_NONE。释放时解除映射后清空。
  * @bound: 仍持有 GPU 绑定；释放时解绑成功后清除，失败重试不会重复解绑。
  * @queue_users: 把本对象用作 Ring 或进度的存活队列数；非零时不能释放。
  */
@@ -35,6 +37,7 @@ typedef struct KmtMemory {
 	GpgpuKmtContext *context;
 	struct KmtMemory *next;
 	uint32_t handle;
+	uint8_t *map;
 	bool bound;
 	unsigned int queue_users;
 } KmtMemory;
@@ -83,7 +86,7 @@ typedef struct KmtEvent {
 
 /**
  * struct GpgpuKmtContext - 进程内共享的设备连接
- * @lock: 保护下列除 fd、path、process、vm_info 外的字段。
+ * @lock: 保护下列除 fd、path、process 外的字段。
  * @fd: render node 文件描述符；-1 表示未打开。
  * @path: 打开的路径；重复打开须路径一致。
  * @process: 打开连接的进程；fork 后的子进程不能复用。
@@ -93,7 +96,6 @@ typedef struct KmtEvent {
  * @closer: 执行回收的线程；它自己仍可调用销毁函数。
  * @uncertain: 存在结果未知、驱动仍在保留的资源；Close 不能报告成功。
  * @gpuvm: 设备以 GPUVM 模式运行。
- * @vm_info: 打开时查询到的 GPUVM 能力与可分配区间。
  * @notify: 打开时创建的通知页，事件的通知槽都在其中。不在 memory
  *          链表中：最后一次 Close 时只解除 CPU 映射，其余由驱动在文件
  *          关闭时回收。
@@ -112,7 +114,6 @@ struct GpgpuKmtContext {
 	pthread_t closer;
 	bool uncertain;
 	bool gpuvm;
-	struct gpgpu_vm_info vm_info;
 	KmtMemory *notify;
 	KmtMemory *memory;
 	GpgpuKmtQueue *queues;
