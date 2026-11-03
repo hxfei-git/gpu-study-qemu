@@ -7,8 +7,8 @@
 | GPU | Graphics Processing Unit | 图形处理器 |
 | CUDA | Compute Unified Device Architecture | 统一计算设备架构 |
 | ARM64 | Arm 64-bit Architecture | Arm 64 位架构 |
-| RV32 / RISC-V | 32-bit RISC-V / Reduced Instruction Set Computer V | 本实验计算执行器使用的 32 位精简指令集 |
-| RV64 | 64-bit RISC-V | 本实验原生 CP 使用的 64 位 RISC-V 模型 |
+| RISC-V / RV32 | Reduced Instruction Set Computer V / 32-bit RISC-V | 精简指令集／协议版本 5 之前计算执行器使用的 32 位模型 |
+| RV64 | 64-bit RISC-V | 本实验原生 CP 与计算执行器使用的 64 位 RISC-V 模型 |
 | API / ABI | Application Programming Interface / Application Binary Interface | 应用编程／二进制接口 |
 | PCI / BAR | Peripheral Component Interconnect / Base Address Register | 外设互连／基址寄存器 |
 | DMA | Direct Memory Access | 直接内存访问 |
@@ -60,7 +60,7 @@
 
 ## 0. 代码结构与分层
 
-一次计算从应用一路走到 RV32 线程，依次经过五层代码。每一层只调用下一层公开的接口，所有层共用 `include/gpgpu/` 中的协议头：
+一次计算从应用一路走到 RV64 线程，依次经过五层代码。每一层只调用下一层公开的接口，所有层共用 `include/gpgpu/` 中的协议头：
 
 ```text
 demos/gpgpu-demo.c          准备数据、调用运行时、比较结果
@@ -82,7 +82,7 @@ hw/gpgpu/ + firmware/       QEMU 设备模型与 RV64 CP 固件
 
 - `gpgpu.c` 负责 QOM/PCI 组装、全局寄存器和复位顺序；`bar0.c` 把 BAR0 每个 0x100 字节的寄存器组挂成独立子区域，统一检查访问宽度，并提供 CP 本地寄存器窗口。
 - `cp/`：`cp_ctrl` 管理原生 CP 的复位与启动，`cp_window` 是 CP 访问 GPU 地址的 64 KiB 窗口，另有 `hqd` 与 `doorbell`。
-- `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv32` 是解释器，`lane_mem` 负责取指与 LW/SW。
+- `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv64` 是解释器，`lane_mem` 负责取指与 4／8 字节访存。
 - `mem/`：`vram`、`phys`（GPU 物理地址到 VRAM 或 Outbound 的路由）、`gpuvm`（用户地址翻译与故障记录）、`dma`。
 - `irq/`：`irq` 是中断锁存与 PCI 通知，`ih` 是通知记录 Ring。
 
@@ -90,22 +90,23 @@ CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` �
 
 Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
 
-协议当前为版本 4，与版本 3 的差异见 [PROTOCOL_V4.md](./PROTOCOL_V4.md)；更早的版本 2 到 3 的差异见 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
+协议当前为版本 5，与版本 4 的差异见 [PROTOCOL_V5.md](./PROTOCOL_V5.md)；更早的差异见 [PROTOCOL_V4.md](./PROTOCOL_V4.md) 与 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
 
 ## 1. 应用提交与统一访存
 
-Host 指 ARM64 Linux 客体中的 CPU 与应用。应用通过 DRM render node 创建 GEM 对象，由 HSAKMT 风格库提交 AQL 包；RV64 CP 处理队列，RV32 计算执行器运行 Kernel。设备属性 `gpuvm=on/off` 决定用户地址含义，默认开启。两种状态使用同一套对象、队列、等待和回收接口。
+Host 指 ARM64 Linux 客体中的 CPU 与应用。应用通过 DRM render node 创建 GEM 对象，由 HSAKMT 风格库提交 AQL 包；RV64 CP 处理队列，RV64 计算执行器运行 Kernel。设备属性 `gpuvm=on/off` 决定用户地址含义，默认开启。两种状态使用同一套对象、队列、等待和回收接口。
 
 ```text
-应用：创建并绑定代码、描述符、参数和数组
+打开设备：库创建本进程的通知页并登记给驱动
+  → 应用：创建并绑定代码、描述符、参数和数组
   → 创建 AQL Queue，填写包体并发布 Header
   → 8 字节写 Doorbell
-  → RV64 CP 读取描述符、派发 RV32 Kernel
+  → RV64 CP 读取描述符、派发 RV64 Kernel
   → Signal → 通知槽 → IH → INVALID Header → 消费进度
   → Host 复查 Signal、读取并比较结果
   → 排空并卸载 Queue → 销毁事件 → 解绑并释放对象
 
-CP 用户访问 / RV32 取指与数据访问
+CP 用户访问 / RV64 取指与数据访问
   ├─ gpuvm=on：GPUVA → 页表与权限检查 → GPU 物理地址
   └─ gpuvm=off：输入就是 GPU 物理地址
                       ↓
@@ -124,9 +125,11 @@ Outbound 只决定访问路由。Host 存储或 IOMMU 映射不存在时访问�
 
 ## 2. GPUVM、对象绑定与资源回收
 
-GPUVM 开启时使用三级 4 KiB 页表、两个用户 VMID 和 64 组 × 4 路的组相联 TLB。VMID 在建队列时取得、队列卸载后归还；驱动取得和归还 VMID 时失效整个 VMID，占有 VMID 期间绑定或解绑对象只失效该对象的 VPN 范围，设备同步完成并以 ACK 确认。PTE 保存地址域、SYSTEM 位和有效、读、写、执行权限：Host 页写 IOVA 并置 SYSTEM，设备换算为 `0x8000_0000 + IOVA`；VRAM 页写 VRAM 偏移。根目录使用 GPU 物理地址，驱动的中间表页都在 VRAM，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
+GPUVM 开启时使用 48 位 GPUVA、四级 4 KiB 页表、两个用户 VMID 和 64 组 × 4 路的组相联 TLB。VMID 在建队列时取得、队列卸载后归还；驱动取得和归还 VMID 时失效整个 VMID，占有 VMID 期间绑定或解绑对象只失效该对象的 VPN 范围，设备同步完成并以 ACK 确认。PTE 保存地址域、SYSTEM 位和有效、读、写、执行权限：Host 页写 IOVA 并置 SYSTEM，设备换算为 `0x8000_0000 + IOVA`；VRAM 页写 VRAM 偏移。根目录使用 GPU 物理地址，驱动的中间表页都在 VRAM，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
 
-用户 GPUVA 的唯一可分配区间为 `[0x1000, 0xffff_f000)`，末页保存内部通知槽。`0x8000_0000` 与 `0x9000_0000` 均为普通 GPUVA，不再代表控制页或参数窗口。GPUVM 关闭时不创建页表，能力查询返回零个 GPUVA 区间，MAP 返回对象固定的 GPU 物理地址；非零 `fixed_va` 请求返回不支持。
+用户 GPUVA 的唯一可分配区间为 `[0x1000, 0x1_0000_0000_0000)`。用户库先用 `mmap(PROT_NONE)` 预留一段对齐的 CPU 地址，把对象经 render node 映射到这里，再以同一数值 MAP，所以对象的 GPUVA 就是它在本进程中的 CPU 地址。Host 对象的这段地址可读写，就是公开的 `cpu`；VRAM 对象的这段地址只占位，CPU 访问会触发段错误，`cpu` 为 NULL。释放时先 UNMAP，成功后才解除 CPU 映射。
+
+每个进程有一页通知页，由库在 `gpgpuKmtOpen()` 中创建，`BO_CREATE` 带 `GPGPU_BO_EVENT_PAGE` 登记给驱动；事件的通知槽都在这一页中。`0x8000_0000` 与 `0x9000_0000` 均为普通 GPUVA，不再代表控制页或参数窗口。GPUVM 关闭时不创建页表，能力查询返回零个 GPUVA 区间，MAP 返回对象固定的 GPU 物理地址；非零 `fixed_va` 请求返回不支持。
 
 ```text
 GEM handle ─────────┐
@@ -134,18 +137,19 @@ GPU 绑定引用 ────────┼→ 固定 Host / VRAM 存储
 CPU mmap 引用 ──────┘
 
 关闭 handle：只解除句柄引用
-Queue 卸载确认：允许解绑
+Ring、进度对象：Queue 卸载后才允许解绑
+通知页：会话关闭时由驱动撤销登记后才解绑
 解绑：开启 GPUVM 时撤销页表并确认 TLB 失效
 最后引用结束：归还存储
 ```
 
-两种状态均建立独立绑定引用；地址为零或没有页表不能作为释放条件。Queue 存活期间冻结绑定，代码、参数及数组随绑定保活。未知管理完成结果或无法确认访问结束时继续保留资源。正常关闭按 Queue、事件、绑定、存储顺序执行，CPU mmap 独立保活实际存储。
+两种状态均建立独立绑定引用；地址为零或没有页表不能作为释放条件。Queue 存活期间可以绑定和解绑其他对象；驱动不知道哪些对象还在被任务使用，由应用确认任务结束后再释放。未知管理完成结果或无法确认访问结束时继续保留资源。正常关闭按 Queue、事件、绑定、存储顺序执行，CPU mmap 独立保活实际存储。
 
 全设备保留两个用户 Queue 名额，每上下文一条。关闭 GPUVM 后，各进程共享物理地址空间，不提供页权限隔离。VRAM 首页及固件区继续受用户访问保护；管理队列、MQD、管理完成区、IH 与 COPY 端点统一使用 GPU 物理地址。
 
 CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含义。CP 自己的代码、栈和本地访存窗口继续使用 RV64 CP 地址空间。
 
-## 3. RV32 Kernel 的启动接口
+## 3. RV64 Kernel 的启动接口
 
 **[DESIGN]** 每 Warp 保存九个只读共享启动值：Block 编号、Block 尺寸、Grid 中的 Block 数量。每 Lane 保存三个线程坐标。新 Warp 创建时填写一次，分段继续执行时保留；X 维变化最快。启动状态独立于 Kernel 可覆盖的通用寄存器。
 
@@ -159,11 +163,11 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 `csrr` 汇编为 `CSRRS rd, csr, x0`。执行器仅接受此只读形式；`rd=x0` 也先检查 CSR 是否有效。未知 CSR、写入及其他未支持形式均返回指令错误。汇编器接受数字与 `.equ` 常量，并检查 CSR 编号范围。
 
-`a0` 直接保存 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数读取按普通内存处理。16 字节 Kernel 描述符在偏移 `0x0c` 保存 `kernel_abi_version=4`，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 4，组件必须一起更新。
+执行器的整数寄存器与 PC 为 64 位，现有指令子集按 RV64 语义执行，另有 LD、SD 读写 64 位指针。`a0` 直接保存 64 位 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数块每项 8 字节，Kernel 用 `ld` 读取。24 字节 Kernel 描述对象在偏移 `0x00` 保存 64 位代码入口，在 `0x10` 保存 `kernel_abi_version=5`，`0x14` 的保留字段为 0，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 5，组件必须一起更新。
 
 ## 4. 公共库与三个计算示例
 
-`GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。参数中写入 32 位地址前须检查范围，运行时用 `gpgpu_rt_arg_address()` 完成这一检查。
+`GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。参数块每项 8 字节，`gpgpu_rt_dispatch()` 接收 `uint64_t` 数组，对象的 `gpu_address` 原样写入，不截断。
 
 KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` 和 `gpgpuKmtDrainQueue()` 分别负责槽位预留、Header 与 Doorbell 发布、Signal 与事件等待、排空。运行时 `gpgpu_rt_dispatch()` 按顺序调用它们完成一次派发。默认等待先主动检查约 200 μs，再进入事件等待，唤醒后复查 Signal。
 
@@ -193,7 +197,7 @@ make -f Makefile.gpgpu build JOBS=4
 # 设备寄存器与双进程 CP 队列回归，核对退出状态、TAP 计划与结果
 make -f Makefile.gpgpu test-gpgpu-qtest
 
-# 用户库、gpgpu-demo 与三个 RV32 Kernel（输出到 build/gpgpu-stack），以及教学汇编器回归
+# 用户库、gpgpu-demo 与三个 RV64 Kernel（输出到 build/gpgpu-stack），以及教学汇编器回归
 make -C software/gpgpu all check
 # RV64 CP 固件，输出 build/gpgpu-firmware/gpgpu-cp.bin
 make -C software/gpgpu/firmware

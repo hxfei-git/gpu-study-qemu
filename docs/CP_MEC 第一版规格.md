@@ -34,8 +34,8 @@
 | QEMU   | Quick Emulator                            | 仿真与虚拟化工具                               |
 | CPU    | Central Processing Unit                   | 中央处理器                                     |
 | GPU    | Graphics Processing Unit                  | 图形处理器                                     |
-| RV32   | 32-bit RISC-V                             | 本版计算解释器使用的 32 位 RISC-V 模型         |
-| RV64   | 64-bit RISC-V                             | 本版 CP 使用的原生 64 位 RISC-V 模型           |
+| RV32   | 32-bit RISC-V                             | 协议版本 5 之前计算解释器使用的 32 位 RISC-V   |
+| RV64   | 64-bit RISC-V                             | 本版 CP 与计算解释器使用的 64 位 RISC-V 模型   |
 | M-mode | Machine Mode                              | RISC-V 机器特权级；CP 裸机固件的运行模式       |
 | TCG    | Tiny Code Generator                       | QEMU 的动态代码生成基础设施                    |
 | VRAM   | Video RAM                                 | 教学设备的显存后备存储                         |
@@ -57,9 +57,9 @@
 
 本文集中保存本实验已经确认的架构、行为与接口约束。寄存器名称参考 AMD，实验语义以本文的 `[DESIGN]` 为准，不声明兼容 AMD 的完整硬件协议。
 
-**[DESIGN]** 当前接口为协议版本 4。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
+**[DESIGN]** 当前接口为协议版本 5。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
 
-设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 3 的差异见 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
+设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 4 的差异见 [PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>)，更早的差异见 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
 
 <a id="spec-overview"></a>
 
@@ -67,7 +67,7 @@
 
 ## 1. 整体架构与执行路径
 
-**[DESIGN]** 第一版使用一个 QEMU 原生 RV64 CP，由 TCG 在 M-mode 执行裸机固件，不启用页表；现有 RV32 计算解释器继续执行应用 Kernel。4 个 HQD 槽位中，槽位 0 用于 KIQ，槽位 1 用于 HIQ，槽位 2、3 由 CP 按创建请求分配给用户 AQL Queue。计算执行器一次处理一个完整 Dispatch。
+**[DESIGN]** 第一版使用一个 QEMU 原生 RV64 CP，由 TCG 在 M-mode 执行裸机固件，不启用页表；RV64 计算解释器执行应用 Kernel。4 个 HQD 槽位中，槽位 0 用于 KIQ，槽位 1 用于 HIQ，槽位 2、3 由 CP 按创建请求分配给用户 AQL Queue。计算执行器一次处理一个完整 Dispatch。
 
 ```text
 Host 读回核对 Outbound 布局、使能并确认，准备 KIQ 的 Ring、MQD 与 HQD，启动 CP
@@ -79,12 +79,12 @@ Host 读回核对 Outbound 布局、使能并确认，准备 KIQ 的 Ring、MQD 
   → 驱动确认配置成功，接口库将队列标识和 Doorbell 入口交给调用方
   → Host 向用户 AQL Ring 发布 Dispatch 并通知设备
   → RV64 CP 根据 HQD 找到 Ring，读取并解析 Dispatch
-  → CP 通过分发接口向 RV32 计算执行器提交任务，等待完成
+  → CP 通过分发接口向 RV64 计算执行器提交任务，等待完成
   → CP 发布完成 Signal，释放包槽并回报消费进度
   → Host 读取结果，复用已经消费的 Ring 槽
 ```
 
-原生 CP 执行队列固件，计算执行器执行应用 Kernel，两者各自保存寄存器和取指位置。2026-10-17 的 RV64 迁移只改变原生 CP；计算线程的寄存器和 Kernel 指令仍按 RV32 执行。执行主体、构建入口及参数交接边界见[CP 与计算执行器的位宽](<./历史/CP_MEC 软件实现、参考与扩展.md#cp-executor-widths>)。上图规定本阶段的队列执行顺序，实际运行结果见软件栈说明第 5 节。
+原生 CP 执行队列固件，计算执行器执行应用 Kernel，两者各自保存寄存器和取指位置。两者都按 RV64 执行：计算线程的整数寄存器与 PC 为 64 位，浮点寄存器只支持 32 位单精度。执行器仍为 RV32 时的执行主体、构建入口及参数交接边界见[CP 与计算执行器的位宽](<./历史/CP_MEC 软件实现、参考与扩展.md#cp-executor-widths>)。上图规定本阶段的队列执行顺序，实际运行结果见软件栈说明第 5 节。
 
 当前公共库包含 `lib/kmt/` 的 HSAKMT 风格薄层与 `lib/rt/` 的小运行时，示例统一链接 `libgpgpu.a`。KMT 层负责槽位预留、Header 发布、8 字节 Doorbell 更新、Signal 与事件等待、排空及 Queue 销毁；运行时负责装载 Kernel、组包并调用这些接口完成派发。历史 Runtime 与旧同步提交入口已删除。
 
@@ -109,7 +109,7 @@ Host 读回核对 Outbound 布局、使能并确认，准备 KIQ 的 Ring、MQD 
 
 HQD 保存状态，CP 读取状态并执行命令，计算执行器执行 Kernel。管理命令与 AQL Packet 直接保存在各自的 Ring 中，本版不引入 IB 间接命令执行，也不建立 IQ 或 EOP 缓冲区。不提供可配置的队列／管线优先级和时间片，也不实现运行中的抢占和计算现场保存；取舍详解见[AMD 寄存器对照](<./历史/CP_MEC 软件实现、参考与扩展.md#amd-registers>)，后期方向见[扩展项](<./历史/CP_MEC 软件实现、参考与扩展.md#extensions>)。
 
-**[DESIGN]** 第一版沿用 RV32 执行器为每个 lane 固定提供的通用、浮点寄存器，不增加 `COMPUTE_PGM_RSRC1/2` 资源配置寄存器。`Y[i] = a × X[i] + b` 中不随线程变化的只读 `a`、`b` 放在参数块中，各线程读取后计算，无需 LDS。工作组共享存储、组内屏障和可配置寄存器资源列为[后续扩展](<./历史/CP_MEC 软件实现、参考与扩展.md#compute-resource-extension>)；概念与已有实现见[线程寄存器、参数与共享存储](<./历史/CP_MEC 软件实现、参考与扩展.md#kernel-registers-lds>)。第二阶段仍只运行不依赖工作组共享存储和屏障的 Kernel。
+**[DESIGN]** 第一版沿用执行器为每个 lane 固定提供的通用、浮点寄存器，不增加 `COMPUTE_PGM_RSRC1/2` 资源配置寄存器。`Y[i] = a × X[i] + b` 中不随线程变化的只读 `a`、`b` 放在参数块中，各线程读取后计算，无需 LDS。工作组共享存储、组内屏障和可配置寄存器资源列为[后续扩展](<./历史/CP_MEC 软件实现、参考与扩展.md#compute-resource-extension>)；概念与已有实现见[线程寄存器、参数与共享存储](<./历史/CP_MEC 软件实现、参考与扩展.md#kernel-registers-lds>)。第二阶段仍只运行不依赖工作组共享存储和屏障的 Kernel。
 
 双进程设备关系如下。队列、Doorbell 与 CP 派发沿用图中的传输层，接口规则见后续章节：
 
@@ -118,7 +118,7 @@ HQD 保存状态，CP 读取状态并执行命令，计算执行器执行 Kernel
   └─ vfio-user-pci 代理
        ├─ 配置空间与 BAR 请求 ──────────→ 进程 B：gpgpu-cp
        │                                  ├─ gpu0：寄存器、VRAM、DMA、中断
-       │                                  ├─ 原有 RV32 计算解释器
+       │                                  ├─ RV64 计算解释器
        │                                  └─ 原生 RV64 CP（默认保持复位）
        ├─ PCI DMA 接口 ←── B 的 DMA 请求       │
        │     └─ SMMUv3（启用时）→ Host RAM     └─ 地址 0 起映射同一份 VRAM
@@ -201,7 +201,7 @@ CP 本地窗口 load/store
                                             → PCIe DMA → SMMUv3（启用时）→ Host RAM
 ```
 
-CP 的代码、栈和控制寄存器仍使用自己的裸机地址；Host 经 BAR2 读写 VRAM。下面只列 CP 本地窗口，不能将这些地址当作 RV32 Kernel 的特殊地址：
+CP 的代码、栈和控制寄存器仍使用自己的裸机地址；Host 经 BAR2 读写 VRAM。下面只列 CP 本地窗口，不能将这些地址当作 Kernel 的特殊地址：
 
 ```text
 0x8000_0000 … 0x8000_ffff    CP 的 64 KiB 访存窗口
@@ -283,7 +283,7 @@ Host 等待任务 T1
 
 **[DESIGN]** `value` 保留 64 位有符号整数，按 8 字节对齐。Host 在提交前初始化为 `1`；从任务发布到本次使用结束，只有 CP 可以更新 `value`，Host 不与 CP 并发写入。CP 在正常完成路径上执行一次“读取、减一、写回”，将 `1` 改为 `0`，无需专门的原子加或原子读改写入口。计算执行器不另行更新同一 Signal。
 
-`S.value` 的 GPU 地址存入 64 位协议槽，高 32 位须为零；按[第 2.5.2 节](#spec-signal-layout)的布局，`value` 位于 Signal 起始地址的偏移 `0x00`。每次任务的完成更新只执行一次；访存失败仍按所属队列记录错误，不盲目重复减一。Host 重新初始化或复用 Signal 前，必须先满足[第 2.5.3 节](#spec-signal-notify-wait)及[第 7.1.7 节](#spec-ih-object-lifetime)已经确定的旧任务、旧通知与对象引用条件；应用释放接口见[9.7.4 的已确认接口](#spec-host-object-release)。
+`S.value` 的 GPU 地址存入 64 位协议槽，范围按[第 2.4 节](#spec-address-values)检查；按[第 2.5.2 节](#spec-signal-layout)的布局，`value` 位于 Signal 起始地址的偏移 `0x00`。每次任务的完成更新只执行一次；访存失败仍按所属队列记录错误，不盲目重复减一。Host 重新初始化或复用 Signal 前，必须先满足[第 2.5.3 节](#spec-signal-notify-wait)及[第 7.1.7 节](#spec-ih-object-lifetime)已经确定的旧任务、旧通知与对象引用条件；应用释放接口见[9.7.4 的已确认接口](#spec-host-object-release)。
 
 **[BOUNDARY]** 单一更新者省去了并发读改写之间的冲突，仍须保证 Host 与 CP 取得完整的 64 位值，并保证结果写回先于完成值发布。窗口支持对齐的 8 字节读写；完整字段访问遵守[第 2.2.1 节](#spec-shared-value-integrity)，具体可见性操作见[第 6.4 节](#spec-dispatch-visibility)。通知槽标记和防止漏唤醒的等待协议已按[第 2.5.3 节](#spec-signal-notify-wait)确定，中断交付沿用[第 7.1.5 节](#spec-ih-signal-notify)。多更新者的原子读改写列为[后续扩展](<./历史/CP_MEC 软件实现、参考与扩展.md#signal-atomic-extension>)，不作为第二阶段必需接口。
 
@@ -357,7 +357,7 @@ Host 只能读到完整旧值或完整新值
 以向量加法为例，下面设 `gpuvm=off`、VRAM 为 64 MiB，参数的 Host IOVA 为 `0x4100_2000`：
 
 ```text
-Dispatch.kernel_object = 0x4000 → VRAM 中的16字节描述对象
+Dispatch.kernel_object = 0x4000 → VRAM 中的 24 字节描述对象
   └─ code_entry = 0x8000 → 执行器经公共入口从 VRAM 取指
 
 Dispatch.kernarg_address = 0xc100_2000 → 启动时 a0 = 0xc100_2000
@@ -370,7 +370,7 @@ Dispatch.kernarg_address = 0xc100_2000 → 启动时 a0 = 0xc100_2000
 
 开启 GPUVM 时流程相同，但这些字段使用绑定返回的 GPUVA，先由所属 VM 页表翻译，再进入公共物理入口。CP 读取描述对象和 Kernel 取指都走这一入口，关闭 GPUVM 时也能访问 Outbound，不保留只许 VRAM 的旁路。
 
-Host 发布前准备好全部内容，发布后保持代码、参数、数组和 Signal 的存储有效，直到确认任务不再访问。Kernel 参数读取使用真实 `a0`，不经过 CP 的本地窗口，也不经过旧 RV32 参数窗口；完整启动和范围规则见[第 6.2 节](#spec-kernel-descriptor)。
+Host 发布前准备好全部内容，发布后保持代码、参数、数组和 Signal 的存储有效，直到确认任务不再访问。Kernel 参数读取使用真实 `a0`，不经过 CP 的本地窗口，也不经过早期执行器的参数窗口；完整启动和范围规则见[第 6.2 节](#spec-kernel-descriptor)。
 
 <a id="spec-address-values"></a>
 
@@ -389,9 +389,9 @@ Host IOVA 0x4100_0000 → Ring 的 GPU 物理地址 0xc100_0000
   → CP 按用户域读取 Ring → 公共物理入口 → Host IOVA 0x4100_0000
 ```
 
-**[DESIGN]** 协议字段仍按原宽度保存字节地址，两个 32 位寄存器分别保存低、高位，不预先右移压缩。当前协议的 GPU 存储地址限定为 32 位，64 位字段的高 32 位须为零；地址加长度等计算用 64 位，先校验再缩窄。
+**[DESIGN]** 协议字段仍按原宽度保存字节地址，两个 32 位寄存器分别保存低、高位，不预先右移压缩。GPU 物理地址限定为 32 位。开启 GPUVM 时用户地址是 48 位 GPUVA，数值等于对象在应用进程中的 CPU 地址，位 63..48 须为零；关闭时用户地址就是 GPU 物理地址，超过 4 GiB 的值在物理入口路由失败。地址加长度用 64 位计算，先确认起点低于上限，再检查剩余长度。
 
-用户 Ring、进度、描述对象、参数、Signal 和通知槽使用 GPUVA 或 GPU 物理地址，取决于设备 `gpuvm` 属性。管理 Ring、MQD、管理完成区、IH 与 COPY 物理端点一律保存 GPU 物理地址。`dma_addr_t` 只供驱动的 DMA API 使用，不能直接填入这些设备字段。Host CPU 指针也不写入 GPU 地址字段。
+用户 Ring、进度、描述对象、参数、Signal 和通知槽使用 GPUVA 或 GPU 物理地址，取决于设备 `gpuvm` 属性。管理 Ring、MQD、管理完成区、IH 与 COPY 物理端点一律保存 GPU 物理地址。`dma_addr_t` 只供驱动的 DMA API 使用，不能直接填入这些设备字段。只有经库分配并绑定的对象，其 CPU 地址才在 GPU 页表中有映射；`malloc` 等得到的普通 CPU 指针不能写入 GPU 地址字段。
 
 <a id="spec-shared-endian"></a>
 
@@ -424,22 +424,22 @@ CP 已从 Dispatch 取得描述对象的 GPU 地址，接下来要读取描述�
 
 ```text
 CP 取得 kernel_object：64 位无符号地址，数值为 0x4000
-  → 检查高 32 位为零、描述对象地址按 8 字节对齐
+  → 检查地址低于用户地址上限、按 8 字节对齐
   → 按描述对象大小检查完整 GPU 地址范围
   → 按用户域读取 GPU 地址 0x4000 处的描述对象
-  → 取得其中的代码入口地址：32 位无符号数，数值为 0x8000
-  → 交给 RV32 计算执行器
+  → 取得其中的代码入口地址：64 位无符号数，数值为 0x8000
+  → 交给 RV64 计算执行器
   → 执行器检查入口按 4 字节对齐，并检查实际访存范围
 ```
 
-**[DESIGN]** `kernel_object`、`kernarg_address` 和 `completion_signal` 保留 64 位字段，保存用户 GPU 地址并检查高 32 位为零。代码入口与参数中的数组地址为 32 位，转换前检查完整范围。公共物理入口拒绝跨 VRAM／Outbound 边界的非法范围，用户访问继续保护 VRAM 首页和固件保留区；开启翻译时还检查映射及权限。
+**[DESIGN]** `kernel_object`、`kernarg_address` 和 `completion_signal` 保留 64 位字段，保存用户 GPU 地址，按第 2.4 节的上限检查。代码入口与参数中的数组地址同样是 64 位，执行器按实际访问检查范围。公共物理入口拒绝跨 VRAM／Outbound 边界的非法范围，用户访问继续保护 VRAM 首页和固件保留区；开启翻译时还检查映射及权限。
 
 **[DESIGN]** 对象采用以下最低对齐要求：
 
 - 用户 AQL Ring、KIQ Ring、HIQ Ring 的起始地址按 64 字节对齐。
 - KIQ、HIQ 中每条管理命令固定为 32 字节，命令起点按 32 字节对齐，字段布局见[第 4.1 节](#spec-management-packet-format)。
 - MQD、Kernel 描述对象、参数块、生产／消费进度存放位置和管理完成标记位置，至少按 8 字节对齐。Signal 和通知槽沿用第 2.5 节的 8 字节对齐要求。
-- RV32 Kernel 代码入口按 4 字节对齐；普通数组按元素类型自然对齐，例如 32 位元素按 4 字节对齐。
+- Kernel 代码入口按 4 字节对齐；普通数组按元素类型自然对齐，例如 32 位元素按 4 字节对齐。
 - 结构内的多字节标量字段按自身宽度自然对齐，例如 32 位字段按 4 字节、64 位字段按 8 字节对齐。
 
 驱动在创建和配置对象时检查，CP 在解析对象引用时检查，计算执行器检查实际执行的访存。检查内容包括地址对齐、乘加计算不溢出，以及整段访问范围有效。VRAM 访问必须完整落在实际容量内；Host RAM 访问还必须处理访存接口返回的错误。
@@ -1589,49 +1589,50 @@ Header 的 `barrier` 位允许 `0`、`1`。`barrier = 1` 要求当前任务在�
 
 **[DESIGN]** CP 对已发布的包检查类型、保留位、必填对象引用、维度、整除条件、资源字段、同步字段和规模上限。遇到不支持的包或非法字段时，拒绝执行，记录到所属队列的 `CP_HQD_ERROR`，停止该队列后续取包，不静默忽略，也不把 Signal 更新为成功完成。`INVALID` 继续按正常等待处理。队列错误编号见[第 7.2.1 节](#spec-queue-error-codes)；失败后的消费进度、Host 等待退出和资源保留按[第 7.3 节](#spec-failure-retirement)处理。
 
-**[BOUNDARY]** Dispatch 校验、尺寸换算、计算交接及同步遵守本节约定。Kernel 描述对象与 RV32 计算执行器的参数约定已按[9.5.2](#spec-kernel-executor-interface)确定，完整规则见下节；RV64 CP 到执行器的寄存器和结果接口已按[9.5.3](#spec-cp-dispatch-interface)确定，见[第 6.3 节](#spec-executor-dispatch)。
+**[BOUNDARY]** Dispatch 校验、尺寸换算、计算交接及同步遵守本节约定。Kernel 描述对象与计算执行器的参数约定最初按[9.5.2](#spec-kernel-executor-interface)确定，现行规则见下节；RV64 CP 到执行器的寄存器和结果接口已按[9.5.3](#spec-cp-dispatch-interface)确定，见[第 6.3 节](#spec-executor-dispatch)。
 
 <a id="spec-kernel-descriptor"></a>
 
 ### 6.2 Kernel 描述对象、真实参数地址与启动 CSR
 
-CP 已取得 Dispatch，接下来读取 16 字节描述对象、核对 Kernel ABI，并为 RV32 执行器交付配置：
+CP 已取得 Dispatch，接下来读取 24 字节描述对象、核对 Kernel ABI，并为 RV64 执行器交付配置：
 
 ```text
 Dispatch → kernel_object → 用户域读取描述对象
-  → 检查 kernel_abi_version = 4、代码与参数范围及对齐
+  → 检查 kernel_abi_version = 5、保留字段为 0、代码与参数范围及对齐
   → 保存 gpuvm_enabled、VMID、HQD 槽、代码和参数地址、长度与工作规模
   → 新建 Warp：填写一次共享启动状态，再填写各 Lane 线程坐标
-  → 初始化 PC、mhartid，并令各有效 Lane 的 a0 = kernarg_address
+  → 令 PC = 代码入口，初始化 mhartid，并令各有效 Lane 的 a0 = kernarg_address（64 位）
   → Kernel 通过 CSR 取得启动坐标，通过普通内存读取参数和数组
 ```
 
-#### 6.2.1 16 字节 Kernel 描述对象
+#### 6.2.1 24 字节 Kernel 描述对象
 
-**[DESIGN]** 描述对象至少按 8 字节对齐，当前示例存于 VRAM；四个字段均为 32 位无符号小端值：
+**[DESIGN]** 描述对象至少按 8 字节对齐，当前示例存于 VRAM；字段均为无符号小端值：
 
 ```text
-偏移 0x00：code_entry          代码入口的 GPU 地址
-偏移 0x04：code_size           代码区域的字节长度
-偏移 0x08：kernarg_size        参数块的字节长度
-偏移 0x0c：kernel_abi_version  固定为 4
+偏移 0x00：code_entry          代码入口的 GPU 地址，64 位
+偏移 0x08：code_size           代码区域的字节长度，32 位
+偏移 0x0c：kernarg_size        参数块的字节长度，32 位
+偏移 0x10：kernel_abi_version  固定为 5，32 位
+偏移 0x14：reserved            必须为 0，32 位
 ```
 
-CP 拒绝旧值 0 和所有不支持的 ABI。代码入口按 4 字节对齐，代码长度非零且为 4 字节整数倍；使用宽整数检查地址加长度，执行器每次取指仍受声明代码范围约束。描述对象可供同一 Kernel 的多次提交复用，AQL 包仍为 64 字节。
+CP 拒绝其他 ABI 版本和非零保留字段。代码入口按 4 字节对齐，代码长度非零且为 4 字节整数倍。CP 先确认入口低于用户地址上限，再检查剩余长度，越界的入口不会让减法回绕；检查通过后把入口的低、高 32 位分别写入 `KERNEL_ADDR_LO/HI`。执行器每次取指仍受声明代码范围约束。描述对象可供同一 Kernel 的多次提交复用，AQL 包仍为 64 字节。
 
 #### 6.2.2 Host 参数块的布局与长度
 
 参数仍位于独立 Host coherent BO，至少按 8 字节对齐，长度为 4 字节至 64 KiB 的 4 字节整数倍。无参数 Kernel 使用 4 字节零占位块。参数内容由应用和 Kernel 约定，CP 只校验地址、长度与对齐。
 
 ```text
-向量加法参数：共16字节
-  0x00：X 的 GPU 地址，32位
-  0x04：Y 的 GPU 地址，32位
-  0x08：Z 的 GPU 地址，32位
-  0x0c：N，32位
+向量加法参数：共 32 字节，每项占一个 8 字节槽
+  0x00：X 的 GPU 地址
+  0x08：Y 的 GPU 地址
+  0x10：Z 的 GPU 地址
+  0x18：N
 ```
 
-参数不增加前缀或启动信息指针。地址在 GPUVM 开启时为 GPUVA，关闭时为 GPU 物理地址；传入 RV32 字段前须检查 32 位范围。
+参数不增加前缀或启动信息指针。地址在 GPUVM 开启时为 GPUVA，即对象在应用进程中的 CPU 地址；关闭时为 GPU 物理地址。运行时把指针原样写入 8 字节槽，不截断，Kernel 用 `ld` 读取。
 
 <a id="spec-kernarg-window"></a>
 
@@ -1640,10 +1641,10 @@ CP 拒绝旧值 0 和所有不支持的 ABI。代码入口按 4 字节对齐，�
 `a0 = kernarg_address`。以 GPUVM 关闭、64 MiB VRAM 为例，参数 Host IOVA 为 `0x4100_2000`，对应 GPU 物理地址 `0xc100_2000`：
 
 ```text
-Kernel 执行 lw t0, 12(a0)，a0 = 0xc100_2000
-  → 普通用户访问 GPU 地址 0xc100_200c
+Kernel 执行 ld t0, 24(a0)，a0 = 0xc100_2000
+  → 普通用户访问 GPU 地址 0xc100_2018，读 8 字节
   → 公共物理入口选择 Outbound
-  → 减 0x8000_0000 → Host IOVA 0x4100_200c
+  → 减 0x8000_0000 → Host IOVA 0x4100_2018
   → t0 取得 N
 ```
 
@@ -1667,9 +1668,9 @@ Host 在发布后保留对象内容、绑定和存储。正常结束先排空和
 0xF14：mhartid，保留现有编号和编码
 ```
 
-创建新 Warp 时初始化一次，坐标按 X 维变化最快的顺序填写，`gridDim` 表示 Block 数量；同一 Warp 分段继续时不重置，切到下一个 Warp 才重填。CSR 读取仅支持 `CSRRS` 且 `rs1` 编码为 `x0`；`rd=x0` 仍检查 CSR 有效性再丢弃结果，未知 CSR、写入及其他形式报指令错误。汇编器支持 `csrr`、`csrrs`，接受数字和 `.equ` 常量并检查范围。
+创建新 Warp 时初始化一次，坐标按 X 维变化最快的顺序填写，`gridDim` 表示 Block 数量；同一 Warp 分段继续时不重置，切到下一个 Warp 才重填。CSR 读取仅支持 `CSRRS` 且 `rs1` 编码为 `x0`，读出值零扩展到 64 位；`rd=x0` 仍检查 CSR 有效性再丢弃结果，未知 CSR、写入及其他形式报指令错误。汇编器支持 `csrr`、`csrrs`，接受数字和 `.equ` 常量并检查范围。
 
-**[BOUNDARY]** 本轮只实现启动状态及只读接口，不扩展可写 SGPR/VGPR、标量 ALU 或向量指令体系。RV32 的旧控制页已删除；`0x8000_0000`、`0x9000_0000` 在开启翻译时是普通 GPUVA，关闭时只按 VRAM／Outbound 物理布局解释。
+**[BOUNDARY]** 本轮只实现启动状态及只读接口，不扩展可写 SGPR/VGPR、标量 ALU 或向量指令体系。早期 RV32 执行器的控制页已删除；`0x8000_0000`、`0x9000_0000` 在开启翻译时是普通 GPUVA，关闭时只按 VRAM／Outbound 物理布局解释。
 
 <a id="spec-executor-dispatch"></a>
 
@@ -1683,7 +1684,7 @@ CP 读取 Dispatch 和 Kernel 描述对象
   → 换算任务规模：4 个工作组，每组 256 个线程
   → 填写执行器配置，最后写 DISPATCH
           ↓
-RV32 计算执行器
+RV64 计算执行器
   → 从 VRAM 取指，检查是否超出代码范围
   → 通过真实 a0 按普通内存规则读取参数
   → 执行计算并写回结果
@@ -1702,14 +1703,14 @@ CP 读取并确认执行结果
 
 ```text
 0x0300 / 0x0304  KERNEL_ADDR_LO/HI：代码入口的 GPU 地址
-0x0308 / 0x030c  KERNEL_ARGS_LO/HI：参数的 GPU 地址，高 32 位为零
+0x0308 / 0x030c  KERNEL_ARGS_LO/HI：参数的 GPU 地址
 0x0310 / 0x0314 / 0x0318  GRID_DIM_X/Y/Z：工作组数量，本例为 (4, 1, 1)
 0x031c / 0x0320 / 0x0324  BLOCK_DIM_X/Y/Z：每组线程数量，本例为 (256, 1, 1)
 0x0328  SHARED_MEM_SIZE：第一版填 0
 0x0330  DISPATCH：写 1，提交本次配置
 ```
 
-`KERNEL_ADDR`、`KERNEL_ARGS` 保存用户 GPU 地址，两个高位寄存器均须为零。描述对象由 CP 读取，执行器使用传入的代码入口和真实参数地址，不再解析描述对象或参数窗口。
+`KERNEL_ADDR`、`KERNEL_ARGS` 保存用户 GPU 地址：开启 GPUVM 时高位寄存器保存 GPUVA 的位 47..32，关闭时为零。描述对象由 CP 读取，执行器使用传入的代码入口和真实参数地址，不再解析描述对象或参数窗口。
 
 所有寄存器采用对齐的 32 位小端访问。CP 在空闲时分高、低两次填写 64 位地址，全部配置写完并保证顺序后才写 `DISPATCH`；设备在提交时统一保存本次配置。这里不要求将两个地址寄存器合成一次 64 位原子写入。
 
@@ -2491,7 +2492,7 @@ CP_HQD_ACTIVE
 
 故障队列按[第 7.2.2 节](#spec-queue-error-stop-scope)清除 `ACTIVE` 并保留占用；`ACTIVE = 0` 不单独代表在途访问已经结束。正常卸载按[第 7.4 节](#spec-unmap-drain)由 Host 先排空，CP 开始卸载时清除 `ACTIVE` 并关闭 Doorbell 使能。`CP_HQD_VMID` 在管理队列填 `0`，用户队列填 `1` 或 `2`；`CP_HQD_AQL_CONTROL` 的整个寄存器填 `0` 表示非 AQL 管理队列，填 `1` 表示用户 AQL 队列，其余值暂不支持。
 
-四组地址均保留 64 位寄存器槽，高 32 位为零。MQD 始终是 GPU 物理地址；Ring 和 R/W 地址按管理域或用户域解释：
+四组地址均保留 64 位寄存器槽。MQD 始终是 GPU 物理地址，高 32 位为零；Ring 和 R/W 地址按管理域或用户域解释，用户队列开启 GPUVM 时保存 48 位 GPUVA：
 
 ```text
 低位寄存器：地址的低 32 位

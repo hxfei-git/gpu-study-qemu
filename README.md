@@ -8,7 +8,7 @@
 | CPU | Central Processing Unit | 中央处理器 |
 | CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
 | ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
-| RV32 / RV64 | 32 / 64-bit RISC-V | 计算执行器／原生 CP 使用的 RISC-V 位宽 |
+| RV64 | 64-bit RISC-V | 原生 CP 与计算执行器使用的 RISC-V 位宽 |
 | GPUVM | GPU Virtual Memory | GPU 虚拟内存 |
 | GPL | GNU General Public License | GNU 通用公共许可证 |
 | CC BY-SA | Creative Commons Attribution-ShareAlike | 知识共享署名—相同方式共享许可 |
@@ -24,7 +24,7 @@
 
 ## 2. 一次计算经过的代码
 
-实验中的 Host 是 ARM64/A57 Linux 客体，应用和驱动运行在其中。设备在另一个 `qemu-system-riscv64 -machine gpgpu-cp` 进程中，由 RV64 CP 执行裸机固件，再把应用 Kernel 交给 RV32 解释器。从应用到设备的五层调用、各层入口和共享协议头见[软件栈第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)。
+实验中的 Host 是 ARM64/A57 Linux 客体，应用和驱动运行在其中。设备在另一个 `qemu-system-riscv64 -machine gpgpu-cp` 进程中，由 RV64 CP 执行裸机固件，再把应用 Kernel 交给 RV64 解释器。从应用到设备的五层调用、各层入口和共享协议头见[软件栈第 0 节](<./software/gpgpu/README.md#0-代码结构与分层>)。
 
 ## 3. 配置、构建与运行
 
@@ -35,7 +35,7 @@
 - [实验进度](<./docs/实验进度.md>)、[四阶段实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)
 - [CP/MEC 第一版规格](<./docs/CP_MEC 第一版规格.md>)、[GPUVM 第一版规格](<./docs/GPUVM 第一版规格.md>)
 - [第三阶段规格评审](<./docs/第三阶段规格评审.md>)：与 AMD 的关键差异、缺陷和改进草案
-- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V4.md>)
+- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V5.md>)
 - [软件栈说明](<./software/gpgpu/README.md>)
 - 历史参考，按各自注明的版本阅读：[GPGPU 适配笔记](<./docs/GPGPU_适配.html>)、[CP/MEC 软件实现、参考与扩展](<./docs/历史/CP_MEC 软件实现、参考与扩展.md>)、[旧设备说明](<./docs/历史/gpgpu.rst>)
 

@@ -23,7 +23,7 @@
 | HIQ    | HSA Interface Queue                                    | HSA 接口队列                                     |
 | IB     | Indirect Buffer                                        | 间接命令缓冲区；第一版不引入                     |
 | CPU    | Central Processing Unit                                | 中央处理器                                       |
-| RV32   | 32-bit RISC-V                                          | 本实验计算解释器使用的 32 位 RISC-V 模型         |
+| RV32   | 32-bit RISC-V                                          | 协议版本 5 之前计算解释器使用的 32 位模型        |
 | RV64   | 64-bit RISC-V                                          | 本实验原生 CP 使用的 64 位 RISC-V 模型           |
 | PCI    | Peripheral Component Interconnect                      | 外设互连总线                                     |
 | BAR    | Base Address Register                                  | PCI 基址寄存器；用于描述设备资源窗口             |
@@ -144,12 +144,12 @@ Host 装载 CP 固件，建立首次 KIQ
 
 ### 2.3 第三阶段：统一访存、CSR 启动信息与固定存储
 
-当前软件栈统一采用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 与 Signal/IH，计算执行器继续运行 RV32 Kernel。设备属性 `gpuvm=on/off` 决定用户访存是否翻译，默认开启。固定存储、两个用户 Queue 名额和正常资源保护继续保留，当前验证只运行三个既有计算示例。
+当前软件栈统一采用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 与 Signal/IH，计算执行器运行 RV64 Kernel。设备属性 `gpuvm=on/off` 决定用户访存是否翻译，默认开启。固定存储、两个用户 Queue 名额和正常资源保护继续保留，当前验证只运行三个既有计算示例。
 
 ```text
-应用创建并绑定全部对象
+打开设备时库创建通知页 → 应用创建并绑定对象
   → 创建 Queue → 发布 AQL → 写 Doorbell
-  → CP 读取描述符并派发 RV32 Kernel
+  → CP 读取描述符并派发 RV64 Kernel
   → CSR 读取线程坐标，a0 读取真实参数地址
   → GPUVM 翻译或物理地址直通
   → 公共物理入口：VRAM / Outbound → Host IOVA → PCIe DMA
@@ -165,15 +165,15 @@ GPU 物理空间分为 `[0, vram_size)` 的 VRAM、`[vram_size, 0x8000_0000)` �
 
 #### 2.3.2 DRM/GEM 与独立绑定引用
 
-两种状态都只开放 DRM render node。应用对象提供 `cpu` 与 `gpu_address`；MAP 返回最终设备地址，两种状态都建立绑定引用。开启 GPUVM 时，三级 4 KiB 页表继续生效，TLB 为 64 组 × 4 路组相联，修改映射后按 VMID 或对象的 VPN 范围同步失效；可分配区间统一为 `[0x1000, 0xffff_f000)`；关闭时不创建页表，非零固定 GPUVA 请求不支持。
+两种状态都只开放 DRM render node。应用对象提供 `cpu` 与 `gpu_address`；MAP 返回最终设备地址，两种状态都建立绑定引用。开启 GPUVM 时，GPUVA 有效 48 位，使用四级 4 KiB 页表，TLB 为 64 组 × 4 路组相联，修改映射后按 VMID 或对象的 VPN 范围同步失效；可分配区间为 `[0x1000, 0x1_0000_0000_0000)`，用户库以对象在本进程中的 CPU 地址作 GPUVA，每个进程的通知页也由库在打开设备时创建；关闭时不创建页表，非零固定 GPUVA 请求不支持。GPU 物理地址仍为 32 位。
 
-Queue 存活期间冻结绑定。关闭 GEM handle、解除 GPU 绑定和结束 CPU mmap 分别处理，最后引用结束后才回收存储；管理完成结果未知或访问未确认结束时继续保留。关闭 GPUVM 后共享物理空间，不提供进程页权限隔离，也不增加进程独占限制。
+Queue 存活期间可以绑定和解绑对象，Ring、进度对象和通知页除外。关闭 GEM handle、解除 GPU 绑定和结束 CPU mmap 分别处理，最后引用结束后才回收存储；管理完成结果未知或访问未确认结束时继续保留。关闭 GPUVM 后共享物理空间，不提供进程页权限隔离，也不增加进程独占限制。
 
 #### 2.3.3 CSR 启动信息与真实参数地址
 
 每 Warp 保存 Block 编号、Block 尺寸与 Grid 中 Block 数量，每 Lane 保存线程坐标。新 Warp 创建时初始化，分段继续执行时保留；通过 `0xCC0～0xCCB` 的只读 CSR 读取，`mhartid` 保留 `0xF14`。只支持 `CSRRS` 且 `rs1=x0` 的读取，未知 CSR 和写入请求返回指令错误。
 
-`a0=kernarg_address`，不再设置参数窗口。控制页与参数窗口的保留规则删除；GPUVM 开启时 `0x8000_0000` 和 `0x9000_0000` 都可正常映射。16 字节描述符的最后字段保存 Kernel ABI 版本（当前为 4），AQL 仍为 64 字节，设备／固件、DRM 与 GPUVM 协议同步升级，拒绝旧组件。
+`a0=kernarg_address`，不再设置参数窗口。控制页与参数窗口的保留规则删除；GPUVM 开启时 `0x8000_0000` 和 `0x9000_0000` 都可正常映射。24 字节描述符保存 64 位代码入口和 Kernel ABI 版本（当前为 5），参数块每项 8 字节，AQL 仍为 64 字节，设备／固件、DRM 与 GPUVM 协议同步升级，拒绝旧组件。
 
 #### 2.3.4 公共队列组件与旧代码清理
 
@@ -207,7 +207,7 @@ Queue 存活期间冻结绑定。关闭 GEM handle、解除 GPU 绑定和结束 
 
 <a id="gpuvm-advanced-extension"></a>
 
-GPUVM 动态管理不作为第三阶段验收内容。TTM 接入、存储迁移和驱逐用于管理多个存储位置；换页与按需补页需要额外的存储后备、故障处理和继续执行协议；运行中或异步更新需要安排旧访问及后续任务依赖。VMID 超额轮换、别名与部分撤销、跨进程共享和更细的通知权限也按实际需求后续评估。本期分别用固定存储、提前分配、Queue 存活期间冻结映射和资源不足时明确失败来限制范围，不预先设计这些扩展的完整接口。
+GPUVM 动态管理不作为第三阶段验收内容。TTM 接入、存储迁移和驱逐用于管理多个存储位置；换页与按需补页需要额外的存储后备、故障处理和继续执行协议；运行中或异步更新需要安排旧访问及后续任务依赖。VMID 超额轮换、别名与部分撤销、跨进程共享和更细的通知权限也按实际需求后续评估。本期分别用固定存储、提前分配、由应用确认对象寿命和资源不足时明确失败来限制范围，不预先设计这些扩展的完整接口。
 
 <a id="rocr-runtime-extension"></a>
 
