@@ -8,6 +8,7 @@
  *   3. 逐元素比较。
  * 任一比较、提交、等待或资源回收失败，程序返回非零。
  */
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -283,6 +284,12 @@ static int lifecycle_demo(GpgpuKmtContext *ctx)
 	args[1] = y->gpu_address;
 	args[2] = z->gpu_address;
 	args[3] = count;
+	/*
+	 * GPUVM 开启时这些地址就是数组在本进程中的 CPU 地址，可据此
+	 * 核对高位 GPUVA 的翻译；关闭时是 GPU 物理地址。
+	 */
+	printf("lifecycle GPU addresses: X=0x%016" PRIx64 " Y=0x%016" PRIx64
+	       " Z=0x%016" PRIx64 "\n", args[0], args[1], args[2]);
 
 	/* 2. 第一次派发建立队列。 */
 	if (check(gpgpu_rt_dispatch(rt, &kernel, args, 4, grid, block, DEMO_TIMEOUT_MS), "派发") ||
