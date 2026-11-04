@@ -446,7 +446,7 @@ CP 取得 kernel_object：64 位无符号地址，数值为 0x4000
 
 校验失败就拒绝该次访问，不截断地址、不自动调整地址。访存过程中发生的失败交给错误协议处理，不承诺撤销已经发生的写入。用户 VMID 为 1、2；开启 GPUVM 时按页表隔离，关闭时共享物理空间；访存失败按[第 2.1.1 节](#spec-memory-access-context)关联当前队列并停止相应取包，具体错误码、通知及失败收尾已按第 7 节和 9.6 确认。
 
-**[BOUNDARY]** 这些是教学设备的接口约定，不套用 AMD 的完整对象布局。MQD 布局已在 9.2.1 确认，见[第 2.6 节](#spec-mqd-format)；管理命令布局已在 9.3.2 确认，见[第 4.1 节](#spec-management-packet-format)。进度值采用[第 5.2.1 节](#spec-ring-progress)确定的 32 位包编号；Kernel 描述对象、参数布局和启动接口按版本 3 更新，见[第 6.2 节](#spec-kernel-descriptor)；Signal 的 24 字节布局及通知、等待协议已按[9.5.4](#spec-signal-completion-protocol)确定，见[第 2.5.2 节](#spec-signal-layout)和[第 2.5.3 节](#spec-signal-notify-wait)。
+**[BOUNDARY]** 这些是教学设备的接口约定，不套用 AMD 的完整对象布局。MQD 布局已在 9.2.1 确认，见[第 2.6 节](#spec-mqd-format)；管理命令布局已在 9.3.2 确认，见[第 4.1 节](#spec-management-packet-format)。进度值采用[第 5.2.1 节](#spec-ring-progress)确定的 32 位包编号；Kernel 描述对象、参数布局和启动接口按当前协议定义，见[第 6.2 节](#spec-kernel-descriptor)；Signal 的 24 字节布局及通知、等待协议已按[9.5.4](#spec-signal-completion-protocol)确定，见[第 2.5.2 节](#spec-signal-layout)和[第 2.5.3 节](#spec-signal-notify-wait)。
 
 <a id="spec-signal-representation"></a>
 
@@ -1543,7 +1543,7 @@ setup：
 
 三个对象引用都必须有效：`kernel_object`、`kernarg_address`、`completion_signal` 分别保存描述对象、参数块和 Signal 的用户 GPU 地址。第一版每个任务都提供独立的完成 Signal，不采用省略完成 Signal 的提交方式。对象的位宽、对齐、计算溢出和完整访问范围按[第 2.4.2 节](#spec-address-validation)检查，描述对象、参数长度和向量加法参数布局见[第 6.2 节](#spec-kernel-descriptor)，Signal 的 24 字节布局见[第 2.5.2 节](#spec-signal-layout)。
 
-> **[SPEC]** [HSA System Architecture 1.2](https://hsafoundation.com/wp-content/uploads/2021/02/HSA-SysArch-1.2.pdf)，**2018-05-02**，§2.9.1、表 2–4，原文第 25 页规定 Header 位域；§2.9.6、表 2–7，原文第 29 页规定 64 字节 Kernel Dispatch 布局。标准中的 `completion_signal` 是 Signal 句柄，本实验采用物理地址引用；布局沿用标准，不能据此认定完整 HSA 兼容。运行时字段定义与枚举见[包格式参考](<./历史/CP_MEC 软件实现、参考与扩展.md#dispatch-packet-reference>)。
+> **[SPEC]** [HSA System Architecture 1.2](https://hsafoundation.com/wp-content/uploads/2021/02/HSA-SysArch-1.2.pdf)，**2018-05-02**，§2.9.1、表 2–4，原文第 25 页规定 Header 位域；§2.9.6、表 2–7，原文第 29 页规定 64 字节 Kernel Dispatch 布局。标准中的 `completion_signal` 是 Signal 句柄，本实验在该字段中直接保存 Signal 的用户 GPU 地址；布局沿用标准，不能据此认定完整 HSA 兼容。运行时字段定义与枚举见[包格式参考](<./历史/CP_MEC 软件实现、参考与扩展.md#dispatch-packet-reference>)。
 
 #### 6.1.2 从线程数量换算工作组数量
 
@@ -2626,7 +2626,7 @@ Host 驱动用锁保护“选槽—访问窗口”，写入选择值后先回读
 
 ## 9. 软件接口约定与确认记录
 
-**[BOUNDARY] 历史确认记录。** 本节保留 2026-10-17～2026-10-19 的原始方案与“尚待实现”表述。这里的 VMID 0、Host 物理地址、旧参数窗口、同步回归及调用方提交职责只说明当时版本；当前版本 3 以第 1～8 节及[GPUVM 规格](<./GPUVM 第一版规格.md>)为准，不按本节旧约定恢复兼容实现。
+**[BOUNDARY] 历史确认记录。** 本节保留 2026-10-17～2026-10-19 的原始方案与“尚待实现”表述。这里的 VMID 0、Host 物理地址、旧参数窗口、同步回归及调用方提交职责只说明当时版本；当前实现以第 1～8 节及[GPUVM 规格](<./GPUVM 第一版规格.md>)为准，不按本节旧约定恢复兼容实现。
 
 确认日期与范围归并如下，具体约定仍在对应编号下保存，不再另抄摘要：
 

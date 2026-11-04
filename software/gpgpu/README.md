@@ -237,7 +237,7 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-下列结果对应协议版本 5。设备模型与 CP 固件的执行逻辑自提交 `e2db1a2`（版本号升为 5）起没有改动。本轮修正了 MAP 表页不足、卸载被 CP 明确拒绝、COPY 未启动时的计数（[第三阶段规格评审](<../../docs/第三阶段规格评审.md#review-index>) D1、D4、D5），以及建队列失败后的资源回收，并将 VRAM 清零分段以允许调度。版本 5 首次验证的记录在 `build/gpgpu-validation/protocol-v5/`，本轮最终记录在 `build/gpgpu-validation/d1-d4-d5-final/`，都不会被下一次运行覆盖：
+下列全栈与失败路径结果对应提交 `ec9a9c0`、协议版本 5，包括 MAP 表页不足、队列映射与卸载被明确拒绝、COPY 未启动时的资源收尾，以及 VRAM 分段清零。设备模型与 CP 固件的执行逻辑仍与 `e2db1a2` 相同。版本 5 首次验证记录在 `build/gpgpu-validation/protocol-v5/`，`ec9a9c0` 的最终记录在 `build/gpgpu-validation/d1-d4-d5-final/`，都不会被下一次运行覆盖：
 
 - QTest 13/13 与基础环境引导回归 6/6 在与提交 `e2db1a2` 相同的代码上运行。之后的行为改动只涉及示例程序、驱动和用户库，这两个入口不执行这些代码，没有重跑；共享协议头仅修改注释，协议值与布局不变。教学汇编器 7/7 在 `dca7909` 上重跑。修正后的驱动另用宿主机交叉编译器以 `W=1` 编译，无警告；用户库与示例以 `-Wall -Wextra -Werror` 构建通过。
 - Linux 全栈复用 `6.18.57-0-gpgpu-virt` 开发环境，驱动模块与用户库在客体中按修正后的源码重编。GPUVM 开、关都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003，客体退出码为 0；示例输出 `GPGPU DRM ABI=5`，GPUVM 状态和客体内核日志检查通过。

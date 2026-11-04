@@ -186,6 +186,8 @@ Queue B → VMID 2 → 页表 B
 
 两个进程各有自己的 CPU 地址空间，同一个地址数值可以分别指向 X_A 和 X_B。两个 Kernel 都读取 `0x0000_ffff_8a40_0000`，设备根据所属 VMID 选择不同页表。填写其他进程使用过的地址数值，仍然只能查询当前 VM 的映射。
 
+<a id="gpuvm-page-table"></a>
+
 ### 3.2 一次请求怎样找到目标页
 
 设备已拿到 VMID、GPUVA、长度和访问类型，接下来查找允许访问的实际存储：
@@ -214,6 +216,20 @@ Queue B → VMID 2 → 页表 B
 ```
 
 例如 `0x0000_ffff_8a40_2000` 的四个索引依次为 `0x1ff`、`0x1fe`、`0x52`、`0x2`，页内偏移为 0。首次建立这条路径需要四张表，共 16 KiB；同一 2 MiB 区段内的页复用已有叶页表。四级、每级 9 位与 AMD 9.4.3 的 48 位 VA 划分相同，见下方证据。
+
+表页属于会话的 VM，不随单个对象解绑而归还。以上述地址所在的 2 MiB 区段为例：
+
+```text
+该区段的对象全部 UNMAP
+  → 清除叶子 PTE；VM 占有 VMID 时完成范围失效
+  → 空 L3 叶表和上级目录仍由 VM 保留
+  → 会话内再次 MAP 该区段时复用表页
+会话安全清理 → 统一归还全部表页
+```
+
+因此表页占用取决于 VM 曾经触及的地址区段，不只取决于当前有效映射；空表也会继续占用与 BO 共用的 VRAM 池。是否引入回收的范围约定见[大纲的空表回收边界](<./QEMU GPGPU 实验大纲.md#page-table-reclaim-extension>)。
+
+> **[SOURCE]** 本仓库 `ec9a9c0`：UNMAP 只清叶子项并结束绑定，见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1) [第 331～364 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1)；表页统一归还见[第 508～519 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:508:1)。
 
 目录项保存 bit 0 `VALID`、bit 1 `SYSTEM` 和下一级表的地址域。叶子项在此基础上再保存 bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`。GPU 物理地址仍为 32 位，地址域为 `[31:12]`，掩码为 `0xffff_f000`；bit 2、bit 63..32 及其余未定义位保留，有效项中出现即报页表错误。
 
@@ -514,7 +530,7 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
   → 独立 IRQ_ERROR 通知 Host，不再依靠故障 IH Ring
 ```
 
-可归属单条用户队列的错误停止源队列，保留绑定；另一进程的健康队列继续运行。管理、固件或共享通道故障沿用第二阶段停止范围。页表更新失败则将受影响 VM 置为不可继续使用，直到安全清理。
+可归属单条用户队列的错误停止源队列，保留绑定；另一进程的健康队列继续运行。管理、固件或共享通道故障沿用第二阶段停止范围。失效请求被拒绝或 ACK 不符时，受影响 VM 不再继续使用，直到安全清理；表页分配不足按[第 8.2 节](#gpuvm-device-host-interface)处理。
 
 > **[SOURCE]** 固定 Linux 源码：[gmc_v9_0.c，第 562～565 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L562-L565)从中断记录恢复故障地址；[第 633～679 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L633-L679)读取访问状态，并区分页表遍历、权限及映射错误。本设备借鉴诊断内容，队列停止及资源保留仍按自己的 CP/IH 协议处理。
 
@@ -554,7 +570,7 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
 
 ### 8.1 设备增加上下文、失效和故障入口
 
-用户 VMID 1、2 各自保存页表根和使能状态；管理队列编号为 0；访问域由 CP 显式传递，不按编号推断。关闭 GPUVM 时用户编号仍保留，但不启用这些页表上下文。地址范围和层数固定。共享失效入口提供目标 VMID、忙、ACK 和错误状态。CP 窗口及执行器增加地址域或 VMID，故障入口按源 HQD 保存首次错误信息。
+用户 VMID 1、2 各自保存页表根和使能状态；管理队列编号为 0；访问域由 CP 显式传递，不按编号推断。关闭 GPUVM 时用户编号仍保留，但不启用这些页表上下文。地址范围和层数固定。共享失效入口提供目标 VMID、ACK 和错误状态。CP 窗口及执行器增加地址域或 VMID，故障入口按源 HQD 保存首次错误信息。
 
 页表根与失效寄存器由 Host 驱动独占，应用不能映射管理寄存器或整个 VRAM BAR。上下文禁用时才能改根，先写完整配置、发布并清旧翻译，再启用。失效请求在写入时同步完成，没有忙状态；所选上下文有激活的队列时照常完成。
 
@@ -632,7 +648,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数�
 
 - **完成与退出：** 保留 Signal/IH，通知页由用户态在打开设备时创建并登记；用户访问故障停止源队列并错误退出，不恢复或重放；访问、通知和失效都结束后才能回收和复用。
 
-以上取舍已用于本版实现。更多页表形式、迁移框架、运行中更新和故障恢复移出本期；后续若需改变接口或约束，先说明原因和影响。
+以上取舍已用于本版实现。更多页表形式、迁移框架、异步页表更新和故障恢复移出本期；后续若需改变接口或约束，先说明原因和影响。
 
 ### 9.2 明确留到后续的能力
 
@@ -642,8 +658,6 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数�
 
 ### 9.3 当前核心计算与历史验收
 
-当前唯一计算验证入口为 `test-gpgpu-stack`。固定 ARM virt、A57、1 GiB 客体内存和 `IOMMU=none`，在 `gpuvm=on`、`gpuvm=off` 下分别执行同一组现有计算：向量加法 17,003 个结果、19×17 与 17×23 矩阵乘法的 437 个结果、ReLU 513 个结果。保持原逐元素比较规则，任一计算失败返回非零退出码。
+当前计算、队列存活期间的对象释放与重建，以及失败路径核对的入口和实际结果，统一见[软件栈第 5 节](<../software/gpgpu/README.md#build-and-validation>)。本规格维护这些操作应满足的接口与寿命约定，不另列用例数量和环境矩阵。
 
-代码、描述对象和数组放 VRAM；参数、Ring、进度、Signal 等 Host 对象经 Outbound 访问。所有对象先绑定再创建 Queue，正常结束按排空、销毁 Queue、事件清理、解绑和释放的顺序执行。
-
-2026-10-19 的多进程隔离、边界、故障注入和生命周期验收保留为[历史记录](<../software/gpgpu/README.md#stage-three-validation>)。相应专项测试与旧组合回归已从当前入口移除，本轮不新增 CSR、Outbound、协议或生命周期专项验收，不扩展数据规模或存储位置组合。
+第三阶段早期的多进程隔离、边界与故障注入验收保留为[历史记录](<../software/gpgpu/README.md#stage-three-validation>)，按各自固定版本阅读，不代替当前代码的验证结果。

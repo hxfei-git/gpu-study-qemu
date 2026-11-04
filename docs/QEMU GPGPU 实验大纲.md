@@ -24,7 +24,7 @@
 | IB     | Indirect Buffer                                        | 间接命令缓冲区；第一版不引入                     |
 | CPU    | Central Processing Unit                                | 中央处理器                                       |
 | RV32   | 32-bit RISC-V                                          | 协议版本 5 之前计算解释器使用的 32 位模型        |
-| RV64   | 64-bit RISC-V                                          | 本实验原生 CP 使用的 64 位 RISC-V 模型           |
+| RV64   | 64-bit RISC-V                                          | 本实验原生 CP 与计算执行器使用的 64 位 RISC-V 模型 |
 | PCI    | Peripheral Component Interconnect                      | 外设互连总线                                     |
 | BAR    | Base Address Register                                  | PCI 基址寄存器；用于描述设备资源窗口             |
 | VRAM   | Video RAM                                              | 设备显存                                         |
@@ -58,6 +58,7 @@
 
 - [CP/MEC 第一版规格](<./CP_MEC 第一版规格.md#spec-overview>)规定队列、派发、完成与错误处理；[GPUVM 第一版规格](<./GPUVM 第一版规格.md>)规定地址翻译、对象绑定和回收。
 - [GPGPU 硬件手册](<./GPGPU_硬件手册.html>)按硬件模块组织寄存器、位域、访问权限和复位值。
+- [第三阶段规格评审](<./第三阶段规格评审.md>)讲解当前实现、与 AMD 的差异及剩余改进草案；[待确认索引](<./第三阶段规格评审.md#review-index>)不再列已结项内容，确认后的范围与边界由对应规格和本大纲维护。
 - [CP/MEC 软件实现、参考与扩展（历史）](<./历史/CP_MEC 软件实现、参考与扩展.md>)保留旧实现分析、图示和 AMD/gem5 参考；查阅时按各段固定提交理解，不据此恢复已删除的接口。
 - 规格确认过程只保留在 [CP/MEC 规格第 9 节](<./CP_MEC 第一版规格.md#spec-open-interfaces>)。原课程资料见[讲义](<./课程资料/QEMU_2026_讲义.html>)与[实验](<./课程资料/QEMU_2026_实验.html>)，按课程当时版本阅读。
 
@@ -144,7 +145,7 @@ Host 装载 CP 固件，建立首次 KIQ
 
 ### 2.3 第三阶段：统一访存、CSR 启动信息与固定存储
 
-当前软件栈统一采用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 与 Signal/IH，计算执行器运行 RV64 Kernel。设备属性 `gpuvm=on/off` 决定用户访存是否翻译，默认开启。固定存储、两个用户 Queue 名额和正常资源保护继续保留，当前验证只运行三个既有计算示例。
+当前软件栈统一采用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 与 Signal/IH，计算执行器运行 RV64 Kernel。设备属性 `gpuvm=on/off` 决定用户访存是否翻译，默认开启。固定存储、两个用户 Queue 名额和正常资源保护继续保留；当前计算与生命周期验证的入口、结果见[软件栈第 5 节](<../software/gpgpu/README.md#build-and-validation>)。
 
 ```text
 打开设备时库创建通知页 → 应用创建并绑定对象
@@ -183,13 +184,11 @@ Queue 存活期间可以绑定和解绑对象，Ring、进度对象和通知页�
 
 <a id="stage-three-acceptance"></a>
 
-#### 2.3.5 唯一核心计算验证
+#### 2.3.5 核心计算与生命周期验证
 
-使用 `make -f Makefile.gpgpu test-gpgpu-stack`，固定 ARM virt、A57、1 GiB、IOMMU=none，分别运行 `gpuvm=on` 和 `gpuvm=off`。两种状态采用同一流程与放置方式：代码、描述符和数组在 VRAM，参数和队列相关 Host 对象经 Outbound 访问。
+核心结果是两种 GPUVM 状态下的计算比较正确，同一队列存活期间释放、重新分配数据对象后仍能继续派发，正常关闭完成资源回收。沿用既有示例和比较规则，不在大纲中固定用例数量或重复维护测试矩阵。
 
-向量加法、矩阵乘法和 ReLU 沿用既有规模与逐元素比较规则，任一失败返回非零。示例规模、运行命令与实际结果见[软件栈说明](<../software/gpgpu/README.md#build-and-validation>)。
-
-本轮不增加 CSR、Outbound、协议或生命周期专项验收，不扩展多进程、IOMMU、存储位置或数据规模矩阵。SMMUv3 功能保留。
+构建、运行命令、环境配置、失败路径核对及实际结果统一见[软件栈第 5 节](<../software/gpgpu/README.md#build-and-validation>)。SMMUv3 功能保留，其验证范围以该节记录为准。
 
 #### 2.3.6 历史成果与后续边界
 
@@ -207,7 +206,11 @@ Queue 存活期间可以绑定和解绑对象，Ring、进度对象和通知页�
 
 <a id="gpuvm-advanced-extension"></a>
 
-GPUVM 动态管理不作为第三阶段验收内容。TTM 接入、存储迁移和驱逐用于管理多个存储位置；换页与按需补页需要额外的存储后备、故障处理和继续执行协议；运行中或异步更新需要安排旧访问及后续任务依赖。VMID 超额轮换、别名与部分撤销、跨进程共享和更细的通知权限也按实际需求后续评估。本期分别用固定存储、提前分配、由应用确认对象寿命和资源不足时明确失败来限制范围，不预先设计这些扩展的完整接口。
+GPUVM 的存储迁移、按需驻留等动态管理不作为第三阶段验收内容。TTM 接入、存储迁移和驱逐用于管理多个存储位置；换页与按需补页需要额外的存储后备、故障处理和继续执行协议；异步页表更新需要安排旧访问及后续任务依赖。队列存活期间的同步映射更新属于现行能力，不再列为后续扩展。VMID 超额轮换、别名与部分撤销、跨进程共享和更细的通知权限也按实际需求后续评估。当前分别用固定存储、提前分配、由应用确认对象寿命和资源不足时明确失败来限制范围，不预先设计这些扩展的完整接口。
+
+<a id="page-table-reclaim-extension"></a>
+
+空表回收（原评审 D2）保持暂缓，不作为当前待确认项或第四阶段的必做前置任务。表页现行寿命见 [GPUVM 规格第 3.2 节](<./GPUVM 第一版规格.md#gpuvm-page-table>)；出现长期运行、GPUVA 持续分散且表页明显挤占对象空间的负载时，再评估空表回收或表页配额。该决定不把资源不足视为 VM 永久失效，也不改变现有 MAP 的失败收尾。
 
 <a id="rocr-runtime-extension"></a>
 
