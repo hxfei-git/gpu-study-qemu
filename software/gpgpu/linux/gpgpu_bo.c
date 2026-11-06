@@ -148,10 +148,10 @@ static bool bo_args_valid(const struct gpgpu_bo_create *args)
 		is_power_of_2(args->alignment) && args->alignment <= GPGPU_QUEUE_RING_MAX;
 }
 
-/* 分配存储：长度取页对齐与对齐要求中较大者，并向上取 2 的幂以满足对齐。 */
+/* 请求长度至少覆盖对象与对齐要求，底层分配器负责内部取整。 */
 static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
 {
-	u64 size = roundup_pow_of_two(max_t(u64, bo->mapped_size, alignment));
+	u64 size = max_t(u64, bo->mapped_size, alignment);
 	int ret;
 
 	if (bo->kind == GPGPU_MEMORY_HOST) {
