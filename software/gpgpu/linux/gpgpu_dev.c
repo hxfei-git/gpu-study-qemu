@@ -14,6 +14,10 @@
  * 等跨进程访问结束后整体复位设备，最后回收 orphan 会话。整体复位会先
  * 回写并清空 dcache，确认停止后释放存储不再需要维护。
  *
+ * 运行中恢复（gpgpu_device_recover）：让旧会话失效、旧等待失败，等
+ * ioctl 退出后整体复位设备；确认停止才回收旧任务保留的资源，再按启动
+ * 顺序重新建立 KIQ、HIQ。旧任务不保存现场，也不续跑。
+ *
  * 存储归还：Host DMA 内存和 VRAM 块归还前都经 gpgpu_storage_release_ok()
  * 回写并失效 dcache 中的旧行；不能确认时不归还，Host 内存转入
  * dev->retired，VRAM 块转入 dev->reserved_blocks，设备释放时再回收。
@@ -422,7 +426,10 @@ int gpgpu_device_start(struct gpgpu_device *dev)
 /*
  * gpgpu_reset_hardware() - 保持 CP 复位后整体复位设备
  *
- * 跨进程 DMA 可能仍在途，设备会拒绝复位；在超时前反复尝试。
+ * 跨进程 DMA 可能仍在途，设备会拒绝复位；在超时前反复尝试。设备只在
+ * 复位的全部步骤（含 dcache 回写）完成后才把 GLOBAL_CTRL 清零，所以每次
+ * 复位前先写 ENABLE，读回 0 说明的是本次复位成功，不会把上一次复位
+ * 留下的 0 当成本次结果。
  *
  * Return: 确认 CP 保持复位、设备与 Outbound 均已复位且无在途访问时为 true。
  */
@@ -435,6 +442,7 @@ static bool gpgpu_reset_hardware(struct gpgpu_device *dev)
 	gpgpu_rreg(dev, GPGPU_REG_CP_CTRL);
 	do {
 		if (!(gpgpu_rreg(dev, GPGPU_REG_OUTBOUND_STATUS) & GPGPU_OUTBOUND_BUSY)) {
+			gpgpu_wreg(dev, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
 			gpgpu_wreg(dev, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
 			if ((gpgpu_rreg(dev, GPGPU_REG_CP_CTRL) & GPGPU_CP_RESET_HOLD) &&
 			    !gpgpu_rreg(dev, GPGPU_REG_GLOBAL_CTRL) &&
@@ -445,6 +453,14 @@ static bool gpgpu_reset_hardware(struct gpgpu_device *dev)
 		usleep_range(50, 100);
 	} while (time_before(jiffies, deadline));
 	return false;
+}
+
+/* 等中断处理函数返回，再取消并等待 IH 工作项；调用者不持 dev->lock。 */
+static void gpgpu_sync_irqs(struct gpgpu_device *dev)
+{
+	for (unsigned int i = 0; i < GPGPU_MSIX_VECTORS; i++)
+		synchronize_irq(pci_irq_vector(dev->pdev, i));
+	cancel_work_sync(&dev->ih_work);
 }
 
 /*
@@ -483,11 +499,10 @@ void gpgpu_device_stop(struct gpgpu_device *dev)
 	mutex_unlock(&dev->management_lock);
 
 	/* 3. 等中断上半部与 IH 工作项全部结束。 */
-	for (unsigned int i = 0; i < GPGPU_MSIX_VECTORS; i++)
-		synchronize_irq(pci_irq_vector(dev->pdev, i));
-	cancel_work_sync(&dev->ih_work);
+	gpgpu_sync_irqs(dev);
 
-	/* 4. 设备确认停止才回收 orphan 会话。 */
+	/* 4. 与文件关闭串行，设备确认停止才回收 orphan 会话。 */
+	mutex_lock(&dev->vm_serial);
 	mutex_lock(&dev->lock);
 	dev->stopped = stopped;
 	if (stopped) {
@@ -505,7 +520,167 @@ void gpgpu_device_stop(struct gpgpu_device *dev)
 	}
 	mutex_unlock(&dev->lock);
 
+	mutex_unlock(&dev->vm_serial);
+
 	/* 5. BAR2 即将随 PCI 区域释放，之后不再经它访问 VRAM。 */
 	pci_iounmap(dev->pdev, dev->vram);
 	dev->vram = NULL;
+}
+
+/* ---- 运行中恢复 ---- */
+
+/*
+ * recover_reset() - 串行化寄存器访问后尝试整体复位
+ *
+ * 恢复路径调用，调用者持 vm_serial，不持其他驱动互斥锁。
+ * 1. 依次取设备锁、管理锁与 DMA 锁，阻止 IH 消费及同步访问寄存器；
+ * 2. 尝试整体复位，不能确认时不回收资源；
+ * 3. 逆序释放锁，资源处理交给调用者。
+ *
+ * Return: 已确认设备停止访问时为 true。
+ */
+static bool recover_reset(struct gpgpu_device *dev)
+{
+	bool stopped;
+
+	/* 1. 按锁序排除设备寄存器的其他同步使用者。 */
+	mutex_lock(&dev->lock);
+	mutex_lock(&dev->management_lock);
+	mutex_lock(&dev->dma_lock);
+
+	/* 2. 未确认停止时，调用者继续保留资源。 */
+	stopped = gpgpu_reset_hardware(dev);
+
+	/* 3. 这里只结束互斥，不回收任何对象。 */
+	mutex_unlock(&dev->dma_lock);
+	mutex_unlock(&dev->management_lock);
+	mutex_unlock(&dev->lock);
+	return stopped;
+}
+
+/*
+ * recover_reclaim() - 设备确认复位后，结束旧会话对设备的占用
+ *
+ * gpgpu_device_recover() 第 4 步调用，调用者持 vm_serial 与 dev->lock。设备
+ * 已停止访问内存，复位前的队列、VMID、管理请求和 IH 进度都已失效：
+ *
+ * 1. 放下等待超时的 COPY 为两端对象保留的 users 计数，清除 dma_uncertain；
+ * 2. 旧会话中未卸载的队列已随复位卸载：放下 Ring 与进度的 users 计数并
+ *    标为 dead，状态在恢复第 1 步已置为 FAULTED。各 VM 不再占有 VMID，
+ *    复位前未确认的失效结果也随设备上下文清除；
+ * 3. 暂置 stopped，回收 orphan 会话，它们拆除 VM 时不访问设备。
+ *    vm_serial 挡住了文件关闭，打开新会话也被拒绝，遍历期间链表
+ *    不会被别人修改；
+ * 4. 释放全部管理请求结果区并重置管理 Ring，IH 从编号 0 重新消费。
+ *
+ * 仍有文件的旧会话连同对象、页表和 Doorbell 页保留到文件关闭，不交给新
+ * 会话；对象的 CPU 映射另行保活各自的存储。
+ */
+static void recover_reclaim(struct gpgpu_device *dev)
+{
+	struct gpgpu_fpriv *fpriv, *next;
+	struct gpgpu_queue *q;
+
+	/* 1. 超时 COPY 的两端对象不会再被 DMA 访问。 */
+	if (dev->copy_host) {
+		dev->copy_host->users--;
+		dev->copy_vram->users--;
+		dev->copy_host = NULL;
+		dev->copy_vram = NULL;
+	}
+	dev->dma_uncertain = false;
+
+	/* 2. 复位清空了 HQD 与 VM 上下文。 */
+	list_for_each_entry(fpriv, &dev->fprivs, node) {
+		list_for_each_entry(q, &fpriv->queues, node) {
+			if (q->dead)
+				continue;
+			q->ring->users--;
+			q->progress->users--;
+			q->dead = true;
+			q->uncertain = false;
+		}
+		fpriv->vm.vmid = 0;
+		fpriv->vm.failed = false;
+		fpriv->reset_done = true;
+	}
+	dev->vmids = 0;
+
+	/* 3. probe 仍持有一个设备引用，这里放下会话引用不会释放设备。 */
+	dev->stopped = true;
+	list_for_each_entry_safe(fpriv, next, &dev->fprivs, node) {
+		if (!fpriv->orphan)
+			continue;
+		gpgpu_fpriv_destroy(fpriv);
+		gpgpu_device_put(dev);
+	}
+	dev->stopped = false;
+
+	/* 4. 管理通道与 IH 回到启动前的状态。 */
+	gpgpu_mgmt_reset(dev);
+	dev->ih_rptr = 0;
+}
+
+int gpgpu_device_recover(struct gpgpu_device *dev)
+{
+	struct gpgpu_fpriv *fpriv;
+	bool stopped;
+	int ret = 0;
+
+	/* 1. 拒绝新工作，结束旧等待。 */
+	mutex_lock(&dev->lock);
+	if (!dev->present || dev->recovering) {
+		ret = dev->present ? -EBUSY : -ENODEV;
+		mutex_unlock(&dev->lock);
+		return ret;
+	}
+	dev->recovering = true;
+	WRITE_ONCE(dev->fatal, true);
+	list_for_each_entry(fpriv, &dev->fprivs, node)
+		fpriv->stale = true;
+	gpgpu_fail_queues(dev, NULL, GPGPU_EVENT_ERROR_RESET);
+	mutex_unlock(&dev->lock);
+
+	/* 2. 此后没有 ioctl 或文件关闭与恢复并发。 */
+	mutex_lock(&dev->vm_serial);
+
+	/* 3. 复位确认后，异步代码也不再访问设备。 */
+	stopped = recover_reset(dev);
+	if (!stopped) {
+		ret = -EIO;
+		goto out;
+	}
+	gpgpu_sync_irqs(dev);
+
+	/* 4. 旧任务的保留资源可以回收。 */
+	mutex_lock(&dev->lock);
+	recover_reclaim(dev);
+	WRITE_ONCE(dev->fatal, false);
+	mutex_unlock(&dev->lock);
+
+	/* 5. 重新启动失败时先停住设备，再报告失败。 */
+	gpgpu_wreg(dev, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+	ret = gpgpu_device_start(dev);
+	if (ret) {
+		WRITE_ONCE(dev->fatal, true);
+		stopped = recover_reset(dev);
+		gpgpu_sync_irqs(dev);
+	}
+
+out:
+	/* 6. 解除恢复状态。 */
+	mutex_lock(&dev->lock);
+	if (!stopped)
+		dev->dma_uncertain = true;
+	dev->recovering = false;
+	mutex_unlock(&dev->lock);
+	mutex_unlock(&dev->vm_serial);
+	if (ret) {
+		dev_err(&dev->pdev->dev, "设备恢复失败（%d），%s\n", ret,
+			stopped ? "设备已停止" : "未确认设备停止，保留全部资源");
+		return ret;
+	}
+	schedule_work(&dev->ih_work);
+	dev_info(&dev->pdev->dev, "设备恢复完成\n");
+	return 0;
 }

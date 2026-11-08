@@ -10,7 +10,7 @@
  *   3. 释放锁，轮询结果区的 completion 等于本次序号（不持 dev->lock）
  *   4. 读取 status；结果码超出协议范围视为协议错误
  *   5. 只有确认完成、或从未发布时才回收结果区；已发布但未确认的结果区
- *      永久保留，防止 CP 迟到的写回落到被复用的内存上
+ *      保留到设备释放或恢复，防止 CP 迟到的写回落到被复用的内存上
  */
 #include <linux/delay.h>
 #include <linux/slab.h>
@@ -22,29 +22,25 @@
 #define MGMT_SLOTS (GPGPU_MGMT_BYTES / sizeof(GpgpuManagementPacket))
 
 /*
- * 为 KIQ 或 HIQ 分配 Ring、进度页与 MQD，并填好 MQD。
+ * 把 KIQ 或 HIQ 的 Ring 与进度清零，再填好 MQD。
  *
  * Ring 之后紧跟一页进度：R 在偏移 GPGPU_MGMT_BYTES，W 在其后 8 字节。两条
  * 管理队列使用 Doorbell 第 0 页的入口 0、1（偏移 index * 8）。KIQ 由
  * gpgpu_load_kiq() 经选槽窗口直接写入 HQD，MQD 地址也写进 HQD，IH 记录
  * 据此识别 KIQ；HIQ 的 MQD 在启动第 6 步经 KIQ 的 MAP_QUEUES 交给 CP 装载。
+ *
+ * 设备恢复后再次调用：重新启动的 CP 从 R = 0 取包，进度页若还留着旧 W，
+ * CP 会把旧命令再执行一遍。
  */
-static int mgmt_ring_init(struct gpgpu_device *dev, unsigned int index)
+static void mgmt_ring_setup(struct gpgpu_device *dev, unsigned int index)
 {
 	struct gpgpu_mgmt_ring *mq = &dev->mgmt[index];
-	GpgpuMqd *mqd;
-	int ret;
+	GpgpuMqd *mqd = mq->mqd.cpu;
 
-	ret = gpgpu_dma_buf_alloc(dev, &mq->storage, MGMT_STORAGE_BYTES, 1);
-	if (!ret)
-		ret = gpgpu_dma_buf_alloc(dev, &mq->mqd, sizeof(GpgpuMqd), 1);
-	if (ret)
-		return ret;
-
+	memset(mq->storage.cpu, 0, MGMT_STORAGE_BYTES);
 	mq->rptr = mq->storage.cpu + GPGPU_MGMT_BYTES;
 	mq->wptr = mq->storage.cpu + GPGPU_MGMT_BYTES + 8;
 	mq->doorbell = index * 8;
-	mqd = mq->mqd.cpu;
 	*mqd = (GpgpuMqd) {
 		.ring_base = cpu_to_le64(mq->storage.addr),
 		.rptr_report_addr = cpu_to_le64(mq->storage.addr + GPGPU_MGMT_BYTES),
@@ -52,6 +48,21 @@ static int mgmt_ring_init(struct gpgpu_device *dev, unsigned int index)
 		.pq_control = cpu_to_le32(GPGPU_MGMT_BYTES),
 		.doorbell_control = cpu_to_le32(GPGPU_DOORBELL_ENABLE | mq->doorbell),
 	};
+	WRITE_ONCE(mq->failed, false);
+}
+
+/* 为 KIQ 或 HIQ 分配 Ring、进度页与 MQD，并填好 MQD。 */
+static int mgmt_ring_init(struct gpgpu_device *dev, unsigned int index)
+{
+	struct gpgpu_mgmt_ring *mq = &dev->mgmt[index];
+	int ret;
+
+	ret = gpgpu_dma_buf_alloc(dev, &mq->storage, MGMT_STORAGE_BYTES, 1);
+	if (!ret)
+		ret = gpgpu_dma_buf_alloc(dev, &mq->mqd, sizeof(GpgpuMqd), 1);
+	if (ret)
+		return ret;
+	mgmt_ring_setup(dev, index);
 	return 0;
 }
 
@@ -86,10 +97,21 @@ void gpgpu_mgmt_fini(struct gpgpu_device *dev)
 	}
 }
 
+void gpgpu_mgmt_reset(struct gpgpu_device *dev)
+{
+	struct gpgpu_mgmt_request *req, *next;
+
+	list_for_each_entry_safe(req, next, &dev->requests, node)
+		mgmt_request_free(dev, req);
+	for (unsigned int i = 0; i < ARRAY_SIZE(dev->mgmt); i++)
+		mgmt_ring_setup(dev, i);
+}
+
 /*
  * 第 1 步：分配 16 字节结果区，completion 已由
  * gpgpu_dma_buf_alloc() 清零，status 置为 PENDING。请求挂到
- * dev->requests，未回收的结果区在设备释放时统一归还。调用者持 dev->lock。
+ * dev->requests，未回收的结果区在设备释放或恢复时统一归还。调用者持
+ * dev->lock。
  */
 static struct gpgpu_mgmt_request *mgmt_request_alloc(struct gpgpu_device *dev)
 {
@@ -239,7 +261,8 @@ int gpgpu_mgmt_submit(struct gpgpu_device *dev, unsigned int ring, u32 opcode, u
 	/*
 	 * 5. 重新取 dev->lock。取得合法结果或从未发布时回收结果区。
 	 *    已发布却没确认（超时、通道故障、结果码非法）时保留，
-	 *    CP 迟到的写回仍会落在这块内存上，等设备释放时再归还。
+	 *    CP 迟到的写回仍会落在这块内存上，等设备释放或恢复时
+	 *    再归还。
 	 */
 	mutex_lock(&dev->lock);
 	if (!ret || !*published)

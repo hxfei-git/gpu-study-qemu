@@ -59,6 +59,13 @@ typedef uint64_t gpgpu_u64;
 #define GPGPU_EVENT_NOTIFIED 1U
 /* 源队列或设备发生错误，等待应返回失败。 */
 #define GPGPU_EVENT_FAILED 2U
+/*
+ * 事件因设备恢复被强制终止时的 error 值。不与队列错误编号 GpgpuQueueError
+ * 和设备错误位 GPGPU_ERR_* 重叠。
+ */
+#define GPGPU_EVENT_ERROR_RESET 0x100U
+/* INFO 输出标志：旧会话访问已随复位结束，可清理但不能提交新工作。 */
+#define GPGPU_INFO_SESSION_RESET (1U << 0)
 
 /**
  * struct gpgpu_memory_copy - 按内存对象与对象内偏移提交同步 DMA
@@ -162,7 +169,7 @@ struct gpgpu_va_range {
 /**
  * struct gpgpu_vm_info - GPUVM 能力及当前绑定数量
  * @version: 输入输出接口版本，必须为 GPGPU_DRM_VERSION。
- * @flags: 保留，输入必须为零。
+ * @flags: 输入必须为零；输出 GPGPU_INFO_SESSION_RESET 等会话状态标志。
  * @address_bits: 设备地址的有效位数：GPUVM 开启时为 GPUVA 位数，关闭时
  *                为 GPU 物理地址位数。
  * @page_size: 页大小，单位为字节。

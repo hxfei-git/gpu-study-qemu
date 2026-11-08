@@ -537,4 +537,4 @@ AMDGPU 另有运行期的超时与复位恢复流程：停止设备活动，按�
 >
 > **[SOURCE]** Linux `248951dd`：GPU 恢复入口中的停止活动、复位与恢复调度顺序，见 [amdgpu_device.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c:5874:1) [第 5874～5904 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c:5874:1)。
 
-**取舍。** 当前实现宁可继续占用资源，也不释放设备可能仍在访问的内存。尤其是全局 `dma_uncertain`，会把一次 COPY 超时的影响扩展到所有会话；这条保守边界仍在。运行期的强制中止、复位恢复和恢复后的回收尚未实现，后续范围见[实验大纲的异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**取舍。** 当前实现宁可继续占用资源，也不释放设备可能仍在访问的内存。尤其是全局 `dma_uncertain`，会把一次 COPY 超时的影响扩展到所有会话；这条保守边界仍在。管理员可以请求[整设备中止与复位恢复](<./CP_MEC 第一版规格.md#spec-device-recovery>)，确认旧访问停止后再解除资源保留；不能只清除软件标志。旧任务终止，新连接重新计算，不恢复旧任务现场。

@@ -246,6 +246,29 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
+<a id="device-recovery-validation"></a>
+
+**整设备中止与复位恢复的验证。** 代码基线为 `17a00fd`，加 `dev/device-recovery` 工作树的未提交改动；改动源码的 SHA-256 见本地源码清单。行为约定见 [CP/MEC 规格第 7.5 节](<../../docs/CP_MEC 第一版规格.md#spec-device-recovery>)。实际运行命令如下，最后一条依赖本地保存的一次性核对材料，不是仓库的常驻测试入口：
+
+```sh
+make -f Makefile.gpgpu test-gpgpu-stack
+make -C software/gpgpu BUILD_DIR="$PWD/build/gpgpu-validation/device-recovery/host-stack" all check
+python3 build/gpgpu-validation/device-recovery/directed/run.py "$PWD" on off failure cancel uncertain
+```
+
+- 驱动使用现有交叉工具链以 `W=1` 编译，无警告；用户库和示例以 `-Wall -Wextra -Werror` 构建通过，教学汇编器 7/7。Linux `checkpatch.pl` 对 C 差异报 0 errors、0 warnings，改动头文件的 `kernel-doc -none` 通过。
+- Linux 全栈复用 `6.18.57-0-gpgpu-virt`、A57、1 GiB RAM、IOMMU=none 与双进程设备。GPUVM 开、关均输出 `GPGPU DRM ABI=6`，向量加法、矩阵乘法、ReLU 和生命周期示例两次派发全部比较通过；客体退出码均为 0，内核日志检查通过。组件散列和实际比较数量保存在两种模式的 `result.json`。
+- `on`、`off` 用正式驱动终止运行中的长任务：旧等待失败，事件报告 `GPGPU_EVENT_ERROR_RESET`，Signal 没有被补写为完成，旧会话新建对象返回 `-ECANCELED`。旧队列、事件、运行时和连接能够清理；新连接完成向量加法，空闲时再次恢复后仍能计算。
+- `failure` 在 GPUVM 开启时使用临时驱动桩：丢弃一次 DMA 完成中断制造 COPY 超时，再让第一次恢复直接返回“复位未确认”。恢复返回 `-EIO` 后，超时 COPY 的对象不能解绑，旧队列不能卸载，新连接被拒绝；再次恢复成功后，两端对象与旧连接可以回收，新连接计算正确。
+- `cancel` 在管理请求等待期间恢复设备；`uncertain` 先让建队列请求超时，再注入一次复位未确认。在 `uncertain` 场景中，用户库在复位前及恢复失败后都拒绝关闭结果未知的旧连接，驱动的 INFO 不报告旧访问已结束；再次恢复确认后才输出 `GPGPU_INFO_SESSION_RESET`。两种场景的旧连接最终都能关闭，同一进程重新 Open 后完成向量加法。
+- 五种定向模式均返回 0，客体内核日志检查通过。临时模块的客体编译提示编译器版本与内核构建时不同；9p 共享目录构建还出现时钟偏差提示。构建均完成，上述退出状态与计算比较通过。
+
+现有全栈入口只跑正常计算，不能验证主动终止、未确认时的保留及再次恢复，因此定向程序和注入桩只保存在 `build/`，不增加常驻脚本或测试用例。
+
+> **[SOURCE]** 本地运行记录：[改动源码清单](../../build/gpgpu-validation/device-recovery/source-manifest.json)、[驱动额外警告编译](../../build/gpgpu-validation/device-recovery/module-w1.log)、[用户态构建与汇编器](../../build/gpgpu-validation/device-recovery/userspace-build-check.log)、[风格检查](../../build/gpgpu-validation/device-recovery/style.log)、[全栈输出](../../build/gpgpu-validation/device-recovery/stack-final.log)、[GPUVM 开启结果](../../build/gpgpu-validation/device-recovery/core/on/result.json)、[GPUVM 关闭结果](../../build/gpgpu-validation/device-recovery/core/off/result.json)、[恢复定向输出](../../build/gpgpu-validation/device-recovery/directed/final-run.log)。初版运行记录仍保留在同目录的 `stack.log` 与 `directed/run.log`；`build/` 不纳入 Git。
+
+**[BOUNDARY]** 最终运行需要创建 Unix socket，沙箱内启动被拒绝后在沙箱外运行通过。未重跑 QTest、SMMUv3 或基础环境引导。设备模型和固件没有行为改动，新增的用户接口标志未改变结构体布局。注入桩模拟的是驱动“未确认复位”，没有制造设备后端的真实回写失败，也未注入重新启动时的固件装载或 HIQ 握手失败。设备移除与文件关闭的并发回收修复经过静态复核，未专门做并发运行注入。
+
 **统一访存入口与页缓存属性的验证。** 本轮在提交 `18504d0` 加未提交改动的代码上运行，命令与日志归档在 `build/gpgpu-validation/unified-mem-access/`，不会被下一次运行覆盖：
 
 - `make -f Makefile.gpgpu build` 后运行 `test-gpgpu-qtest`：寄存器 QTest 7/7，CP QTest 12/12。GPUVM 开启的 CP 用例把 Ring、进度、参数和 Signal 映射为 UNCACHED 页，缓存专项用例走 WB 映射。与缓存属性相关的用例各查一件事：

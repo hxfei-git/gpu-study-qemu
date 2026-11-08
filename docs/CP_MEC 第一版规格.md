@@ -30,6 +30,7 @@
 | ALU    | Arithmetic Logic Unit | 算术逻辑单元 |
 | TLB    | Translation Lookaside Buffer | 地址翻译缓存 |
 | API    | Application Programming Interface         | 应用编程接口                                   |
+| ioctl | Input/Output Control | 输入／输出控制调用 |
 | PCIe   | Peripheral Component Interconnect Express | 高速外设互连总线                               |
 | BAR    | Base Address Register                     | PCIe 基址寄存器；描述设备资源窗口              |
 | QEMU   | Quick Emulator                            | 仿真与虚拟化工具                               |
@@ -106,7 +107,7 @@ Host 读回核对 Outbound 布局、使能并确认，准备 KIQ 的 Ring、MQD 
   → 为新 Queue 准备自己的 Ring、MQD 和进度区
 ```
 
-驱动负责准备资源和提交请求，CP 负责判断用户槽位是否空闲并分配；满额时报告失败，驱动将结果返回应用。本版不先创建更多逻辑队列再等待 HQD。仅有 `ACTIVE = 0` 或发出销毁请求，尚不能归还名额；仍需满足既有卸载与资源回收条件。CP 的占用记录、重复请求处理和槽位释放条件见[第 4.2 节](#spec-management-slot-state)，每次管理请求的结果通过[第 4.4 节](#spec-management-result)的独立结果区返回。错误退出与正常卸载按第 7 节执行，强制恢复留作后续扩展；应用创建接口与错误返回见[9.7.3 的已确认接口](#spec-host-queue-create)。
+驱动负责准备资源和提交请求，CP 负责判断用户槽位是否空闲并分配；满额时报告失败，驱动将结果返回应用。本版不先创建更多逻辑队列再等待 HQD。仅有 `ACTIVE = 0` 或发出销毁请求，尚不能归还名额；仍需满足既有卸载与资源回收条件。CP 的占用记录、重复请求处理和槽位释放条件见[第 4.2 节](#spec-management-slot-state)，每次管理请求的结果通过[第 4.4 节](#spec-management-result)的独立结果区返回。错误退出与正常卸载按第 7 节执行，强制恢复见[第 7.5 节](#spec-device-recovery)；应用创建接口与错误返回见[9.7.3 的已确认接口](#spec-host-queue-create)。
 
 HQD 保存状态，CP 读取状态并执行命令，计算执行器执行 Kernel。管理命令与 AQL Packet 直接保存在各自的 Ring 中，本版不引入 IB 间接命令执行，也不建立 IQ 或 EOP 缓冲区。不提供可配置的队列／管线优先级和时间片，也不实现运行中的抢占和计算现场保存；取舍详解见[AMD 寄存器对照](<./历史/CP_MEC 软件实现、参考与扩展.md#amd-registers>)，后期方向见[扩展项](<./历史/CP_MEC 软件实现、参考与扩展.md#extensions>)。
 
@@ -254,7 +255,7 @@ CP 正在处理 Queue A，位于 HQD 槽位 2
 
 **[DESIGN]** 固件在访问前保存所属 HQD 槽位、访问阶段和完整目标地址，访问失败后据此区分“读取 Ring 失败”“写回消费进度失败”等情况。队列归属由槽位确定，访问域和用户 VMID 分别保存。处理 KIQ 或 HIQ 的映射命令时，记录来源管理队列、目标种类和 MQD 地址；CP 选定目标槽位后，再记录该槽位，例如“HIQ 正在为 CP 选定的槽位 2 读取 MQD”。尚未选定目标槽位时，错误仍关联到来源管理队列和本次请求。
 
-普通 Host 访问成功时，同步取得读值或完成写请求；失败时进入原生访存异常，由固件按上述上下文处理。能够归属到用户队列的访问错误，记录到该槽位的 `CP_HQD_ERROR`，并停止这条队列后续取包；CP 可以继续处理 KIQ 和其他正常队列。KIQ 实际通道故障，或 CP 固件代码、栈等访问异常时，停止队列调度并保留相关资源，设备恢复留作后续扩展。
+普通 Host 访问成功时，同步取得读值或完成写请求；失败时进入原生访存异常，由固件按上述上下文处理。能够归属到用户队列的访问错误，记录到该槽位的 `CP_HQD_ERROR`，并停止这条队列后续取包；CP 可以继续处理 KIQ 和其他正常队列。KIQ 实际通道故障，或 CP 固件代码、栈等访问异常时，停止队列调度并保留相关资源，再按[第 7.5 节](#spec-device-recovery)恢复设备。
 
 失败后不自动重新执行整个任务，也不盲目重试完成更新。例如 Kernel 已执行完、Signal 更新失败时，不能重新运行 Kernel。已经发生的写入保留；停止取包后仍须按卸载或恢复协议确认访问结束，才能释放资源。具体错误编码、Host 通知、失败阶段的收尾及恢复步骤见[第 7 节](#spec-errors-unmap)和 9.6。
 
@@ -640,7 +641,7 @@ MQD：64 字节，偏移范围 0x00～0x3f
 
 1. **首次初始化。** 每条存活队列使用独立的 MQD。驱动填写配置，并把 `saved_rptr`、`saved_error` 和保留区清零。从发布映射请求到成功卸载，驱动保持配置字段不变；相关管理操作和卸载收尾完成前，MQD 内存及其物理地址保持有效，不释放或复用。首次启动的 KIQ 由 Host 按同一套配置填写 HQD，再按第 3 节启动 CP。
 2. **装载与激活。** `MAP_QUEUES` 提供目标队列种类和 MQD 物理地址；CP 根据种类确定可用的 HQD 范围，并为用户队列选择空闲槽位，再读取、校验并装入配置，恢复消费位置，最后激活。MQD 不重复保存自身地址，也不保存 `ACTIVE`；两者分别来自管理命令和装载流程。错误队列按[第 7.2.4 节](#spec-queue-error-rebuild)清理后重建；未绑定 MQD 的 `saved_error` 非零时拒绝激活，返回参数非法结果 `status = 4`，重新映射不清错或重放失败任务。
-3. **驻留与卸载保存。** 驻留期间 CP 在 HQD 中维护活动状态，不在每个包完成后更新 MQD。正常卸载前由 Host 排空队列；CP 开始卸载时清除 `ACTIVE`、关闭 Doorbell 使能，确认相关在途访问结束后，只写回 `saved_rptr` 与 `saved_error`，配置字段保持原值。保存失败继续保留槽位占用，能够安全回报时按[第 4.4 节](#spec-management-result)返回结果码 `5`；目标队列尚无错误时记录编号 `10`，已有首次错误时保留原值，见[第 7.2.3 节](#spec-management-error-separation)。异常退出按[第 7.3 节](#spec-failure-retirement)处理，需要强制停止或故障复位的处理列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，正常回收继续遵守已确认的对象寿命条件。
+3. **驻留与卸载保存。** 驻留期间 CP 在 HQD 中维护活动状态，不在每个包完成后更新 MQD。正常卸载前由 Host 排空队列；CP 开始卸载时清除 `ACTIVE`、关闭 Doorbell 使能，确认相关在途访问结束后，只写回 `saved_rptr` 与 `saved_error`，配置字段保持原值。保存失败继续保留槽位占用，能够安全回报时按[第 4.4 节](#spec-management-result)返回结果码 `5`；目标队列尚无错误时记录编号 `10`，已有首次错误时保留原值，见[第 7.2.3 节](#spec-management-error-separation)。异常退出按[第 7.3 节](#spec-failure-retirement)处理，需要强制停止时按[第 7.5 节](#spec-device-recovery)整设备恢复，正常回收继续遵守已确认的对象寿命条件。
 4. **重新装载。** 正常成功卸载后，CP 从 `saved_rptr` 恢复消费位置；生产进度始终从 `wptr_poll_addr` 指向的共享内存读取，MQD 不缓存一份生产进度。正常重装要求 `saved_error = 0`；错误快照非零的队列须按[清理后重建规则](#spec-queue-error-rebuild)处理，不直接清错续跑。
 
 **[DESIGN]** 消费进度 `R` 表示下一待消费包的编号，采用 32 位无符号数。卸载保存时，CP 将 HQD 中的完整 `R` 零扩展写入 64 位 `saved_rptr`；正常重新装载先检查高 32 位为零，再恢复低 32 位，高位非零则拒绝配置。例如当前 `R = 7`：
@@ -654,7 +655,7 @@ HQD 中 R = 7（32 位）
 
 进度初值、包地址、满空判断和计数溢出的规则见[第 5.2.1 节](#spec-ring-progress)。MQD 不随每个包更新，正常重装也不清零已保存的进度。
 
-**[BOUNDARY]** 故障队列清除 `ACTIVE` 并保留占用，按[第 7.2 节](#spec-queue-error-policy)处理。正常卸载前排空、清除 `ACTIVE` 和关闭 Doorbell 的规则见[第 7.4 节](#spec-unmap-drain)，任务卡住后的强制停止和复位恢复列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 故障队列清除 `ACTIVE` 并保留占用，按[第 7.2 节](#spec-queue-error-policy)处理。正常卸载前排空、清除 `ACTIVE` 和关闭 Doorbell 的规则见[第 7.4 节](#spec-unmap-drain)，任务卡住后的强制停止和复位恢复见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-boot"></a>
 
@@ -747,13 +748,15 @@ Host 必须同时准备内存中的 KIQ MQD 和对应 HQD；只准备 MQD，尚�
 
 `CP_HQD_AQL_CONTROL` 的整个 32 位值定义为：`0` 表示非 AQL，`1` 表示 AQL。KIQ、HIQ 配置为 `0`，申请创建的用户 AQL Queue 配置为 `1`；CP 据此选择解析流程。其他数值属于非法编码，不能把任意非零值都当作 AQL。队列格式须在激活前配置好，非法编码和运行期间修改格式按[第 8.2 节](#spec-hqd-access-rules)拒绝并报告；解释与 AMD 参考见[队列格式选择](<./历史/CP_MEC 软件实现、参考与扩展.md#queue-format>)。
 
+<a id="spec-reset-scope"></a>
+
 ### 3.3 复位的影响范围
 
 复位与启动在目标 CPU 线程中同步完成。`GLOBAL_CTRL.ENABLE` 只控制原有设备功能；CP 通过自己的控制位解除复位。
 
 CP 单独复位清零 Host 访存窗口的基址，保留 VRAM、入口，以及原 DMA、派发和中断状态。`GLOBAL_CTRL.RESET` 复位设备状态并使 CP 回到保持复位、入口为 0 的默认值，VRAM 保留。设备冷复位先停止 CP，再清零 VRAM 并恢复全部默认状态。
 
-**[DESIGN]** 设备冷复位或整体复位将所有 HQD 寄存器与 `HQD_SELECT` 清零；CP 单独复位保留 HQD 内容，供诊断和后续恢复使用。寄存器默认状态见[第 8.2 节](#spec-hqd-access-rules)，故障后的队列恢复列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[DESIGN]** 设备冷复位或整体复位将所有 HQD 寄存器与 `HQD_SELECT` 清零；CP 单独复位保留 HQD 内容，供诊断和后续恢复使用。寄存器默认状态见[第 8.2 节](#spec-hqd-access-rules)；运行中整体复位后怎样回收旧队列并重新启动，见[第 7.5 节](#spec-device-recovery)。
 
 **[DESIGN]** 固件重新启动仍按第 3.2 节装载和初始化：Host 恢复已初始化数据，固件设置栈、清零未初始化全局变量并初始化内部状态，不能依赖 CP 单独复位清空这些内容。
 
@@ -792,7 +795,7 @@ KIQ、HIQ 的命令都由 Host 内核驱动填写；用户运行时只向自己�
 - **HIQ，槽位 1：** 映射、卸载命令只针对槽位 2、3 的用户队列，写标记命令确认同一 HIQ 中前面的管理操作。
 - **用户队列，使用槽位 2、3：** CP 按创建请求选择空闲槽位，处理 AQL Packet，不接收上述管理命令。
 
-KIQ 和 HIQ 均不通过这些命令映射或卸载自身，也不允许越过上述目标范围。错误入口、非法目标和不支持的命令按管理错误处理，不自动转交另一条队列；请求结果返回与管理通道故障按[第 4.4 节](#spec-management-result)处理。首次 KIQ 仍由 Host 配置，正常卸载 HIQ 前须按[第 7.4 节](#spec-unmap-drain)完成用户队列清理及 HIQ 请求回报；运行期间 KIQ 重配和故障 HIQ 重建列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+KIQ 和 HIQ 均不通过这些命令映射或卸载自身，也不允许越过上述目标范围。错误入口、非法目标和不支持的命令按管理错误处理，不自动转交另一条队列；请求结果返回与管理通道故障按[第 4.4 节](#spec-management-result)处理。首次 KIQ 仍由 Host 配置，正常卸载 HIQ 前须按[第 7.4 节](#spec-unmap-drain)完成用户队列清理及 HIQ 请求回报；故障后的 KIQ、HIQ 随[设备恢复](#spec-device-recovery)整体复位后重新建立，运行期间单独重配 KIQ 或重建 HIQ 列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
 
 本版管理命令直接保存在各自的 Ring 中，固定的是 HQD 槽位数量和管理／用户用途，具体用户队列由 CP 按请求绑定到空闲槽位。用户队列总数按[两个创建名额](#spec-user-queue-capacity)限制，不增加 `RUN_LIST`、`MAP_PROCESS` 或 IB 间接执行。映射、卸载命令名称参考 AMD，`WRITE_COMPLETION` 为实验自定义名称，三者的具体编码均由本实验定义；AMD 的 HIQ 与 runlist 关系见[管理队列分工与 AMD 参考](<./历史/CP_MEC 软件实现、参考与扩展.md#management>)。
 
@@ -823,7 +826,7 @@ CP 必须先让管理操作达到规定的完成条件，并保证本次结果�
 
 卸载采用相同组织方式：先提交 `UNMAP_QUEUES`，再追加 `WRITE_COMPLETION`，完成条件见第 7 节。管理标记针对前面的管理操作，Host 读到本次序号后仍须检查结果码；用户 Kernel 通过各自的 Signal 协议确认完成。普通管理失败也返回结果，回报路径自身出错则停止故障管理 Ring，见[第 4.4 节](#spec-management-result)。完整例子与 AMD 参考见[后续写完成标记命令](<./历史/CP_MEC 软件实现、参考与扩展.md#completion-marker>)。
 
-命令范围、队列分工、字段布局、重复请求处理、标记使用和失败结果返回规则已确认，见下文第 4.1～4.4 节。管理通道故障的基本退出与资源保留按 9.6 执行，强制恢复留作后续扩展。
+命令范围、队列分工、字段布局、重复请求处理、标记使用和失败结果返回规则已确认，见下文第 4.1～4.4 节。管理通道故障的基本退出与资源保留按 9.6 执行，强制恢复见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-management-packet-format"></a>
 
@@ -916,7 +919,7 @@ MQD 中的 `aql_control` 只说明包格式：KIQ、HIQ 均为 `0`，用户 AQL 
 
 `mqd_addr`、`completion_addr` 都保存保存在 64 位槽中的 **GPU 物理字节地址**（高 32 位为零），至少按 8 字节对齐，不右移编码。前者指向已确认的 64 字节 MQD，后者指向[第 4.4 节](#spec-management-result)的 16 字节结果区。CP 执行 `WRITE_COMPLETION` 时，先将前一条管理操作的 32 位结果码写入 `completion_addr + 8`，保证结果可见，再向 `completion_addr` 写入完整的 64 位 `completion_value`。结果码由 CP 按来源管理 Ring 暂存，命令不增加结果码字段。地址及整段访问范围按[第 2.4.2 节](#spec-address-validation)校验，完成地址须覆盖完整 16 字节结果区。
 
-对已经发布的管理命令，`opcode = 0` 和其他未定义编号均为非法命令。保留区非零或地址校验失败时，拒绝该命令。对于 `MAP_QUEUES`、`UNMAP_QUEUES`，`queue_kind` 不属于 `1`、`2`，或目标种类与来源管理队列不符合上述分工时，同样拒绝处理。请求结果、命令配对和回报故障按[第 4.4 节](#spec-management-result)处理，强制恢复步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。尚未发布的 Ring 空间是否可读由提交协议判断，不能把空槽中的零当成一条已提交命令。
+对已经发布的管理命令，`opcode = 0` 和其他未定义编号均为非法命令。保留区非零或地址校验失败时，拒绝该命令。对于 `MAP_QUEUES`、`UNMAP_QUEUES`，`queue_kind` 不属于 `1`、`2`，或目标种类与来源管理队列不符合上述分工时，同样拒绝处理。请求结果、命令配对和回报故障按[第 4.4 节](#spec-management-result)处理，强制恢复按[第 7.5 节](#spec-device-recovery)整设备进行。尚未发布的 Ring 空间是否可读由提交协议判断，不能把空槽中的零当成一条已提交命令。
 
 **[BOUNDARY]** 本节已确定三种管理命令的完整布局、操作编号、队列种类编码和卸载目标的查找方法。管理命令不采用 AQL 包头，普通用户 Ring 继续按 AQL 格式处理。生产／消费进度按第 5 节确定；普通管理失败继续回报，管理通道故障停止后续消费，失败后的进度处理按[第 7.3 节](#spec-failure-retirement)执行。重复请求和槽位占用见[第 4.2 节](#spec-management-slot-state)，标记的初始化、发布与复用见[第 4.3 节](#spec-management-marker)，结果返回协议见[第 4.4 节](#spec-management-result)。
 
@@ -965,11 +968,11 @@ CP 按完整 MQD 物理地址检查重复映射。同一个地址已经出现在
   → 解除绑定，将槽位标为空闲
 ```
 
-保存失败或无法确认访问结束时，继续保留占用。映射中途失败时，只有确认队列尚未激活、相关访问已结束、部分配置已经撤销，才归还槽位；否则保留占用，故障恢复留作后续扩展。Host 释放 MQD、Ring 等内存，仍须确认管理结果并满足已有生命周期约定。
+保存失败或无法确认访问结束时，继续保留占用。映射中途失败时，只有确认队列尚未激活、相关访问已结束、部分配置已经撤销，才归还槽位；否则保留占用，故障恢复见[第 7.5 节](#spec-device-recovery)。Host 释放 MQD、Ring 等内存，仍须确认管理结果并满足已有生命周期约定。
 
 本版固件在读取、校验 MQD 或读取 W 失败时都还没有写入 HQD，撤销占用登记后返回结果码 `4` 或 `5`；没有空闲槽位时返回 `1`。例如进度对象在用户页表中不可读，CP 装载时读 W 失败，返回 `5`。Host 收到这三种结果，就能确认 CP 没有持有这份 MQD：删除这条队列、归还 VMID，并向应用报告确定失败。结果码 `2` 说明 CP 已经绑定同一 MQD 地址，结果码 `6` 或结果未知时 CP 也可能仍持有队列；这三种情况下，Host 保留队列、MQD 和 VMID。
 
-**[BOUNDARY]** 本节确定请求处理结果和槽位释放条件。“重复映射”“名额已满”“队列未映射”的结果码、返回位置及后附标记处理见[第 4.4 节](#spec-management-result)；强制停止和故障复位步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节确定请求处理结果和槽位释放条件。“重复映射”“名额已满”“队列未映射”的结果码、返回位置及后附标记处理见[第 4.4 节](#spec-management-result)；强制停止和故障复位见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-management-marker"></a>
 
@@ -1046,7 +1049,7 @@ T2 随后取得同一提交锁
 
 只有确认 CP 不会再写入旧请求的结果区，且 Host 已结束旧请求的等待和结果处理，才允许复用这块内存。复用时将完成标记重新置为 `0`、结果码置为 `0xffff_ffff`、保留字段填 `0`，交给使用新序号的请求。等待超时不能直接清零、释放或复用结果区；必须保留，直到旧请求结束，或恢复流程确认相关访问已终止，再按上述条件回收。
 
-**[BOUNDARY]** 本节确定标记的使用、等待和结果区复用规则。管理失败的结果码、回报顺序，以及管理通道故障后的等待退出方式见[第 4.4 节](#spec-management-result)；强制停止和故障复位步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节确定标记的使用、等待和结果区复用规则。管理失败的结果码、回报顺序，以及管理通道故障后的等待退出方式见[第 4.4 节](#spec-management-result)；强制停止和故障复位见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-management-result"></a>
 
@@ -1134,7 +1137,7 @@ Host 使用带超时的轮询，并在本次标记未匹配时检查来源管理
 
 故障或超时后继续保留相关内存，按[第 4.3 节](#spec-management-marker)和恢复流程确认结果区及目标队列资源的回收条件。返回通道故障或超时本身不结束设备访问。
 
-**[BOUNDARY]** 9.3.5 的结果区布局、请求结果码、后附完成命令行为和故障等待退出方式均已确认。队列故障编号、首次记录和停止范围已按[第 7.2 节](#spec-queue-error-policy)确定，失败后的进度处理与等待退出已按[第 7.3 节](#spec-failure-retirement)确定，强制恢复列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，正常回收继续遵守已确认的对象寿命条件；驱动向应用返回的接口形式已按 9.7 确认。
+**[BOUNDARY]** 9.3.5 的结果区布局、请求结果码、后附完成命令行为和故障等待退出方式均已确认。队列故障编号、首次记录和停止范围已按[第 7.2 节](#spec-queue-error-policy)确定，失败后的进度处理与等待退出已按[第 7.3 节](#spec-failure-retirement)确定，强制恢复见[第 7.5 节](#spec-device-recovery)，正常回收继续遵守已确认的对象寿命条件；驱动向应用返回的接口形式已按 9.7 确认。
 
 <a id="spec-submit-consume"></a>
 
@@ -1283,7 +1286,7 @@ D = (W - R) mod 2^32 = 3
 
 首次创建时，`W`、HQD 消费进度、消费回报和 `MQD.saved_rptr` 均初始化为 `0`。正常卸载前，Host 按[第 7.4 节](#spec-unmap-drain)停止提交并等到消费回报 `R == W`；CP 卸载时将当前 `R` 零扩展到 64 位，保存到 `MQD.saved_rptr`，高 32 位填零。重新装载先检查高 32 位为零，再恢复低 32 位；高位非零则拒绝该配置。生产进度继续从共享内存读取保留的 `W`，不因重新装载而清零。MQD 的字段布局与装载、保存流程见[第 2.6 节](#spec-mqd-format)。
 
-**[BOUNDARY]** 本节已确定进度数值及正常初始化、恢复规则。字段完整读写和发布同步遵守[第 2.2.1 节](#spec-shared-value-integrity)，用户 AQL 的多生产者主方案见[第 9.4.4 节](#spec-ring-submitters)，Header 的完整 32 位访问、管理 Ring 的串行发布及取号约束也已确认。生产进度按[第 5.2.3 节](#spec-doorbell-notification)刷新；失败包和回报失败按[第 7.3 节](#spec-failure-retirement)处理，强制恢复步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节已确定进度数值及正常初始化、恢复规则。字段完整读写和发布同步遵守[第 2.2.1 节](#spec-shared-value-integrity)，用户 AQL 的多生产者主方案见[第 9.4.4 节](#spec-ring-submitters)，Header 的完整 32 位访问、管理 Ring 的串行发布及取号约束也已确认。生产进度按[第 5.2.3 节](#spec-doorbell-notification)刷新；失败包和回报失败按[第 7.3 节](#spec-failure-retirement)处理，强制恢复见[第 7.5 节](#spec-device-recovery)。
 
 #### 5.2.2 包发布与队列选择
 
@@ -1411,7 +1414,7 @@ Ring 地址、容量、消费位置、生产进度及包的发布状态共同决
 
 等待计算完成期间，CP 暂不处理其他队列，包括 KIQ、HIQ；Host 在 Ring 有空位时仍可继续发布。以下把当前分配在用户槽位 2、3 的两条队列记作 A、B。若 A、B 始终就绪，执行顺序为 A1、B1、A2、B2；B 无任务时跳过 B，继续 A。轮流选择保证提交机会，不保证两条队列占用相同计算时间。
 
-A、B 的 HQD 可以同时保持驻留，轮换处理无需换出另一个槽位。若当前 Dispatch 一直不结束，普通队列处理也会停住；等待超时只结束本次等待，强制中止和复位收尾列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。本版不增加可配置的优先级或时间片寄存器，也不实现中途抢占。调度限制及扩展依据见[固定轮流选择与阻塞执行](<./历史/CP_MEC 软件实现、参考与扩展.md#scheduling>)。
+A、B 的 HQD 可以同时保持驻留，轮换处理无需换出另一个槽位。若当前 Dispatch 一直不结束，普通队列处理也会停住；等待超时只结束本次等待，需要终止时由管理员按[第 7.5 节](#spec-device-recovery)恢复设备。本版不增加可配置的优先级或时间片寄存器，也不实现中途抢占。调度限制及扩展依据见[固定轮流选择与阻塞执行](<./历史/CP_MEC 软件实现、参考与扩展.md#scheduling>)。
 
 <a id="spec-doorbell-notification"></a>
 
@@ -1475,7 +1478,7 @@ CP 按[第 6.1 节](#spec-dispatch-packet)检查 AQL Dispatch，以用户地址�
 
 读进度用于判断 Ring 槽是否可复用，任务结果按 Signal 和错误协议判断。回报内存保存 CP 发布的进度副本；MQD 在卸载保存时接收需要恢复的状态，下次驻留时再装回 HQD。Host 不独立推进这些副本。回报尚未完成时，Host 可能读到旧值，因此应暂缓复用对应槽位。进度副本与槽位复用的例子见[消费进度与回报](<./历史/CP_MEC 软件实现、参考与扩展.md#consumption>)。
 
-本版的 32 位消费进度按[第 5.2.1 节](#spec-ring-progress)表示，不采用 `CP_HQD_AQL_DISPATCH_ID / HI`，推进时机仍遵守上述顺序。Signal 按[第 2.1.2 节](#spec-signal-single-writer)由 CP 单独更新，仍须保证 64 位读写完整性和结果可见性。Dispatch 必须提供有效 Signal，包校验失败按下节停止所属队列后续取包；执行失败、写回失败及基本资源收尾按第 7 节和 9.6 执行，强制恢复留作后续扩展。
+本版的 32 位消费进度按[第 5.2.1 节](#spec-ring-progress)表示，不采用 `CP_HQD_AQL_DISPATCH_ID / HI`，推进时机仍遵守上述顺序。Signal 按[第 2.1.2 节](#spec-signal-single-writer)由 CP 单独更新，仍须保证 64 位读写完整性和结果可见性。Dispatch 必须提供有效 Signal，包校验失败按下节停止所属队列后续取包；执行失败、写回失败及基本资源收尾按第 7 节和 9.6 执行，强制恢复见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-dispatch-packet"></a>
 
@@ -1754,7 +1757,7 @@ IDLE → 提交 → BUSY → DONE 或 FAILED
 
 `BUSY` 或存在未确认结果时，拒绝修改配置和再次提交，保留当前任务及结果。`DONE`、`FAILED` 和对应结果保持到 CP 读取并确认；`DISPATCH_ACK` 只用于确认终态结果，不能中止正在执行的任务。CP 必须先保存结果，再确认取走，不能用尚未开始下一任务时读到的旧完成状态判断新任务成功。
 
-本次执行结果单独保存。现有全局错误还会记录 DMA、非法寄存器访问等其他故障，CP 不能仅凭全局状态判断这个 Dispatch 的成败。基本错误退出按第 7 节执行，故障复位恢复留作后续扩展。
+本次执行结果单独保存。现有全局错误还会记录 DMA、非法寄存器访问等其他故障，CP 不能仅凭全局状态判断这个 Dispatch 的成败。基本错误退出按第 7 节执行，故障复位恢复见[第 7.5 节](#spec-device-recovery)。
 
 **[DESIGN]** 本次接入将 `DISPATCH_ERROR` 定义为以下独立编号，保留到终态确认；这些编号不直接写入 HQD。CP 读取失败结果后，仍以队列错误 `4`（执行器失败）记录所属队列：
 
@@ -1880,7 +1883,7 @@ CP 取得并保存 Signal 的事件编号和通知槽地址后，成功路径按
 
 ## 7. 错误记录、卸载与资源释放
 
-**[DESIGN]** 保留每槽位的 `CP_HQD_ERROR`，用于记录取包、命令校验、执行与完成写回中的实际异常。需要覆盖 Ring 或写指针读取失败、已发布命令非法或不受支持、Dispatch 描述或参数不可用、执行器返回失败、读进度回报失败，以及完成 Signal 无效或无法更新。访存失败的归属与停止取包规则已在[第 2.1.1 节](#spec-memory-access-context)确定。管理请求通过[独立结果区](#spec-management-result)返回成败；管理通道取包、已发布命令配对和结果写回故障记录到来源管理队列，并停止该 Ring 后续消费。错误通知采用[IH 记录通路](#spec-ih-notification)，队列错误编号、首次记录、停止范围及清理后重建按[第 7.2 节](#spec-queue-error-policy)执行；失败收尾按[第 7.3 节](#spec-failure-retirement)处理，强制恢复步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。各类异常及诊断关系见[队列错误记录](<./历史/CP_MEC 软件实现、参考与扩展.md#error>)。
+**[DESIGN]** 保留每槽位的 `CP_HQD_ERROR`，用于记录取包、命令校验、执行与完成写回中的实际异常。需要覆盖 Ring 或写指针读取失败、已发布命令非法或不受支持、Dispatch 描述或参数不可用、执行器返回失败、读进度回报失败，以及完成 Signal 无效或无法更新。访存失败的归属与停止取包规则已在[第 2.1.1 节](#spec-memory-access-context)确定。管理请求通过[独立结果区](#spec-management-result)返回成败；管理通道取包、已发布命令配对和结果写回故障记录到来源管理队列，并停止该 Ring 后续消费。错误通知采用[IH 记录通路](#spec-ih-notification)，队列错误编号、首次记录、停止范围及清理后重建按[第 7.2 节](#spec-queue-error-policy)执行；失败收尾按[第 7.3 节](#spec-failure-retirement)处理，管理通道不可用时的强制恢复按[第 7.5 节](#spec-device-recovery)执行。各类异常及诊断关系见[队列错误记录](<./历史/CP_MEC 软件实现、参考与扩展.md#error>)。
 
 访存或执行器必须把失败结果返回 CP，固件才能将错误归到所属队列。原有设备级 `ERROR_STATUS` 不能直接作为已经实现的 `CP_HQD_ERROR` 协议。Host 可通过选槽窗口查询错误；MQD 的 `saved_error` 在卸载保存时接收错误快照，Host 诊断缓冲区在驱动读取时接收副本，均不会自动同步。
 
@@ -1888,7 +1891,7 @@ Ring 为空、当前 AQL 槽仍为 `INVALID` 或执行器忙属于正常等待�
 
 正常卸载时，Host 先停止提交并等待队列排空，再请求 CP 卸载；CP 停止目标队列取包，确认相关访问结束，保存 MQD 后解除绑定。完整流程与 HIQ 关闭顺序见[第 7.4 节](#spec-unmap-drain)。保存字段继续使用[第 2.6 节](#spec-mqd-format)的 `saved_rptr` 和 `saved_error`，槽位释放仍遵守[第 4.2 节](#spec-management-slot-state)的条件。
 
-本版不采用 `CP_HQD_DEQUEUE_REQUEST` 寄存器入口。故障队列的清理不要求先排空，尚未完成的等待按[第 7.3 节](#spec-failure-retirement)报错退出；卸载结果只确认管理操作，任务结果和资源释放仍按各自协议判断。只读到 `ACTIVE = 0`、发现错误或等待超时，都不能证明设备已经结束相关访问。故障时清除 `ACTIVE` 并保留占用的规则见[第 7.2.2 节](#spec-queue-error-stop-scope)；当前任务无法结束时的强制停止、运行期间 KIQ 重配及复位恢复列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+本版不采用 `CP_HQD_DEQUEUE_REQUEST` 寄存器入口。故障队列的清理不要求先排空，尚未完成的等待按[第 7.3 节](#spec-failure-retirement)报错退出；卸载结果只确认管理操作，任务结果和资源释放仍按各自协议判断。只读到 `ACTIVE = 0`、发现错误或等待超时，都不能证明设备已经结束相关访问。故障时清除 `ACTIVE` 并保留占用的规则见[第 7.2.2 节](#spec-queue-error-stop-scope)；当前任务无法结束时的强制停止与复位恢复见[第 7.5 节](#spec-device-recovery)，运行期间单独重配 KIQ 列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
 
 <a id="spec-ih-notification"></a>
 
@@ -2189,7 +2192,7 @@ Ring 已满时再次提交、Host RAM 记录写入失败或非法协议操作，
 
 读取状态或写 `IRQ_ACK` 都不清除 IH 故障。Host 恢复前须停止相关生产者、确认在途写入结束，并处理或按恢复协议明确作废旧通知，然后在 IH 已禁用且 `BUSY = 0` 时请求复位。停止取包和调度后，已经开始的计算或 DMA 仍须按各自停止协议收尾，资源释放条件不能由 IH 故障状态代替。
 
-**[DESIGN]** 冷复位和 `GLOBAL_CTRL.RESET` 清零 IH 基址、容量、W/R、控制与状态。合法的独立 `IH_CTRL.RESET` 仅清零 W/R 与整个 `IH_STATUS`，保留基址和容量，IH 继续禁用；该写入不能同时设置 `ENABLE`。CP 单独复位保留所有 IH 状态。独立 IH 复位不清除全局错误位，也不清空 Host Ring 内容；旧记录由重置后的发布范围判定，不能把残留字节视为新通知。运行期间的恢复流程仍属于后续扩展。
+**[DESIGN]** 冷复位和 `GLOBAL_CTRL.RESET` 清零 IH 基址、容量、W/R、控制与状态。合法的独立 `IH_CTRL.RESET` 仅清零 W/R 与整个 `IH_STATUS`，保留基址和容量，IH 继续禁用；该写入不能同时设置 `ENABLE`。CP 单独复位保留所有 IH 状态。独立 IH 复位不清除全局错误位，也不清空 Host Ring 内容；旧记录由重置后的发布范围判定，不能把残留字节视为新通知。运行期间整设备恢复时，驱动同步 IH 读进度的做法见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-ih-object-lifetime"></a>
 
@@ -2207,7 +2210,7 @@ Ring 已满时再次提交、Host RAM 记录写入失败或非法协议操作，
 
 仅收到卸载成功结果或中断确认，还不能证明旧通知已经处理完。若驱动先复制记录、归还 IH 槽，再延后处理，复制记录对应的 Queue 和事件引用必须保留到处理结束。应用释放接口见[9.7.4 的已确认接口](#spec-host-object-release)；故障复位后的旧通知处理随后续异常恢复细化，当前继续保留尚不能安全回收的资源。
 
-**[BOUNDARY]** 本节的 IH 容量与布局、寄存器字段、同步提交、进度和发布规则、中断与 Signal 关联、故障处理方向及对象复用前提均已确认，本次工作区已接入设备与固件路径。寄存器偏移、故障枚举和复位字段已按上述规则补齐；Linux 客体的完整验收结果以大纲为准。队列错误编号、停止范围及清理后重建的规则见[第 7.2 节](#spec-queue-error-policy)，失败收尾按[第 7.3 节](#spec-failure-retirement)处理，强制恢复步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节的 IH 容量与布局、寄存器字段、同步提交、进度和发布规则、中断与 Signal 关联、故障处理方向及对象复用前提均已确认，设备与固件已实现相应路径。寄存器偏移、故障枚举和复位字段已按上述规则补齐；Linux 客体的实际验收结果见[软件栈第 5 节](<../software/gpgpu/README.md#build-and-validation>)。队列错误编号、停止范围及清理后重建的规则见[第 7.2 节](#spec-queue-error-policy)，失败收尾按[第 7.3 节](#spec-failure-retirement)处理，IH 故障后的强制恢复见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-queue-error-policy"></a>
 
@@ -2278,7 +2281,7 @@ HIQ 故障
 
 KIQ 故障
   → 停止所有队列的新取包与新派发
-  → 保留相关资源，设备恢复留作后续扩展
+  → 保留相关资源，由管理员按第 7.5 节恢复设备
 
 固件代码、栈等无法可靠归属队列的异常
   → 记录设备级故障，停止所有队列调度
@@ -2290,7 +2293,7 @@ IH 自身故障
 
 KIQ 的实际通道故障统一按停止全部调度处理，包括取包、已发布命令配对和结果写回故障；普通管理请求失败仍按下一节处理。能够可靠归属队列的故障由 CP 清除该队列的 `ACTIVE`，并在[固件槽位占用记录](#spec-management-slot-state)中保留异常占用状态。
 
-停止新取包与新派发后，已经开始的计算或访存仍须完成收尾。Host 继续保留相应内存和对象引用，直到卸载或恢复流程确认访问结束；`ACTIVE = 0` 不能作为释放资源或归还槽位的依据。故障 HIQ 重建、任务卡住后的强制停止及设备复位步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，不作为第二阶段必做内容。
+停止新取包与新派发后，已经开始的计算或访存仍须完成收尾。Host 继续保留相应内存和对象引用，直到卸载或恢复流程确认访问结束；`ACTIVE = 0` 不能作为释放资源或归还槽位的依据。任务卡住后的强制停止及设备复位见[第 7.5 节](#spec-device-recovery)；单独重建故障 HIQ 列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
 
 <a id="spec-management-error-separation"></a>
 
@@ -2314,12 +2317,12 @@ KIQ 的实际通道故障统一按停止全部调度处理，包括取包、已�
 
 #### 7.2.4 错误保存与清理后重建
 
-错误队列须先确认访问结束并清理旧状态，再重新创建。第二阶段处理能够安全卸载的故障队列，需要强制停止或故障复位的情况留作后续扩展；清理顺序如下：
+错误队列须先确认访问结束并清理旧状态，再重新创建。能够安全卸载的故障队列经 HIQ 卸载；需要强制停止或故障复位时按[第 7.5 节](#spec-device-recovery)整设备恢复，恢复后在新会话中重建队列。清理顺序如下：
 
 ```text
 错误队列
   → 停止取包
-  → 卸载或设备恢复，确认相关访问结束（设备恢复留作后续扩展）
+  → 卸载或设备恢复，确认相关访问结束（设备恢复见第 7.5 节）
   → 保存诊断信息，处理完旧通知及驱动后续工作
   → 回收旧对象
   → 重新创建队列
@@ -2331,7 +2334,7 @@ KIQ 的实际通道故障统一按停止全部调度处理，包括取包、已�
 
 出错后停止正常收尾，保留已经发生的写入，不自动重放任务或补写成功 Signal。失败包、部分完成状态和等待退出按[第 7.3 节](#spec-failure-retirement)处理。
 
-**[BOUNDARY]** 本节的错误编号、首次记录、停止范围、故障时清除 `ACTIVE`、管理请求与目标故障的区分、错误队列清理后重建均已确认。正常卸载前排空及 `ACTIVE` 清零时机已按[第 7.4 节](#spec-unmap-drain)确定，任务卡住后的停止方法和复位重建步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节的错误编号、首次记录、停止范围、故障时清除 `ACTIVE`、管理请求与目标故障的区分、错误队列清理后重建均已确认。正常卸载前排空及 `ACTIVE` 清零时机已按[第 7.4 节](#spec-unmap-drain)确定，任务卡住后的停止方法和复位重建步骤见[第 7.5 节](#spec-device-recovery)。
 
 <a id="spec-failure-retirement"></a>
 
@@ -2352,7 +2355,7 @@ CP 处理当前包时发现异常
 3. **Host 能退出等待，资源暂时保留。** 驱动保存队列或设备故障并唤醒相关等待者，通过错误结束尚未完成的等待。错误、超时和停止取包都不能直接作为释放依据；确认设备访问及旧通知处理结束后，才能按对象寿命规则回收相关资源。
 4. **精细恢复留作扩展。** 各个写入步骤失败后的状态组合、逐步故障注入、自动重试和原地恢复列入[后续扩展](<./QEMU GPGPU 实验大纲.md#failure-recovery-extension>)。第一版继续遵守已确定的[完整读写](#spec-shared-value-integrity)和[发布顺序](#spec-dispatch-visibility)。
 
-**[BOUNDARY]** 本节已按[9.6.2](#spec-failure-retirement-rules)确认。正常卸载见[第 7.4 节](#spec-unmap-drain)，任务卡住后的强制停止和复位重建列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，具体等待接口已按 9.7 确认。
+**[BOUNDARY]** 本节已按[9.6.2](#spec-failure-retirement-rules)确认。正常卸载见[第 7.4 节](#spec-unmap-drain)，任务卡住后的强制停止和复位重建见[第 7.5 节](#spec-device-recovery)，具体等待接口已按 9.7 确认。
 
 <a id="spec-unmap-drain"></a>
 
@@ -2398,7 +2401,7 @@ status = 5（读取 W 或保存 MQD 失败）
 
 结果码 `3` 只说明 CP 此刻找不到该 MQD 的绑定；这条队列此前可能已经运行并发布过通知，所以同样先处理旧通知。结果码 `6` 的典型情况是：Host 检查时 R 等于 W，随后另一线程又发布了一个包，CP 卸载时看到 R 不等于 W。这说明调用者没有先停止提交，队列仍可运行。等待结果期间队列已经报告故障的，恢复时保持故障状态。结果码 `5` 之后再次卸载，CP 按已出错队列跳过排空检查，保存成功后才解除绑定。
 
-故障队列的清理不要求先排空，尚未完成的等待按[第 7.3 节](#spec-failure-retirement)报错退出，相关资源继续保留。任务一直不结束时的强制停止方法列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，第二阶段不要求实现。取消未执行任务、保留未执行任务跨卸载续跑列为[后续扩展](<./QEMU GPGPU 实验大纲.md#queue-unmap-extension>)；正常重装仍保留已有消费位置，不把进度清零。
+故障队列的清理不要求先排空，尚未完成的等待按[第 7.3 节](#spec-failure-retirement)报错退出，相关资源继续保留。任务一直不结束时，CP 无法处理卸载命令，按[第 7.5 节](#spec-device-recovery)整设备恢复。取消未执行任务、保留未执行任务跨卸载续跑列为[后续扩展](<./QEMU GPGPU 实验大纲.md#queue-unmap-extension>)；正常重装仍保留已有消费位置，不把进度清零。
 
 正常卸载 HIQ 前，驱动先完成用户队列清理，并等待 HIQ 的管理请求回报：
 
@@ -2412,7 +2415,75 @@ status = 5（读取 W 或保存 MQD 失败）
 
 第一版由 Host 保证上述关闭顺序，CP 不在卸载 HIQ 时自动连带卸载用户队列。HIQ 的卸载仍按本节停止取包、结束访问、保存状态、解除绑定和回报结果；返回管理结果的是 KIQ。
 
-**[BOUNDARY]** 本节已按[9.6.3](#spec-unmap-rules)确认。任务卡住后的强制停止、故障 HIQ 重建及设备复位步骤列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+**[BOUNDARY]** 本节已按[9.6.3](#spec-unmap-rules)确认。任务卡住或管理通道故障、无法经 HIQ 卸载时，按[第 7.5 节](#spec-device-recovery)整设备恢复；单独重建故障 HIQ 列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。
+
+<a id="spec-device-recovery"></a>
+
+### 7.5 设备恢复：终止旧任务并重新启动 CP
+
+第 7.2～7.4 节的收尾都要靠 CP 处理管理命令：出错队列停止取包，Host 再经 HIQ 卸载并回收。有两种情况走不通。一是 Kernel 一直不结束，CP 停在 Dispatch 等待中，不再处理 KIQ、HIQ；二是 KIQ、IH 或固件已经报告设备级故障，管理通道本身不可用。这时由管理员请求设备恢复：驱动终止全部旧任务，整体复位设备，确认旧访问结束后回收旧任务保留的资源，再按[第 3 节](#spec-boot)重新启动 CP。旧任务不保存执行现场，也不续跑。
+
+以一次长时间不结束的矩阵乘法为例。进程 A 的线程阻塞在完成事件上，管理员向设备的 sysfs 属性 `recover` 写入 1：
+
+```text
+echo 1 > /sys/class/drm/renderD128/device/recover
+  │
+  ├─ 1. 进入恢复：拒绝打开新会话，管理命令与 COPY 不再发布
+  │      恢复前打开的会话标为失效
+  │      PENDING 事件以 GPGPU_EVENT_ERROR_RESET 失败 ─▶ 进程 A 的等待返回 -EIO
+  ├─ 2. 等正在进行的 ioctl 退出（管理请求与 COPY 的等待都有上限）
+  ├─ 3. 保持 CP 复位后整体复位设备，读回确认本次复位完成
+  │      执行器任务撤销，dcache 回写并失效，HQD、VM 上下文、IH、DMA 回到复位值
+  │      再等中断处理函数与 IH 工作项结束
+  ├─ 4. 回收旧任务保留的资源；旧队列视为已卸载，VMID 全部空闲
+  ├─ 5. 装载固件，配置 IH 与 KIQ，经 KIQ 映射 HIQ 并完成版本握手
+  └─ 6. 写入返回成功，新打开的会话可以建队列和计算
+```
+
+前三步的次序决定资源何时可以回收。第 1 步只结束等待、拒绝新工作，设备此时可能仍在执行旧任务，不回收任何资源。第 2 步之后，驱动中不再有线程在发布管理命令或等待 COPY 完成。第 3 步才让设备停止访问内存：CP 单独复位只停住 CP，不撤销执行器任务和 DMA 完成定时器，见[第 3.3 节](#spec-reset-scope)；整体复位依次停住 CP 和执行器，回写并失效 dcache，清空 GPUVM、HQD 和 IH 等状态，最后把 `GLOBAL_CTRL` 清零。遇到在途访问或回写失败，复位被拒绝或中途返回，`GLOBAL_CTRL` 保持原值。驱动每次复位前先写 `ENABLE`，读回 0 才认定本次复位成功，不会把上一次复位留下的 0 当成本次结果。
+
+#### 7.5.1 复位确认后回收的资源
+
+设备确认停止后，下列资源不会再被旧任务访问，驱动在重新启动前回收：
+
+- 等待超时的 COPY 为两端对象保留的使用计数，以及全设备的“DMA 结果未知”标记。COPY 超时后后续 COPY 一律被拒绝，所以这样的 COPY 至多一次；
+- 文件已经关闭、因设备可能仍在访问而保留的 orphan 会话；
+- 已发布但没有确认结果的管理请求结果区；
+- 旧队列对 Ring 与进度对象的使用计数，以及旧 VM 占用的 VMID。
+
+随后两条管理 Ring 清零并重填 MQD，IH 从编号 0 重新消费；管理请求序号继续递增，不与复位前的请求重号。仍有文件引用的旧会话这时不回收，它的对象、页表和 Doorbell 页保留到文件关闭，不分给新会话；对象的 CPU 映射另外保活各自的存储。dcache 维护失败而保留的存储，仍到设备释放时归还。
+
+#### 7.5.2 失效会话只能查询与回收
+
+恢复开始前打开的会话一律失效。应用的等待返回失败后，应关闭旧连接，再重新打开设备：
+
+- 等待和查询事件、查询队列、读取 GPUVM 故障，以及销毁事件、销毁队列和 UNMAP 照常处理。恢复开始时，仍为 `PENDING` 的旧事件转为 `FAILED`，`error` 为 `GPGPU_EVENT_ERROR_RESET`；已完成通知的事件保持原结果，Signal 不会被补写为完成。旧队列查询为 `FAULTED`，复位确认后销毁直接返回成功。
+- 创建对象、MAP、COPY、CACHE_SYNC、建队列和建事件返回 `-ECANCELED`。
+- 恢复打断已进入管理等待的队列创建时，也向用户返回 `-ECANCELED`。驱动先根据原始管理结果决定资源保留，再转换返回值；取消错误码本身不证明设备已经停止。
+- 用户库关闭连接时依次排空队列、销毁队列、销毁事件、释放内存。排空返回等待失败后仍继续卸载。旧连接若已因创建或绑定结果未知而设置本地 `uncertain`，先通过 INFO 查询：只有输出 `GPGPU_INFO_SESSION_RESET`，才解除该标记并继续清理。这个标志在复位确认、旧引用解除后设置，不使旧会话重新获得提交权限；复位未确认时，关闭仍返回暂不可用。
+
+恢复进行中打开 render node 返回 `-EBUSY`；设备处于故障状态时返回 `-ENODEV`。文件关闭与恢复串行：恢复期间关闭的文件，等恢复结束后再按常规回收。
+
+> **[SOURCE]** Linux `248951ddc14de84de3910f9b13f51491a8cd91df` 的 AMDGPU 为上下文记录复位计数和 VM 代次，见 [amdgpu_ctx.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c:341:1) [第 341～343 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c:341:1)；上下文代次与新建作业代次不符时，提交返回 `-ECANCELED`，见 [amdgpu_cs.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:301:1) [第 301～304 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/2.%E6%BA%90%E7%A0%81/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c:301:1)。这段代码不能推出 AMDGPU 每次复位都拒绝全部旧上下文；本设备则约定恢复前的会话一律失效。
+
+#### 7.5.3 不能确认停止时的处理
+
+寄存器访问能正常返回、但设备在等待上限内不能确认复位时，写入返回 `-EIO`。驱动置位“DMA 结果未知”标记，旧队列、对象、页表和管理结果区全部保留：解绑和会话回收继续被拒绝，文件关闭的会话保留为 orphan。设备保持故障状态，拒绝打开新会话。管理员可以再次请求恢复，下一次复位确认后再统一回收。
+
+复位已经确认、但重新启动失败时，例如固件装载或 HIQ 握手失败，驱动再次整体复位设备，设备保持故障状态，写入返回启动错误码。第二次复位也必须确认；无法确认时，重新启动期间可能被访问的管理结果区等资源继续保留，不能沿用第一次复位的结果回收。同样可以再次请求恢复。
+
+**[BOUNDARY]** 本版恢复以整设备为范围，由管理员显式请求。驱动不判断任务是否挂死，普通等待超时仍只结束本次等待；不做单队列或管线复位，也不在运行期间单独重配 KIQ 或重建故障 HIQ；不保存旧任务现场，暂停后继续执行旧任务列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)。驱动的等待上限依赖同步寄存器及访存后端能够返回；后端永久不返回时，恢复调用也可能无法返回，不能靠这个超时强制打断。
+
+> **[SOURCE] 可选源码索引**
+>
+> 本仓库 `17a00fd` 加本工作树改动；以下链接定位到 `dev/device-recovery` 工作树。
+>
+> - 管理员入口与恢复顺序：[gpgpu_main.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_main.c:238:1) [第 238～252 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_main.c:238:1)；[gpgpu_dev.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:624:1) [第 624～686 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:624:1)。
+> - 复位完成确认与旧引用回收：[gpgpu_dev.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:436:1) [第 436～456 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:436:1)；[gpgpu_dev.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:579:1) [第 579～622 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_dev.c:579:1)。
+> - 管理结果区与 Ring 重建：[gpgpu_mgmt.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_mgmt.c:100:1) [第 100～108 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_mgmt.c:100:1)。
+> - 失效门禁、中途取消与旧队列清理：[gpgpu_drm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:210:1) [第 210～213 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:210:1)；[gpgpu_drm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:216:1) [第 216～225 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:216:1)；[gpgpu_queue.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_queue.c:417:1) [第 417～474 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_queue.c:417:1)。
+> - 旧访问确认与未知连接关闭：[gpgpu_drm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:185:1) [第 185～204 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_drm.c:185:1)；[device.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/lib/kmt/device.c:264:1) [第 264～317 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/lib/kmt/device.c:264:1)。
+> - 超时 COPY 两端对象的计数归属：[gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_bo.c:359:1) [第 359～408 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/.claude/worktrees/device-recovery/software/gpgpu/linux/gpgpu_bo.c:359:1)。
 
 <a id="spec-registers"></a>
 
@@ -2549,7 +2620,7 @@ CP 运行后
 
 **[DESIGN]** 本版采用以下复位与访问规则，适用于 HQD 寄存器入口。`HQD_SELECT` 的有效槽位选择及 CP 地址译码范围见[第 8.3 节](#spec-hqd-address-map)。
 
-1. **复位值。** 设备冷复位或整体复位时，所有 HQD 寄存器清零，`HQD_SELECT = 0`。队列处于未激活状态，Doorbell 未启用；容量为 0 表示尚未配置，必须填入合法容量后才能激活。CP 单独复位保留 HQD 内容，故障后的队列恢复列入[后续异常恢复扩展](<./QEMU GPGPU 实验大纲.md#stalled-task-recovery-extension>)，不能据此判断相关访问已经结束。
+1. **复位值。** 设备冷复位或整体复位时，所有 HQD 寄存器清零，`HQD_SELECT = 0`。队列处于未激活状态，Doorbell 未启用；容量为 0 表示尚未配置，必须填入合法容量后才能激活。CP 单独复位保留 HQD 内容，不能据此判断相关访问已经结束；故障后的整设备恢复见[第 7.5 节](#spec-device-recovery)。
 2. **访问宽度。** Host 窗口和 CP 直接入口都采用小端、4 字节对齐的 32 位读写，`HQD_SELECT` 也按对齐的 32 位访问。64 位地址通过低、高两个寄存器分别读写，不支持一次 64 位访问跨过两个寄存器；非法宽度或未对齐请求不能分拆成多个有效访问后部分生效。
 3. **Host 与 CP 的写权限。** 首次启动时，Host 在 CP 保持复位期间配置 KIQ，并初始化消费位置。CP 运行后，Host 对 HQD 只读，按[第 4 节的分工](#spec-management)经 KIQ 请求配置 HIQ、经 HIQ 请求配置用户队列，由 CP 执行；Host 仍可写 `HQD_SELECT` 选择查看对象。`CP_HQD_ERROR` 对 Host 始终只读，读取不清除错误，由 CP 按[第 7.2 节](#spec-queue-error-policy)保留首次错误；槽位完成清理并用于建立新队列时，由 CP 初始化错误状态。
 4. **运行期间的字段更新。** Ring 地址、MQD 地址、进度地址、容量、VMID、队列格式和 Doorbell OFFSET，须在队列未激活且相关在途访问已结束后修改。运行期间允许 CP 更新消费进度、错误状态、`ACTIVE`，以及单独切换 `DOORBELL_EN`；切换使能时，Doorbell OFFSET 保持原值。`ACTIVE` 的清零时机按[正常卸载](#spec-unmap-drain)及[故障停止规则](#spec-queue-error-stop-scope)执行。

@@ -10,6 +10,8 @@
  *   5. 复位并使能设备，创建设备对象，启动 CP，注册 DRM。
  *
  * remove 顺序相反：先撤销 DRM 入口，再停止设备访问，最后释放中断与 BAR。
+ *
+ * 绑定期间另有 sysfs 属性 recover：管理员写入 1 时调用 gpgpu_device_recover()。
  */
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -227,6 +229,35 @@ static void gpgpu_remove(struct pci_dev *pdev)
 	kfree(gpu);
 }
 
+/*
+ * recover：管理员写入 1，终止全部旧任务并整体复位设备，重新启动后
+ * 接收新任务；写入在恢复结束后返回。属性只在 probe 成功后存在，解绑
+ * 时内核先撤销属性并等进行中的写入返回，再调用 gpgpu_remove()，所以
+ * gpu->dev 一直有效。
+ */
+static ssize_t recover_store(struct device *device, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct gpgpu_pci *gpu = dev_get_drvdata(device);
+	bool request;
+	int ret;
+
+	ret = kstrtobool(buf, &request);
+	if (ret)
+		return ret;
+	if (!request)
+		return -EINVAL;
+	ret = gpgpu_device_recover(gpu->dev);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(recover);
+
+static struct attribute *gpgpu_attrs[] = {
+	&dev_attr_recover.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(gpgpu);
+
 static const struct pci_device_id gpgpu_ids[] = {
 	{ PCI_DEVICE(GPGPU_VENDOR_ID, GPGPU_DEVICE_ID) },
 	{}
@@ -238,6 +269,7 @@ static struct pci_driver gpgpu_driver = {
 	.id_table = gpgpu_ids,
 	.probe = gpgpu_probe,
 	.remove = gpgpu_remove,
+	.dev_groups = gpgpu_groups,
 };
 module_pci_driver(gpgpu_driver);
 

@@ -3,9 +3,9 @@
  * GPGPU Linux 驱动：对象、锁与模块间接口
  *
  * 文件划分：
- *   gpgpu_main.c   PCI probe/remove 与中断入口
- *   gpgpu_dev.c    设备生命周期：固件装载、CP 启停、DMA 缓冲区、dcache 命令与
- *                  存储归还
+ *   gpgpu_main.c   PCI probe/remove、中断入口与 sysfs 恢复入口
+ *   gpgpu_dev.c    设备生命周期：固件装载、CP 启停、运行中恢复、
+ *                  DMA 缓冲区、dcache 命令与存储归还
  *   gpgpu_mgmt.c   KIQ/HIQ 管理 Ring 与管理请求
  *   gpgpu_ih.c     中断上半部与 IH Ring 消费
  *   gpgpu_drm.c    DRM 驱动、ioctl 分发与文件会话
@@ -19,7 +19,7 @@
  *
  *   gpgpu_device（kref：probe、每个会话、每个 GEM 对象各持一个）
  *     ├─ gpgpu_fpriv（每个 DRM 文件一个；文件关闭时若设备仍可能访问其对象，
- *     │   保留为 orphan，直到设备停止）
+ *     │   保留为 orphan，直到设备停止或恢复）
  *     │    ├─ gpgpu_bo（GEM 对象；会话列表、GEM 句柄、GPU 绑定各持一个引用）
  *     │    ├─ gpgpu_queue（引用 Ring 与进度两个 BO）
  *     │    ├─ gpgpu_event（引用来源队列）
@@ -28,6 +28,9 @@
  *
  * 锁的顺序：vm_serial → lock → management_lock / dma_lock → irq_lock。
  * 等待设备完成时（管理请求、DMA、事件）释放 lock，避免阻塞 IH 消费。
+ * 设备恢复从等到正在进行的 ioctl 退出起一直持 vm_serial，直到设备重新
+ * 可用；文件关闭也先取 vm_serial，所以恢复期间没有会话回收访问正在
+ * 复位的设备。
  *
  * dcache：Host 一方的命令寄存器由 lock 串行化。缓存属性只在 GPUVM 叶子项
  * 中：带不可缓存标志的 BO 绑定时置 UNCACHED，驱动自己的控制对象由 CP
@@ -254,7 +257,10 @@ struct gpgpu_vm {
  * @next_event: 下一个事件编号；回绕为 0 后不再分配。
  * @db_page: 设备 Doorbell BAR 中分给本会话的页号；0 表示未分配。
  * @db_maps: Doorbell 页的存活 VMA 数。
- * @orphan: 文件已关闭但设备访问尚未结束，等设备停止后回收。
+ * @orphan: 文件已关闭但设备访问尚未结束，等设备停止或恢复后回收。
+ * @stale: 会话在一次设备恢复开始前打开。之后只能查询、等待和回收，
+ *         建立对象、映射、COPY、队列与事件的 ioctl 返回 -ECANCELED。
+ * @reset_done: 旧任务访问已随复位结束；之后即使重启失败，也可尝试清理。
  *
  * 除 db_maps 外由 dev->lock 保护。
  */
@@ -272,6 +278,8 @@ struct gpgpu_fpriv {
 	unsigned int db_page;
 	atomic_t db_maps;
 	bool orphan;
+	bool stale;
+	bool reset_done;
 };
 
 /**
@@ -320,13 +328,21 @@ struct gpgpu_mgmt_request {
  * @ih_work: 在可睡眠上下文中消费 IH 记录。
  * @dma_done: DMA 完成或失败时唤醒。
  * @present: BAR 仍可访问；移除时最先清除。
- * @stopped: 设备已确认停止访问，可以回收 orphan 会话。
- * @fatal: KIQ、IH 或固件发生设备级故障。
+ * @stopped: 设备已确认停止访问，可以回收 orphan 会话。设备恢复只在确认
+ *           复位之后、重新启动之前短暂置位。
+ * @fatal: KIQ、IH 或固件发生设备级故障；设备恢复期间也置位，恢复成功
+ *         后清除。
+ * @recovering: 设备恢复进行中：拒绝打开新会话，IH 工作项不访问设备。
  * @dma_failed: 本次 DMA 报告了错误。
- * @dma_uncertain: DMA 等待超时，无法证明访问已结束；之后禁止 COPY 与回收。
+ * @dma_uncertain: DMA 等待超时，或设备恢复不能确认停止，无法证明访问
+ *                 已结束；之后禁止 COPY 与回收，直到设备恢复确认停止。
  * @gpuvm: 设备以 gpuvm=on 启动。
  * @vram_size: VRAM 字节数；VRAM 占 GPU 物理地址 [0, vram_size)。
  * @vmids: 用户 VMID 1、2 的占用位图；队列驻留期间占用。
+ * @copy_host: 等待超时的 COPY 的 Host 端对象；NULL 表示没有。COPY 超时后
+ *             dma_uncertain 拒绝后续 COPY，所以至多一次。它与 @copy_vram 各
+ *             保留一个 users 计数，设备恢复确认停止后放下。
+ * @copy_vram: 同一次 COPY 的 VRAM 端对象。
  * @drm: DRM 设备。
  * @fprivs: 全部会话，包括 orphan。
  * @requests: 未回收的管理请求结果区。
@@ -357,11 +373,14 @@ struct gpgpu_device {
 	bool present;
 	bool stopped;
 	bool fatal;
+	bool recovering;
 	bool dma_failed;
 	bool dma_uncertain;
 	bool gpuvm;
 	u32 vram_size;
 	unsigned long vmids;
+	struct gpgpu_bo *copy_host;
+	struct gpgpu_bo *copy_vram;
 	struct drm_device *drm;
 	struct list_head fprivs;
 	struct list_head requests;
@@ -415,6 +434,38 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 					 void __iomem *doorbell, bool gpuvm);
 int gpgpu_device_start(struct gpgpu_device *dev);
 void gpgpu_device_stop(struct gpgpu_device *dev);
+/**
+ * gpgpu_device_recover() - 终止全部旧任务，整体复位设备后重新启动
+ *
+ * @dev: 设备实例；调用者不得持有驱动互斥锁。
+ *
+ * 管理员写 sysfs 属性 recover 时调用。PCI 驱动解绑时先撤销该属性并等
+ * 写入返回，所以不会与 gpgpu_device_stop() 并发。恢复开始前打开的会话
+ * 全部失效，旧任务不保存现场；设备不能确认停止时宁可恢复失败，也不
+ * 回收可能仍被访问的资源。
+ *
+ * 1. 持 dev->lock 标记恢复中并置 fatal：打开新会话、发布管理命令和启动
+ *    COPY 都被拒绝，等待中的管理请求提前退出，IH 工作项不再访问设备。
+ *    旧会话标为失效，全部队列置 FAULTED，PENDING 事件以
+ *    GPGPU_EVENT_ERROR_RESET 失败并唤醒等待者；
+ * 2. 取 vm_serial 并持有到结束，等正在进行的 ioctl 退出。COPY 等待有
+ *    GPGPU_TIMEOUT_MS 上限，超时退出前已记下保留的两端对象；
+ * 3. 保持 CP 复位后整体复位设备，再等中断处理函数与 IH 工作项结束。
+ *    不能确认停止时跳到第 6 步；
+ * 4. recover_reclaim() 结束旧会话对设备的占用，回收 orphan 与保留资源，
+ *    然后清除 fatal，管理命令才能发布；
+ * 5. 与 probe 相同，复位后置 ENABLE，再按启动顺序装载固件、建立 KIQ 与
+ *    HIQ。失败时设备保持 fatal，并再次整体复位；
+ * 6. 不能确认停止时置 dma_uncertain，旧资源与恢复中的资源都保留。清除
+ *    恢复标记；成功时补调度一次 IH 工作项：恢复期间到达的 IH 中断
+ *    屏蔽了 IH 使能，要由它消费记录并恢复使能。
+ *
+ * 失败后设备拒绝打开新会话，可以再次请求恢复。
+ *
+ * Return: 0；-EBUSY（恢复已在进行）、-ENODEV（设备已移除）、-EIO（不能确认
+ * 停止），或 gpgpu_device_start() 的错误码。
+ */
+int gpgpu_device_recover(struct gpgpu_device *dev);
 void gpgpu_device_get(struct gpgpu_device *dev);
 void gpgpu_device_put(struct gpgpu_device *dev);
 int gpgpu_dma_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
@@ -427,6 +478,15 @@ bool gpgpu_storage_release_ok(struct gpgpu_device *dev, u64 addr, u64 size);
 
 int gpgpu_mgmt_init(struct gpgpu_device *dev);
 void gpgpu_mgmt_fini(struct gpgpu_device *dev);
+/**
+ * gpgpu_mgmt_reset() - 复位确认后回收结果区并重建管理 Ring
+ * @dev: 设备实例；调用者持有 vm_serial 与 dev->lock。
+ *
+ * 设备已确认复位，中断与 IH 工作项已同步，且没有管理请求在等待。
+ * CP 不再写旧结果区，未确认的结果区全部回收；两条管理 Ring 清零并
+ * 重填 MQD，供重新启动使用。请求序号继续递增，不与复位前请求重号。
+ */
+void gpgpu_mgmt_reset(struct gpgpu_device *dev);
 int gpgpu_mgmt_submit(struct gpgpu_device *dev, unsigned int ring, u32 opcode, u32 kind,
 		      u64 mqd, u32 *status, bool *published);
 

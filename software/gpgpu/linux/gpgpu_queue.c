@@ -318,12 +318,16 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	return 0;
 }
 
-/* 按编号取未卸载的队列，并先读取它所在槽的 GPUVM 故障，供后续报告。 */
+/*
+ * 按编号取未卸载的队列，并先读取它所在槽的 GPUVM 故障，供后续报告。
+ * 失效会话的队列已随设备恢复卸载，仍可查询和销毁，应用据此结束
+ * 旧队列。
+ */
 static struct gpgpu_queue *queue_get(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *args)
 {
 	struct gpgpu_queue *q = gpgpu_queue_lookup(fpriv, args->queue_id);
 
-	if (!q || q->dead || args->reserved)
+	if (!q || (q->dead && !fpriv->stale) || args->reserved)
 		return NULL;
 	gpgpu_vm_save_fault(q);
 	return q;
@@ -392,8 +396,9 @@ static int queue_unmap_rejected(struct gpgpu_queue *q, u32 previous, u32 status)
  * 就清除，队列可以再次卸载。是否回收 Ring、进度和 VMID 另看 CP 是否
  * 已经放开队列，只有第 5 步的 OK 与 NOT_MAPPED 回收。
  *
- * 1. 上一次管理结果未知或正在卸载时返回 -EBUSY。READY 队列必须已排空
- *    （R == W），CP 卸载时不处理未消费的包；FAULTED 队列不要求排空；
+ * 1. 失效会话的队列已随设备恢复卸载，只报告状态并返回 0。上一次管理
+ *    结果未知或正在卸载时返回 -EBUSY。READY 队列必须已排空（R == W），
+ *    CP 卸载时不处理未消费的包；FAULTED 队列不要求排空；
  * 2. 先把队列置为 UNLOADING + uncertain，再经 HIQ 发送 UNMAP_QUEUES。
  *    等待期间文件关闭时，会话因这条队列保留为 orphan；
  * 3. 已发布却没有取得有效结果，如超时、通道故障、结果码非法或设备
@@ -420,6 +425,10 @@ int gpgpu_queue_destroy(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_state *arg
 	/* 1. 只有结果已知、非卸载中且已排空的队列才能卸载。 */
 	if (!q)
 		return -EINVAL;
+	if (q->dead) {
+		queue_report(q, args);
+		return 0;
+	}
 	if (q->uncertain || q->state == GPGPU_QUEUE_UNLOADING)
 		return -EBUSY;
 

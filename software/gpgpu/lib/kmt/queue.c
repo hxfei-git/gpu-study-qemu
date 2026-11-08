@@ -100,7 +100,7 @@ GpgpuKmtStatus gpgpuKmtCreateQueue(GpgpuKmtContext *c, GpgpuKmtMemory *ring_memo
 	if (ioctl(c->fd, GPGPU_DRM_QUEUE_CREATE, &args) < 0) {
 		int error = errno;
 
-		/* 映射请求已发出但结果未知：驱动保留队列，本连接不能再正常关闭。 */
+		/* 结果未知时由驱动保留队列；复位确认前不能关闭本连接。 */
 		if (error == EPROTO || error == EIO || error == ETIMEDOUT)
 			kmt_mark_uncertain(c);
 		status = kmt_status(error);
