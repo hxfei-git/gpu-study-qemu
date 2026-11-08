@@ -5,9 +5,13 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "hw/gpgpu/gpgpu_state.h"
+#include "dcache.h"
 #include "vram.h"
 
-/* BAR2 读：越界锁存 VRAM_FAULT 并返回零。 */
+/*
+ * BAR2 读：越界锁存 VRAM_FAULT 并返回零。先回写重叠的 dcache 脏行，
+ * 再读后备存储；回写失败时 dcache 已锁存 DCACHE_FAULT，同样返回零。
+ */
 static uint64_t vram_bar_read(void *opaque, hwaddr addr, unsigned int size)
 {
 	GPGPUState *s = opaque;
@@ -16,11 +20,14 @@ static uint64_t vram_bar_read(void *opaque, hwaddr addr, unsigned int size)
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return 0;
 	}
+	if (gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN))
+		return 0;
 	return ldn_le_p(s->vram.ptr + addr, size);
 }
 
 /*
- * BAR2 写：越界锁存 VRAM_FAULT。合法写入经内部地址空间，
+ * BAR2 写：越界锁存 VRAM_FAULT。先回写并失效重叠的 dcache 行，避免旧
+ * 脏行之后覆盖本次写入；回写失败时不写入。合法写入经内部地址空间，
  * 使原生 CP 已翻译的代码失效。
  */
 static void vram_bar_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
@@ -32,6 +39,8 @@ static void vram_bar_write(void *opaque, hwaddr addr, uint64_t val, unsigned int
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return;
 	}
+	if (gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
+		return;
 	stn_le_p(buf, size, val);
 	gpgpu_vram_rw(s, addr, buf, size, true);
 }

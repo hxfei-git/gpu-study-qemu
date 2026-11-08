@@ -4,7 +4,7 @@
  *
  * 文件划分：
  *   gpgpu_main.c   PCI probe/remove 与中断入口
- *   gpgpu_dev.c    设备生命周期：固件装载、CP 启停、DMA 缓冲区
+ *   gpgpu_dev.c    设备生命周期：固件装载、CP 启停、DMA 缓冲区与 dcache 命令
  *   gpgpu_mgmt.c   KIQ/HIQ 管理 Ring 与管理请求
  *   gpgpu_ih.c     中断上半部与 IH Ring 消费
  *   gpgpu_drm.c    DRM 驱动、ioctl 分发与文件会话
@@ -27,6 +27,11 @@
  *
  * 锁的顺序：vm_serial → lock → management_lock / dma_lock → irq_lock。
  * 等待设备完成时（管理请求、DMA、事件）释放 lock，避免阻塞 IH 消费。
+ *
+ * dcache：Host 一方的命令寄存器由 lock 串行化。驱动自己的控制对象和带
+ * 不可缓存标志的 BO 在交给设备前登记为不可缓存区间；可缓存 BO 的存储
+ * 释放前先回写并失效，失败或设备已移除时存储转入 retained，设备释放时
+ * 才归还。
  */
 #ifndef GPGPU_DRV_H
 #define GPGPU_DRV_H
@@ -102,8 +107,11 @@ struct gpgpu_dma_buf {
  * @permissions: 绑定时的 GPGPU_VM_READ/WRITE/EXEC。
  * @users: 进行中的 COPY、存活队列与通知页登记持有的使用计数；
  *         非零时不能解绑。
+ * @uncached: 创建时带 GPGPU_BO_UNCACHED 或 GPGPU_BO_EVENT_PAGE，[phys_addr,
+ *            phys_addr + mapped_size) 已登记为不可缓存区间。
  *
- * 除 gem 与 dev 外的字段由 dev->lock 保护。
+ * 除 gem 与 dev 外的字段由 dev->lock 保护。node 在对象释放后还用于挂入
+ * dev->retained。
  */
 struct gpgpu_bo {
 	struct drm_gem_object gem;
@@ -121,6 +129,7 @@ struct gpgpu_bo {
 	bool bound;
 	u32 permissions;
 	u32 users;
+	bool uncached;
 };
 
 /**
@@ -303,6 +312,7 @@ struct gpgpu_mgmt_request {
  * @drm: DRM 设备。
  * @fprivs: 全部会话，包括 orphan。
  * @requests: 未回收的管理请求结果区。
+ * @retained: 释放时 dcache 维护失败或设备已移除的 BO，存储保留到设备释放。
  * @buddy: 管理固件区之前 VRAM 的分配器。
  * @reserved_blocks: 分配器中预留的 VRAM 首页。
  * @buddy_ready: 分配器已初始化。
@@ -336,6 +346,7 @@ struct gpgpu_device {
 	struct drm_device *drm;
 	struct list_head fprivs;
 	struct list_head requests;
+	struct list_head retained;
 	struct gpu_buddy buddy;
 	struct list_head reserved_blocks;
 	bool buddy_ready;
@@ -390,6 +401,10 @@ void gpgpu_device_put(struct gpgpu_device *dev);
 int gpgpu_dma_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
 			size_t align);
 void gpgpu_dma_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf);
+int gpgpu_ctrl_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
+			 size_t align);
+void gpgpu_ctrl_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf);
+int gpgpu_dcache_command(struct gpgpu_device *dev, u32 cmd, u64 addr, u64 size);
 
 /* ---- gpgpu_mgmt.c ---- */
 
@@ -424,7 +439,9 @@ struct gpgpu_bo *gpgpu_bo_lookup(struct gpgpu_fpriv *fpriv, u32 handle);
 bool gpgpu_bo_range_ok(struct gpgpu_bo *bo, u64 offset, u64 size);
 void gpgpu_bo_drop(struct gpgpu_bo *bo);
 void gpgpu_bo_release_all(struct gpgpu_fpriv *fpriv);
+void gpgpu_bo_release_retained(struct gpgpu_device *dev);
 int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args);
+int gpgpu_bo_cache_sync(struct gpgpu_fpriv *fpriv, struct gpgpu_cache_sync *args);
 
 /* ---- gpgpu_vm.c ---- */
 

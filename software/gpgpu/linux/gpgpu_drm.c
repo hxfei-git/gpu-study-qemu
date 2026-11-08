@@ -232,6 +232,8 @@ GPGPU_IOCTL_HANDLER(gpgpu_event_wait_ioctl, struct gpgpu_event_request, false,
 GPGPU_IOCTL_HANDLER(gpgpu_event_destroy_ioctl, struct gpgpu_event_request, true,
 		    gpgpu_event_destroy(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_fault_ioctl, struct gpgpu_vm_fault, true, gpgpu_fault(fpriv, args))
+GPGPU_IOCTL_HANDLER(gpgpu_cache_sync_ioctl, struct gpgpu_cache_sync, true,
+		    gpgpu_bo_cache_sync(fpriv, args))
 
 #define GPGPU_IOCTL(ioctl, handler) \
 	{ .cmd = ioctl, .func = handler, .flags = DRM_RENDER_ALLOW, .name = #ioctl }
@@ -250,6 +252,7 @@ static const struct drm_ioctl_desc gpgpu_ioctls[] = {
 	GPGPU_IOCTL(GPGPU_DRM_EVENT_WAIT, gpgpu_event_wait_ioctl),
 	GPGPU_IOCTL(GPGPU_DRM_EVENT_DESTROY, gpgpu_event_destroy_ioctl),
 	GPGPU_IOCTL(GPGPU_DRM_FAULT, gpgpu_fault_ioctl),
+	GPGPU_IOCTL(GPGPU_DRM_CACHE_SYNC, gpgpu_cache_sync_ioctl),
 };
 
 /* ---- 文件操作 ---- */

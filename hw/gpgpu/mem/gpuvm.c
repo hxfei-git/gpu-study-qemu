@@ -8,6 +8,7 @@
 #include "hw/gpgpu/gpgpu_state.h"
 #include "hw/gpgpu/cp/hqd.h"
 #include "gpuvm.h"
+#include "dcache.h"
 #include "phys.h"
 
 /* 每个页表项的字节数。 */
@@ -288,6 +289,18 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *p
 }
 
 /*
+ * 检查通过后的物理访问：读写数据经 dcache，取指直接读后备存储，
+ * 不分配数据行，留给以后独立的指令缓存。
+ */
+static MemTxResult user_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len,
+				uint32_t access)
+{
+	if (access == GPGPU_VM_EXEC)
+		return gpgpu_phys_rw(s, addr, buf, len, false);
+	return gpgpu_dcache_rw(s, addr, buf, len, access == GPGPU_VM_WRITE);
+}
+
+/*
  * vm_translated_rw() - gpuvm=on 时按 VMID 翻译并访问用户地址
  *
  * CP 或计算执行器给出的是 GPUVA，必须先经 vmid 的四级页表换成 GPU
@@ -300,7 +313,8 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *p
  *    vfio-user DMA 同步等待回复，期间不释放主锁，收到的 Host 寄存器写入
  *    暂存到访问结束后才处理。计数让上下文修改在访问期间被拒绝，也让
  *    vm_invalidate() 断言这一前提；
- * 3. 逐页查 TLB 或遍历页表，检查叶子项的权限位，再读写物理页；
+ * 3. 逐页查 TLB 或遍历页表，检查叶子项的权限位，再经 user_phys_rw()
+ *    读写物理页。权限检查在前，dcache 命中也不能绕过它；
  * 4. 撤销计数。失败时按 HQD 槽位记录首个故障，已完成的页不回退。
  *
  * 参数按值保存，跨进程 DMA 期间的寄存器写入不影响本次访问。
@@ -343,8 +357,8 @@ static bool vm_translated_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64
 		reason = vm_lookup(s, vmid, addr, &pte);
 		if (!reason && !(pte & access))
 			reason = GPGPU_VM_FAULT_PERMISSION;
-		if (!reason && gpgpu_phys_rw(s, (pte & GPGPU_VM_ADDR_MASK) + offset, buf, chunk,
-					     access == GPGPU_VM_WRITE) != MEMTX_OK)
+		if (!reason && user_phys_rw(s, (pte & GPGPU_VM_ADDR_MASK) + offset, buf, chunk,
+					    access) != MEMTX_OK)
 			reason = GPGPU_VM_FAULT_STORAGE;
 		if (!reason) {
 			addr += chunk;
@@ -374,7 +388,7 @@ static bool vm_direct_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t a
 
 	if (!user_request_valid(addr, len, access) || !user_phys_valid(s, addr, len))
 		reason = GPGPU_VM_FAULT_RANGE;
-	else if (gpgpu_phys_rw(s, addr, buf, len, access == GPGPU_VM_WRITE) != MEMTX_OK)
+	else if (user_phys_rw(s, addr, buf, len, access) != MEMTX_OK)
 		reason = GPGPU_VM_FAULT_STORAGE;
 	if (!reason)
 		return true;

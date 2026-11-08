@@ -8,7 +8,8 @@
  * 由 bar0.c 统一检查后再转发。
  *
  * CP 本地寄存器窗口（gpgpu_cp_map.h 中的 GPGPU_CP_REG_BASE）沿用 BAR0 偏移，
- * 但只开放 CP 需要的组：VM 只读信息与固件握手、Dispatch、IH 与 ERROR_STATUS。
+ * 但只开放 CP 需要的组：VM 只读信息与固件握手、Dispatch、IH、dcache 与
+ * ERROR_STATUS。
  */
 #ifndef HW_GPGPU_BAR0_H
 #define HW_GPGPU_BAR0_H
@@ -16,8 +17,8 @@
 #include "gpgpu.h"
 #include "system/memory.h"
 
-/* BAR0 子区域数：10 个寄存器组、HQD 窗口与背景区。 */
-#define GPGPU_BAR0_REGIONS 12
+/* BAR0 子区域数：11 个寄存器组、HQD 窗口与背景区。 */
+#define GPGPU_BAR0_REGIONS 13
 
 typedef struct Bar0Group Bar0Group;
 

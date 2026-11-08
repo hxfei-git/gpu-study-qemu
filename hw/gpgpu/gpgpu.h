@@ -9,7 +9,7 @@
  *   bar0.c    BAR0 寄存器分组转发
  *   cp/       原生 CP 控制、CP 访存窗口、HQD、Doorbell
  *   compute/  Dispatch 寄存器、warp 调度、RV64 解释器、lane 访存
- *   mem/      VRAM、GPU 物理地址路由、GPUVM 翻译、DMA
+ *   mem/      VRAM、GPU 物理地址路由、GPUVM 翻译、数据缓存、DMA
  *   irq/      中断锁存、IH 通知 Ring
  */
 #ifndef HW_GPGPU_H
@@ -73,9 +73,10 @@ bool gpgpu_gpuvm_enabled(GPGPUState *s);
  * @s: 设备实例。
  *
  * 由 GLOBAL_CTRL.RESET 与 QOM 复位调用。仍有跨进程物理访问在途时拒绝
- * 复位并锁存 INVALID_CMD。
+ * 复位并锁存 INVALID_CMD；dcache 脏行回写失败时停在 CP 与执行器已停止
+ * 的状态，保留未写回的数据。
  *
- * Return: 已复位为 true，拒绝复位为 false。
+ * Return: 已复位为 true，拒绝或中途停止为 false。
  */
 bool gpgpu_reset_registers(GPGPUState *s);
 

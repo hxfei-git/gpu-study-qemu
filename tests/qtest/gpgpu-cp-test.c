@@ -40,6 +40,11 @@
 #define QUEUE_MAILBOX(task) (QUEUE_HOST + 0xa000 + (task) * 8)
 #define QUEUE_ARGS(task) (QUEUE_HOST + 0xb000 + (task) * ARGS_BYTES)
 #define QUEUE_RESULT (QUEUE_HOST + 0xc000)
+/*
+ * 以上对象由 CP 持续轮询或由测试直接改写，从 QUEUE_HOST 到结果区所在页的
+ * 末尾整段登记为不可缓存，设备访问它们时不经过 dcache。
+ */
+#define QUEUE_CONTROL_END (QUEUE_RESULT + GPGPU_VM_PAGE_SIZE)
 /* Ring 容量：管理 Ring 8 个 32 字节槽，AQL Ring 4 个 64 字节槽。 */
 #define QUEUE_RING_BYTES 256
 
@@ -189,6 +194,15 @@ static void wr64(CPTest *s, uint64_t reg, uint64_t value)
 	wr(s, reg + 4, value >> 32);
 }
 
+/* 以 Host 身份发出一条 dcache 命令；设备同步执行，返回 STATUS。 */
+static uint32_t dcache_cmd(CPTest *s, uint32_t cmd, uint64_t addr, uint32_t length)
+{
+	wr64(s, GPGPU_REG_DCACHE_ADDR_LO, addr);
+	wr(s, GPGPU_REG_DCACHE_LENGTH, length);
+	wr(s, GPGPU_REG_DCACHE_CMD, cmd);
+	return rd(s, GPGPU_REG_DCACHE_STATUS);
+}
+
 /* 先写 HQD_SELECT 选中槽位，再经 Host 选槽窗口读取该槽的一个 HQD 字段。 */
 static uint32_t hqd_read(CPTest *s, unsigned int slot, unsigned int field)
 {
@@ -269,7 +283,8 @@ static void queue_mqd(CPTest *s, unsigned int slot)
  * @ih_bytes: IH Ring 字节容量。
  *
  * 1. 保持 CP 复位时写入固件和复位向量；
- * 2. 使能 Outbound，使 Host RAM 可经 GPU 物理地址访问；
+ * 2. 使能 Outbound，使 Host RAM 可经 GPU 物理地址访问，并把队列控制区
+ *    登记为不可缓存；
  * 3. 配置并使能 IH Ring；
  * 4. 经 Host 选槽窗口写入 KIQ（槽 0）并激活；
  * 5. 使能设备并解除 CP 复位。
@@ -302,10 +317,14 @@ static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes)
 	 * 2. Outbound 布局在复位后固定为
 	 *    “GPU 物理地址 = GPGPU_OUTBOUND_BASE + Host IOVA”，只需打开；
 	 *    状态为 ACK 表示设备接受了这次配置。此后 CP 才能经
-	 *    GPA() 换算出的地址访问 Host RAM。
+	 *    GPA() 换算出的地址访问 Host RAM。测试随时改写 W、Header、
+	 *    Signal 与参数块，CP 必须读到 Host RAM 中的最新值，所以整个
+	 *    控制区登记为不可缓存。
 	 */
 	wr(s, GPGPU_REG_OUTBOUND_CONTROL, GPGPU_OUTBOUND_ENABLE);
 	g_assert_cmphex(rd(s, GPGPU_REG_OUTBOUND_STATUS), ==, GPGPU_OUTBOUND_ACK);
+	g_assert_cmpuint(dcache_cmd(s, GPGPU_DCACHE_UC_ADD, GPA(QUEUE_HOST),
+				    QUEUE_CONTROL_END - QUEUE_HOST), ==, GPGPU_DCACHE_OK);
 
 	/*
 	 * 3. IH Ring 放在 Host RAM 的 QUEUE_IH。CP 每完成一个任务或
@@ -1065,6 +1084,130 @@ static void test_gpuvm_tlb(void)
 	cp_stop(&s);
 }
 
+/*
+ * test_gpuvm_cached_permission() - dcache 命中不绕过页权限
+ *
+ * 准备：vm_prepare() 建好 VMID 1，task 0 写 VM_DATA；收尾回写后
+ * KERNEL_OUT 所在行仍是干净的缓存行。随后卸载槽 2，把 VM_DATA 的叶子
+ * 改为只读，失效 TLB 后重新映射。
+ *
+ * 期望：task 1 写同一行时先检查页权限，记 PERMISSION 故障与 EXECUTOR
+ * 错误；KERNEL_OUT 保持 task 0 的结果。
+ */
+static void test_gpuvm_cached_permission(void)
+{
+	const uint64_t fault = GPGPU_REG_VM_FAULT(2);
+	CPTest s = { 0 };
+	uint32_t no_alloc = 0;
+
+	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
+	vm_submit(&s, 0, 0, VM_DATA);
+	wait_host32(&s, QUEUE_RPTR(2), 1);
+	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+
+	queue_unmap(&s, 2);
+	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_DATA, &no_alloc),
+		       KERNEL_OUT | GPGPU_VM_READ | GPGPU_VM_VALID);
+	vm_invalidate(&s);
+	queue_map(&s, 2);
+	vm_submit(&s, 1, 1, VM_DATA);
+	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
+	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_PERMISSION);
+	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_ACCESS), ==, GPGPU_VM_WRITE);
+	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+	cp_stop(&s);
+}
+
+/*
+ * test_dcache() 的可缓存 Host 区域：参数块与数据各占一条缓存行，位于
+ * 不可缓存控制区和 VM_HOST_TABLE 之后。
+ */
+#define DCACHE_ARGS (VM_HOST_TABLE + GPGPU_VM_PAGE_SIZE)
+#define DCACHE_DATA (DCACHE_ARGS + GPGPU_DCACHE_LINE_SIZE)
+
+/* 写 DCACHE_ARGS 中的两个参数：目标地址与待写值。 */
+static void dcache_args(CPTest *s, uint64_t target, uint64_t value)
+{
+	qtest_writeq(s->host, DCACHE_ARGS, target);
+	qtest_writeq(s->host, DCACHE_ARGS + 8, value);
+}
+
+/*
+ * test_dcache() - CP 与执行器共用的数据缓存、收尾回写与旁路维护
+ *
+ * 准备：GPUVM 关闭，映射 HIQ 与槽 2，装入写值 Kernel。Ring、进度、Signal
+ * 和 task 参数块在不可缓存控制区；DCACHE_ARGS、DCACHE_DATA 是可缓存的
+ * Host 内存，DCACHE_DATA 整行预先填 0x5a。
+ *
+ * 期望：
+ * 1. task 0 把值写到描述对象所在行（KERNEL_DESC + 32）。CP 读描述对象时
+ *    回填这一行，执行器的 store 直接命中，整个任务只有一次未命中；收尾
+ *    回写这一条脏行后，BAR 读到新值，描述对象不变；
+ * 2. task 1 的参数块在 DCACHE_ARGS，把值写到 DCACHE_DATA + 8。写分配先
+ *    回填整行，收尾回写后 Host 读到新值，同一行的其余字节不变；
+ * 3. CPU 改写 DCACHE_ARGS 并失效这一行，task 2 读到新参数，把值写到
+ *    DCACHE_DATA + 16。不失效时执行器仍读到旧参数，写回 + 8；
+ * 4. BAR 把已缓存的描述对象的 ABI 版本改为 0，CP 读到新内容，task 3 记
+ *    DESCRIPTOR 错误。
+ */
+static void test_dcache(void)
+{
+	const uint64_t shared = KERNEL_DESC + 32;
+	CPTest s = { 0 };
+	uint8_t expected[GPGPU_DCACHE_LINE_SIZE];
+	uint8_t line[GPGPU_DCACHE_LINE_SIZE];
+	uint32_t misses, hits, writebacks;
+
+	cp_boot(&s, false, 4096);
+	queue_mqd(&s, 1);
+	queue_map(&s, 1);
+	queue_mqd(&s, 2);
+	queue_map(&s, 2);
+	kernel_load(&s, KERNEL_CODE);
+	memset(expected, 0x5a, sizeof(expected));
+	qtest_memwrite(s.host, DCACHE_DATA, expected, sizeof(expected));
+
+	/* 1. CP 与执行器访问同一物理行。 */
+	misses = rd(&s, GPGPU_REG_DCACHE_MISSES);
+	hits = rd(&s, GPGPU_REG_DCACHE_HITS);
+	writebacks = rd(&s, GPGPU_REG_DCACHE_WRITEBACKS);
+	aql_submit(&s, 2, 0, 0, KERNEL_DESC, GPA(QUEUE_ARGS(0)), GPA(QUEUE_SIGNAL(0)),
+		   GPA(QUEUE_MAILBOX(0)), shared);
+	wait_host32(&s, QUEUE_RPTR(2), 1);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_MISSES) - misses, ==, 1);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_HITS) - hits, >, 0);
+	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_WRITEBACKS) - writebacks, ==, 1);
+	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, shared), ==, 0xaabb0000);
+	g_assert_cmphex(qpci_io_readq(s.dev, s.vram, KERNEL_DESC), ==, KERNEL_CODE);
+
+	/* 2. Host 数据写分配，部分写不破坏同一行的其余字节。 */
+	dcache_args(&s, GPA(DCACHE_DATA) + 8, 0xaabb0001);
+	aql_submit(&s, 2, 1, 1, KERNEL_DESC, GPA(DCACHE_ARGS), GPA(QUEUE_SIGNAL(1)),
+		   GPA(QUEUE_MAILBOX(1)), GPA(DCACHE_DATA) + 8);
+	wait_host32(&s, QUEUE_RPTR(2), 2);
+	stl_le_p(expected + 8, 0xaabb0001);
+	qtest_memread(s.host, DCACHE_DATA, line, sizeof(line));
+	g_assert_cmpmem(line, sizeof(line), expected, sizeof(expected));
+
+	/* 3. CPU 改写可缓存参数后，失效设备中的旧副本。 */
+	dcache_args(&s, GPA(DCACHE_DATA) + 16, 0xaabb0002);
+	g_assert_cmpuint(dcache_cmd(&s, GPGPU_DCACHE_INVALIDATE, GPA(DCACHE_ARGS), 16), ==,
+			 GPGPU_DCACHE_OK);
+	aql_submit(&s, 2, 2, 2, KERNEL_DESC, GPA(DCACHE_ARGS), GPA(QUEUE_SIGNAL(2)),
+		   GPA(QUEUE_MAILBOX(2)), GPA(DCACHE_DATA) + 16);
+	wait_host32(&s, QUEUE_RPTR(2), 3);
+	stl_le_p(expected + 16, 0xaabb0002);
+	qtest_memread(s.host, DCACHE_DATA, line, sizeof(line));
+	g_assert_cmpmem(line, sizeof(line), expected, sizeof(expected));
+
+	/* 4. BAR 写入使已缓存的描述对象行失效。 */
+	qpci_io_writel(s.dev, s.vram,
+		       KERNEL_DESC + offsetof(GpgpuKernelDescriptor, kernel_abi_version), 0);
+	aql_submit_phys(&s, 2, 3, 3);
+	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_DESCRIPTOR);
+	cp_stop(&s);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -1075,5 +1218,7 @@ int main(int argc, char **argv)
 	qtest_add_func("/gpgpu/cp/gpuvm-exec-fault", test_gpuvm_exec_fault);
 	qtest_add_func("/gpgpu/cp/gpuvm-system", test_gpuvm_system);
 	qtest_add_func("/gpgpu/cp/gpuvm-tlb", test_gpuvm_tlb);
+	qtest_add_func("/gpgpu/cp/gpuvm-cached-permission", test_gpuvm_cached_permission);
+	qtest_add_func("/gpgpu/cp/dcache", test_dcache);
 	return g_test_run();
 }

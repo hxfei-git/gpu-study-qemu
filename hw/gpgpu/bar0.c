@@ -45,6 +45,7 @@ static const Bar0Group bar0_groups[] = {
 	{ "gpgpu-ih", 0x800, REG_GROUP_SIZE, gpgpu_ih_read, gpgpu_ih_write, true },
 	{ "gpgpu-vm", 0x900, 2 * REG_GROUP_SIZE, gpgpu_vm_read, gpgpu_vm_write },
 	{ "gpgpu-outbound", 0xb00, REG_GROUP_SIZE, gpgpu_outbound_read, gpgpu_outbound_write },
+	{ "gpgpu-dcache", 0xc00, REG_GROUP_SIZE, gpgpu_dcache_read, gpgpu_dcache_write },
 };
 
 /* HQD 窗口的寄存器偏移相对所选槽，单独处理。 */
@@ -175,7 +176,10 @@ static bool cp_access_ok(GPGPUState *s, hwaddr reg, unsigned int size)
 	return false;
 }
 
-/* CP 可读：VM 0x900～0x9ff、Dispatch、IH 与 ERROR_STATUS；其余锁存 INVALID_CMD。 */
+/*
+ * CP 可读：VM 0x900～0x9ff、Dispatch、IH、dcache 与 ERROR_STATUS；
+ * 其余锁存 INVALID_CMD。
+ */
 static uint64_t cp_regs_read(void *opaque, hwaddr reg, unsigned int size)
 {
 	GPGPUState *s = opaque;
@@ -189,6 +193,8 @@ static uint64_t cp_regs_read(void *opaque, hwaddr reg, unsigned int size)
 		return gpgpu_dispatch_read(s, reg);
 	if (reg_group(reg) == GPGPU_REG_IH_BASE_LO)
 		return gpgpu_ih_read(s, reg);
+	if (reg_group(reg) == GPGPU_REG_DCACHE_HITS)
+		return gpgpu_dcache_cp_read(s, reg);
 	if (reg == GPGPU_REG_ERROR_STATUS)
 		return gpgpu_global_read(s, reg);
 
@@ -197,7 +203,7 @@ static uint64_t cp_regs_read(void *opaque, hwaddr reg, unsigned int size)
 }
 
 /*
- * CP 可写：VM_FIRMWARE 握手、Dispatch 与 IH_SUBMIT。
+ * CP 可写：VM_FIRMWARE 握手、Dispatch、IH_SUBMIT 与 dcache 维护命令。
  * 握手版本不符或其余偏移锁存 INVALID_CMD。
  */
 static void cp_regs_write(void *opaque, hwaddr reg, uint64_t value, unsigned int size)
@@ -214,6 +220,8 @@ static void cp_regs_write(void *opaque, hwaddr reg, uint64_t value, unsigned int
 		gpgpu_dispatch_cp_write(s, reg, value);
 	} else if (reg_group(reg) == GPGPU_REG_IH_BASE_LO) {
 		gpgpu_ih_cp_write(s, reg, value);
+	} else if (reg_group(reg) == GPGPU_REG_DCACHE_HITS) {
+		gpgpu_dcache_cp_write(s, reg, value);
 	} else {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
 	}

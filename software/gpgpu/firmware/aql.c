@@ -7,11 +7,11 @@
  *   1. 读 Header，INVALID 表示尚未发布，等下一轮
  *   2. 读包体，检查包、Kernel 描述对象与 Signal
  *   3. 把配置写入执行器并提交
- *   4. 等执行器结束并确认结果
+ *   4. 等执行器结束并确认结果，再回写整个 dcache
  *   5. 按序发布完成：Signal 1→0、通知槽、IH 记录、Header 置 INVALID、R+1
  *
  * 第 2 步之前的错误不触及执行器；第 3 步之后出错时，执行器已经结束，已写入
- * 的数据保留，不补写成功 Signal。
+ * 的数据照样回写并保留，不补写成功 Signal。
  */
 #include "cp.h"
 
@@ -263,13 +263,27 @@ static int aql_run(void)
 }
 
 /*
+ * 第 4 步的后半：执行器已停止访问内存，回写整个 dcache，Kernel 写出的
+ * 数据随后对 Host 可见。缓存行保留，后续任务可以继续命中。CMD 写入后
+ * 设备同步执行，fence 后读到的 STATUS 就是本次结果。
+ *
+ * Return: 回写成功为 1。
+ */
+static int aql_clean(void)
+{
+	cp_reg_write(GPGPU_REG_DCACHE_CMD, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_ALL);
+	cp_fence();
+	return cp_reg_read(GPGPU_REG_DCACHE_STATUS) == GPGPU_DCACHE_OK;
+}
+
+/*
  * aql_complete() - 第 5 步：任务成功后按序发布完成
  *
  * Host 等待方先轮询 Signal，超时后阻塞在事件上，由驱动根据 IH 记录和
  * 通知槽唤醒；Host 提交方根据 R 复用 Ring 槽。所以顺序必须是：
  *
- * 1. Signal：fence 保证执行器写回的结果先于 Signal 可见；再读一次确认
- *    完成值仍为 1，然后用单条 64 位 store 写 0；
+ * 1. Signal：第 4 步已把结果回写到内存，fence 保证它们先于 Signal 可见；
+ *    再读一次确认完成值仍为 1，然后用单条 64 位 store 写 0；
  * 2. 通知槽：fence 后写入零扩展的事件编号，驱动消费 IH 记录时用它核对；
  * 3. IH：fence 后提交 SIGNAL_NOTIFY，驱动据此唤醒等待者。提交失败时
  *    cp_ih_submit() 已置 cp_stopped，直接返回；
@@ -317,7 +331,7 @@ static void aql_complete(u32 slot, const AqlTask *t)
  * cp_aql() - 处理用户槽中的一个派发包
  *
  * 一次调用同步走完文件头的 5 步：取包并检查，配置执行器，等待整个
- * Dispatch 结束，再发布完成。CP 在等待期间不处理其他队列。
+ * Dispatch 结束并回写 dcache，再发布完成。CP 在等待期间不处理其他队列。
  *
  * Return: 本轮提交过执行器或调度已停止时为 1，供主循环轮换两个用户槽的
  * 优先顺序；没有可执行的包（含提交前即出错）时为 0。
@@ -325,6 +339,7 @@ static void aql_complete(u32 slot, const AqlTask *t)
 int cp_aql(u32 slot)
 {
 	AqlTask t;
+	int ok;
 
 	/* 1. 2. 没有已发布的包或检查失败时返回 0，失败已记错误。 */
 	if (!aql_fetch(slot, &t))
@@ -344,8 +359,13 @@ int cp_aql(u32 slot)
 	if (cp_ih_faulted())
 		return 1;
 
-	/* 4. 提交并等待终态；执行失败记 EXECUTOR 错误，不发布成功 Signal。 */
-	if (!aql_run()) {
+	/*
+	 * 4. 提交并等待终态，再回写 dcache；执行失败也先回写，失败前
+	 *    已完成的写入同样对 Host 可见。执行或回写失败都记 EXECUTOR
+	 *    错误，不发布成功 Signal。
+	 */
+	ok = aql_run();
+	if (!aql_clean() || !ok) {
 		cp_queue_error(slot, GPGPU_QUEUE_ERROR_EXECUTOR);
 		return 1;
 	}

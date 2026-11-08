@@ -5,6 +5,9 @@
  * 同一块 RAM 有三条访问路径：Host 经 BAR2；原生 CP 经板级别名直接取指和
  * 访存；设备内部（GPU 物理访问、DMA、IH）经本模块的 AddressSpace。设备内部
  * 写入必须走 AddressSpace，原生 CP 已翻译的代码才会随之失效。
+ *
+ * 本模块是后备存储，不经过 dcache。BAR2 在读写前维护重叠的 dcache 行；
+ * 其他直接读写本模块的一方自行维护，见 mem/dcache.h。
  */
 #ifndef HW_GPGPU_MEM_VRAM_H
 #define HW_GPGPU_MEM_VRAM_H

@@ -11,7 +11,8 @@
  *   6. 经 KIQ 映射 HIQ，确认固件已完成版本握手。
  *
  * 停止顺序（gpgpu_device_stop）：拒绝新请求并让等待者失败，保持 CP 复位，
- * 等跨进程访问结束后整体复位设备，最后回收 orphan 会话。
+ * 等跨进程访问结束后整体复位设备，最后回收 orphan 会话。整体复位会先
+ * 回写并清空 dcache 与不可缓存区间表，之后释放存储不再需要维护。
  */
 #include <linux/delay.h>
 #include <linux/dma-map-ops.h>
@@ -62,15 +63,91 @@ void gpgpu_dma_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf)
 	*buf = (struct gpgpu_dma_buf) { 0 };
 }
 
+/* ---- dcache ---- */
+
+/**
+ * gpgpu_dcache_command() - 经 BAR0 发出一条 Host dcache 命令
+ * @dev: 设备；调用者持 dev->lock，或设备尚未对外发布、已不再被并发使用。
+ * @cmd: GPGPU_DCACHE_* 命令。
+ * @addr: GPU 物理地址；@cmd 含 GPGPU_DCACHE_ALL 时忽略。
+ * @size: 字节数，不超过 32 位。
+ *
+ * 设备在 CMD 写入时同步执行，随后读到的 STATUS 就是本次结果。
+ *
+ * Return: 0；区间表已满为 -ENOSPC；遇到脏行或有在途访问为 -EBUSY；参数
+ * 被拒绝为 -EINVAL；回写失败为 -EIO。
+ */
+int gpgpu_dcache_command(struct gpgpu_device *dev, u32 cmd, u64 addr, u64 size)
+{
+	if (size > U32_MAX)
+		return -EINVAL;
+	gpgpu_wreg64(dev, GPGPU_REG_DCACHE_ADDR_LO, addr);
+	gpgpu_wreg(dev, GPGPU_REG_DCACHE_LENGTH, size);
+	gpgpu_wreg(dev, GPGPU_REG_DCACHE_CMD, cmd);
+	switch (gpgpu_rreg(dev, GPGPU_REG_DCACHE_STATUS)) {
+	case GPGPU_DCACHE_OK:
+		return 0;
+	case GPGPU_DCACHE_FULL:
+		return -ENOSPC;
+	case GPGPU_DCACHE_DIRTY:
+	case GPGPU_DCACHE_BUSY:
+		return -EBUSY;
+	case GPGPU_DCACHE_INVALID:
+		return -EINVAL;
+	default:
+		return -EIO;
+	}
+}
+
+/* 控制对象登记的长度：按缓存行取整，仍在按页分配的存储之内。 */
+static u64 ctrl_buf_span(const struct gpgpu_dma_buf *buf)
+{
+	return round_up(buf->size, GPGPU_DCACHE_LINE_SIZE);
+}
+
+/*
+ * gpgpu_ctrl_buf_alloc() - 分配驱动自己的控制对象并登记为不可缓存
+ *
+ * 用于 MQD、管理 Ring 与结果区、IH Ring。CP 管理域与 IH 本来就绕过
+ * dcache；登记后 GPUVM 关闭时，用户域经物理地址访问它们也不会缓存。
+ * 登记失败时不保留分配。调用者持 dev->lock，或设备尚未对外发布。
+ *
+ * Return: 0、gpgpu_dma_buf_alloc() 的错误，或 gpgpu_dcache_command() 的错误。
+ */
+int gpgpu_ctrl_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
+			 size_t align)
+{
+	int ret = gpgpu_dma_buf_alloc(dev, buf, size, align);
+
+	if (ret)
+		return ret;
+	ret = gpgpu_dcache_command(dev, GPGPU_DCACHE_UC_ADD, buf->addr, ctrl_buf_span(buf));
+	if (ret)
+		gpgpu_dma_buf_free(dev, buf);
+	return ret;
+}
+
+/*
+ * 撤销登记再释放。设备已移除时不再发命令：区间登记时已清掉旧行，
+ * 此后不会产生缓存行，复位也就不会回写这段存储。
+ */
+void gpgpu_ctrl_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf)
+{
+	if (buf->cpu && READ_ONCE(dev->present))
+		gpgpu_dcache_command(dev, GPGPU_DCACHE_UC_REMOVE, buf->addr, ctrl_buf_span(buf));
+	gpgpu_dma_buf_free(dev, buf);
+}
+
 /* ---- 引用计数 ---- */
 
-/* 最后一个引用：释放管理对象、IH、VRAM 分配器与 PCI 引用。 */
+/* 最后一个引用：释放管理对象、IH、保留的 BO、VRAM 分配器与 PCI 引用。 */
 static void gpgpu_device_release(struct kref *refs)
 {
 	struct gpgpu_device *dev = container_of(refs, struct gpgpu_device, refs);
 
 	gpgpu_mgmt_fini(dev);
-	gpgpu_dma_buf_free(dev, &dev->ih);
+	gpgpu_ctrl_buf_free(dev, &dev->ih);
+	gpgpu_bo_release_retained(dev);
 	gpgpu_vram_fini(dev);
 	if (dev->vram)
 		pci_iounmap(dev->pdev, dev->vram);
@@ -113,7 +190,8 @@ static bool gpgpu_device_supported(struct pci_dev *pdev, void __iomem *regs)
  *    Doorbell 第 0 页留给管理队列，管理请求序号从 1 开始；
  * 3. 建立 VRAM 分配器（预留首页），映射 BAR2 用于装载固件、清零对象
  *    和写页表；
- * 4. 分配 KIQ、HIQ 的 Ring 与 MQD，以及 IH Ring。
+ * 4. 分配 KIQ、HIQ 的 Ring 与 MQD，以及 IH Ring，并登记为不可缓存区间。
+ *    probe 已整体复位设备，区间表此时为空。
  *
  * 失败时放下唯一的引用，gpgpu_device_release() 只回收已分配的部分。
  */
@@ -149,6 +227,7 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 
 	INIT_LIST_HEAD(&dev->fprivs);
 	INIT_LIST_HEAD(&dev->requests);
+	INIT_LIST_HEAD(&dev->retained);
 	INIT_LIST_HEAD(&dev->reserved_blocks);
 	dev->next_sequence = 1;
 	dev->db_pages = BIT(0);
@@ -168,7 +247,7 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 	ret = gpgpu_mgmt_init(dev);
 	if (ret)
 		goto fail;
-	ret = gpgpu_dma_buf_alloc(dev, &dev->ih, GPGPU_IH_BYTES, GPGPU_IH_BYTES);
+	ret = gpgpu_ctrl_buf_alloc(dev, &dev->ih, GPGPU_IH_BYTES, GPGPU_IH_BYTES);
 	if (ret)
 		goto fail;
 

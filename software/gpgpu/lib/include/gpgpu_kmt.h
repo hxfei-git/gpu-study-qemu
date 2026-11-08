@@ -9,8 +9,10 @@
  * 使用顺序：
  *
  *   Open → AllocMemory → CreateQueue → CreateEvent
- *        → Reserve → Publish → WaitSignal（可重复）
+ *        → [SyncMemory] → Reserve → Publish → WaitSignal（可重复）
  *        → DrainQueue → DestroyQueue → DestroyEvent → FreeMemory → Close
+ *
+ * SyncMemory 只在 CPU 直接改写了可缓存对象时需要，见该函数的说明。
  *
  * 队列存活期间仍可分配和释放其他对象；Ring 与进度对象要等队列卸载后才能
  * 释放。驱动不知道哪些任务还在使用某个对象，释放前由调用者确认。
@@ -104,20 +106,29 @@ const char *gpgpuKmtStatusString(GpgpuKmtStatus status);
 /* ---- 内存 ---- */
 
 /*
- * 创建并绑定一个整对象。permissions 为 GPGPU_VM_READ/WRITE/EXEC 的组合。
- * 库先申请一段 CPU 地址，把对象映射到这里，GPUVM 开启时再以同一数值
- * 绑定 GPU。fixed_va 非零时要求使用这一 CPU 地址，已被占用则失败；
- * GPUVM 关闭时必须为 0。队列存活期间也可以创建和释放内存，释放前由
- * 调用者确认已没有任务使用该对象。
+ * 创建并绑定一个整对象。flags 为 0 或 GPGPU_BO_UNCACHED：Ring、进度与
+ * Signal 这类与 CP 持续共享的对象必须不可缓存，普通数据用 0。permissions
+ * 为 GPGPU_VM_READ/WRITE/EXEC 的组合。库先申请一段 CPU 地址，把对象映射
+ * 到这里，GPUVM 开启时再以同一数值绑定 GPU。fixed_va 非零时要求使用
+ * 这一 CPU 地址，已被占用则失败；GPUVM 关闭时必须为 0。队列存活期间
+ * 也可以创建和释放内存，释放前由调用者确认已没有任务使用该对象。
  */
-GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint64_t size,
-				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
-				   GpgpuKmtMemory **memory);
+GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *context, uint32_t kind, uint32_t flags,
+				   uint64_t size, uint64_t alignment, uint32_t permissions,
+				   uint64_t fixed_va, GpgpuKmtMemory **memory);
 GpgpuKmtStatus gpgpuKmtFreeMemory(GpgpuKmtMemory *memory);
 /* 在 Host 对象与 VRAM 对象之间同步搬运；direction 为 GPGPU_COPY_H2D 或 D2H。 */
 GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset,
 				  GpgpuKmtMemory *vram, uint64_t vram_offset, uint64_t size,
 				  uint32_t direction);
+/*
+ * 在 CPU 与设备之间交接可缓存对象的一段数据：CPU 直接改写后、发布任务
+ * 前用 GPGPU_CACHE_INVALIDATE 失效设备中的旧副本；op 也可带
+ * GPGPU_CACHE_CLEAN，先回写设备写出的数据。CopyMemory 由设备自行维护
+ * 两端，不需要再调用。
+ */
+GpgpuKmtStatus gpgpuKmtSyncMemory(GpgpuKmtMemory *memory, uint64_t offset, uint64_t size,
+				  uint32_t op);
 
 /* ---- 队列 ---- */
 

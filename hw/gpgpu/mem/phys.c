@@ -6,6 +6,7 @@
 #include "qemu/bitops.h"
 #include "hw/remote/vfio-user-obj.h"
 #include "hw/gpgpu/gpgpu_state.h"
+#include "dcache.h"
 #include "phys.h"
 #include "vram.h"
 
@@ -24,9 +25,10 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
 /*
  * gpgpu_phys_rw() - 按 GPU 物理地址读写 VRAM 或 Host 内存
  *
- * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都经过这里。
- * GPU 物理空间低端是 VRAM，0x8000_0000 起是 Outbound 窗口，窗口内的地址
- * 对应 Host 内存；两者之间的空洞不可路由：
+ * CP 管理域访问、页表遍历、取指、IH 写记录、DMA 的 Host 端，以及 dcache
+ * 的回填与回写都经过这里；本函数不查 dcache。GPU 物理空间低端是 VRAM，
+ * 0x8000_0000 起是 Outbound 窗口，窗口内的地址对应 Host 内存；两者之间的
+ * 空洞不可路由：
  *
  * 1. 检查 [addr, addr + len) 完整落在 VRAM 或已使能的 Outbound 窗口内，
  *    不允许触及空洞或跨越边界；
@@ -97,8 +99,9 @@ uint32_t gpgpu_outbound_read(GPGPUState *s, hwaddr reg)
 
 /*
  * 布局固定且只读，Host 只能写 CONTROL：所有设备引擎停止、且无在途访问时
- * 才接受，值只能是 0 或 GPGPU_OUTBOUND_ENABLE。其余写入置 ERROR 并锁存
- * INVALID_CMD。
+ * 才接受，值只能是 0 或 GPGPU_OUTBOUND_ENABLE。关闭窗口前先回写并失效
+ * 窗口内的 dcache 行，关闭后这些行再也无法回写；回写失败时窗口保持
+ * 打开。其余写入置 ERROR 并锁存 INVALID_CMD。
  */
 void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 {
@@ -106,6 +109,10 @@ void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 
 	if (reg != GPGPU_REG_OUTBOUND_CONTROL || (value & ~GPGPU_OUTBOUND_ENABLE) ||
 	    p->accesses || !gpgpu_engines_idle(s))
+		goto invalid;
+	if (p->enabled && !value &&
+	    gpgpu_dcache_maintain(s, p->gpu_base, p->size,
+				  GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
 		goto invalid;
 	p->enabled = value;
 	p->status = GPGPU_OUTBOUND_ACK;

@@ -39,6 +39,7 @@
 | GEM    | Graphics Execution Manager                             | DRM 图形内存对象管理框架                         |
 | GPUVA  | GPU Virtual Address                                    | GPU 虚拟地址                                     |
 | GPUVM  | GPU Virtual Memory                                     | GPU 虚拟内存；设备地址空间及其映射管理           |
+| dcache | Data Cache                                             | 数据缓存；本实验指翻译后的设备级数据缓存         |
 | VM     | Virtual Memory                                         | 虚拟内存；本文指 GPU 地址空间                   |
 | TTM    | Translation Table Maps                                 | Linux 图形内存管理框架；用于对象存储位置管理     |
 | MMU    | Memory Management Unit                                 | 内存管理单元                                     |
@@ -56,7 +57,7 @@
 
 本大纲维护阶段依赖、实验范围和完成标准，不再记录当前任务或重复验收结果。开始工作先看[实验进度](<./实验进度.md>)；查构建命令、当前代码和实际运行记录，进入[软件栈说明](<../software/gpgpu/README.md>)。
 
-- [CP/MEC 第一版规格](<./CP_MEC 第一版规格.md#spec-overview>)规定队列、派发、完成与错误处理；[GPUVM 第一版规格](<./GPUVM 第一版规格.md>)规定地址翻译、对象绑定和回收。
+- [CP/MEC 第一版规格](<./CP_MEC 第一版规格.md#spec-overview>)规定队列、派发、完成与错误处理；[GPUVM 第一版规格](<./GPUVM 第一版规格.md>)规定地址翻译、对象绑定和回收；[dcache 第一版规格](<./dcache 第一版规格.md>)规定翻译后的数据缓存、缓存属性和软件交接。
 - [GPGPU 硬件手册](<./GPGPU_硬件手册.html>)按硬件模块组织寄存器、位域、访问权限和复位值。
 - [Linux 驱动内存管理](<./Linux 驱动内存管理.md>)独立讲解对象、存储、映射与回收，并保留 AMD 对照，不作为待确认规格。
 - [第三阶段规格评审](<./第三阶段规格评审.md>)维护与 AMD 的差异及剩余改进草案；[待确认索引](<./第三阶段规格评审.md#review-index>)不再列已结项内容，确认后的范围与边界由对应规格和本大纲维护。

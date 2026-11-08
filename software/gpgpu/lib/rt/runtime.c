@@ -63,15 +63,19 @@ struct GpgpuRt {
 	bool failed;
 };
 
-/* 分配并登记一个对象，默认不可由 buffer_free 单独释放。 */
-static GpgpuKmtStatus rt_alloc(GpgpuRt *rt, uint32_t kind, size_t size, uint32_t permissions,
-			       GpgpuKmtMemory **memory)
+/*
+ * 分配并登记一个对象，默认不可由 buffer_free 单独释放；
+ * flags 见 gpgpuKmtAllocMemory()。
+ */
+static GpgpuKmtStatus rt_alloc(GpgpuRt *rt, uint32_t kind, uint32_t flags, size_t size,
+			       uint32_t permissions, GpgpuKmtMemory **memory)
 {
 	GpgpuKmtStatus status;
 
 	if (rt->object_count == RT_MAX_OBJECTS)
 		return GPGPU_KMT_OUT_OF_RESOURCES;
-	status = gpgpuKmtAllocMemory(rt->context, kind, size, RT_PAGE, permissions, 0, memory);
+	status = gpgpuKmtAllocMemory(rt->context, kind, flags, size, RT_PAGE, permissions, 0,
+				     memory);
 	if (status == GPGPU_KMT_SUCCESS)
 		rt->objects[rt->object_count++] = (struct rt_object) { .memory = *memory };
 	return status;
@@ -80,8 +84,10 @@ static GpgpuKmtStatus rt_alloc(GpgpuRt *rt, uint32_t kind, size_t size, uint32_t
 /*
  * gpgpu_rt_create() - 分配运行时内部的 Host 对象
  *
- * 1. 暂存区（上传、下载时与 VRAM 之间中转）和参数块（设备只读）；
- * 2. AQL Ring（4 KiB，64 个槽）、R/W 进度页和一个 Signal。
+ * 1. 暂存区（上传、下载时与 VRAM 之间中转）和参数块（设备只读）。两者
+ *    可缓存：暂存区只经 COPY 访问，由设备维护；参数块每次派发前失效；
+ * 2. AQL Ring（4 KiB，64 个槽）、R/W 进度页和一个 Signal。CP 持续轮询
+ *    它们，三者都不可缓存。
  *
  * 它们都是 Host 对象，CPU 可以直接写。队列推迟到第一次派发时创建。
  * 任一对象分配失败时，释放已分配的部分并返回错误。
@@ -89,6 +95,7 @@ static GpgpuKmtStatus rt_alloc(GpgpuRt *rt, uint32_t kind, size_t size, uint32_t
 GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, GpgpuRt **out)
 {
 	const uint32_t rw = GPGPU_VM_READ | GPGPU_VM_WRITE;
+	const uint32_t uc = GPGPU_BO_UNCACHED;
 	GpgpuKmtStatus status;
 	GpgpuRt *rt;
 
@@ -104,16 +111,16 @@ GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, Gp
 	 * 1. 暂存区和参数块；2. Ring、进度页和 Signal。
 	 *    某次分配失败后跳过后面的分配，统一在下方回收。
 	 */
-	status = rt_alloc(rt, GPGPU_MEMORY_HOST, staging_size, rw, &rt->staging);
+	status = rt_alloc(rt, GPGPU_MEMORY_HOST, 0, staging_size, rw, &rt->staging);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_HOST, GPGPU_RT_MAX_ARGS * sizeof(uint64_t),
+		status = rt_alloc(rt, GPGPU_MEMORY_HOST, 0, GPGPU_RT_MAX_ARGS * sizeof(uint64_t),
 				  GPGPU_VM_READ, &rt->args);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_HOST, RT_RING_BYTES, rw, &rt->ring);
+		status = rt_alloc(rt, GPGPU_MEMORY_HOST, uc, RT_RING_BYTES, rw, &rt->ring);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_HOST, RT_PAGE, rw, &rt->progress);
+		status = rt_alloc(rt, GPGPU_MEMORY_HOST, uc, RT_PAGE, rw, &rt->progress);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_HOST, sizeof(GpgpuSignal), rw, &rt->signal);
+		status = rt_alloc(rt, GPGPU_MEMORY_HOST, uc, sizeof(GpgpuSignal), rw, &rt->signal);
 	if (status != GPGPU_KMT_SUCCESS) {
 		gpgpu_rt_destroy(rt);
 		return status;
@@ -204,7 +211,7 @@ GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **
 
 	if (!rt || !size || !buffer)
 		return GPGPU_KMT_INVALID_PARAMETER;
-	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, size, GPGPU_VM_READ | GPGPU_VM_WRITE, buffer);
+	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, 0, size, GPGPU_VM_READ | GPGPU_VM_WRITE, buffer);
 	if (status == GPGPU_KMT_SUCCESS)
 		rt->objects[rt->object_count - 1].can_free = true;
 	return status;
@@ -235,10 +242,10 @@ GpgpuKmtStatus gpgpu_rt_kernel_load(GpgpuRt *rt, const void *code, size_t code_s
 		return GPGPU_KMT_INVALID_PARAMETER;
 
 	/* 1. 代码区可执行，描述对象只读。 */
-	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, code_size, GPGPU_VM_READ | GPGPU_VM_EXEC,
+	status = rt_alloc(rt, GPGPU_MEMORY_VRAM, 0, code_size, GPGPU_VM_READ | GPGPU_VM_EXEC,
 			  &kernel->code);
 	if (status == GPGPU_KMT_SUCCESS)
-		status = rt_alloc(rt, GPGPU_MEMORY_VRAM, sizeof(desc), GPGPU_VM_READ,
+		status = rt_alloc(rt, GPGPU_MEMORY_VRAM, 0, sizeof(desc), GPGPU_VM_READ,
 				  &kernel->descriptor);
 	if (status != GPGPU_KMT_SUCCESS)
 		return status;
@@ -324,13 +331,15 @@ static GpgpuAqlPacket rt_packet(const GpgpuRt *rt, const GpgpuRtKernel *kernel,
  * 要等本次完成才返回。
  *
  * 1. 确保队列存在，回收旧事件；待回收事件已满时返回 OUT_OF_RESOURCES；
- * 2. 创建本次事件。失败时还没有改动参数和 Signal，可以重试；
- * 3. 把参数按小端写进参数块，每个参数一个 8 字节槽。RV64 执行器把
- *    参数块地址放进 a0，Kernel 用普通 LD 读取；
+ * 2. 把参数按小端写进参数块，每个参数一个 8 字节槽。RV64 执行器把
+ *    参数块地址放进 a0，Kernel 用普通 LD 读取。参数块可缓存，上一次派发
+ *    读过的行可能还留在 dcache 中，所以写完后失效这段范围；
+ * 3. 创建本次事件。第 2、3 步失败时还没有发布任何包，可以重试；
  * 4. 把 Signal 置为 1，填入本次事件的编号与通知槽地址。CP 完成后把值减为 0，
  *    再写通知槽，驱动随后唤醒事件等待者；
  * 5. 组包，经 Reserve 取号并等到空槽，再由 Publish 发布 Header、敲 Doorbell；
- * 6. 等 Signal 归零，期限为 timeout_ms；
+ * 6. 等 Signal 归零，期限为 timeout_ms。CP 发布 Signal 前已回写 dcache，
+ *    Kernel 写出的数据此时对 CPU 可见；
  * 7. 成功后销毁本次事件，返回忙时登记待回收。
  *
  * 第 5、6 步失败时 CP 可能仍在读写参数块和 Signal，运行时标记为失败并保留
@@ -359,18 +368,23 @@ GpgpuKmtStatus gpgpu_rt_dispatch(GpgpuRt *rt, const GpgpuRtKernel *kernel, const
 	if (rt->pending_count == RT_MAX_PENDING_EVENTS)
 		return GPGPU_KMT_OUT_OF_RESOURCES;
 
-	/* 2. 事件绑定来源队列，所以在队列之后创建。 */
-	status = gpgpuKmtCreateEvent(rt->queue, &rt->event);
-	if (status != GPGPU_KMT_SUCCESS)
-		return status;
-
 	/*
-	 * 3. 参数块是 Host 对象，CPU 直接写；
-	 *    可见性由 Publish 中的屏障保证。
+	 * 2. 参数块是可缓存的 Host 对象，CPU 直接写；失效 dcache 中的
+	 *    旧副本后，执行器才会从内存读到新参数。写入顺序由 Publish
+	 *    中的屏障保证。
 	 */
 	block_args = rt->args->cpu;
 	for (uint32_t i = 0; i < args_count; i++)
 		block_args[i] = htole64(args[i]);
+	status = gpgpuKmtSyncMemory(rt->args, 0, args_count * sizeof(uint64_t),
+				    GPGPU_CACHE_INVALIDATE);
+	if (status != GPGPU_KMT_SUCCESS)
+		return status;
+
+	/* 3. 事件绑定来源队列，所以在队列之后创建。 */
+	status = gpgpuKmtCreateEvent(rt->queue, &rt->event);
+	if (status != GPGPU_KMT_SUCCESS)
+		return status;
 
 	/*
 	 * 4. 必须在发布包之前写好 Signal：

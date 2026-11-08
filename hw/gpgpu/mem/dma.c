@@ -6,6 +6,7 @@
 #include "qemu/timer.h"
 #include "hw/gpgpu/gpgpu_state.h"
 #include "hw/gpgpu/irq/irq.h"
+#include "dcache.h"
 #include "dma.h"
 #include "phys.h"
 #include "vram.h"
@@ -41,10 +42,16 @@ static void dma_fail(GPGPUState *s)
  * 2. 检查描述符：设备已使能、长度非零、VRAM 端完整位于 VRAM 内，
  *    Host 端不低于 Outbound 起点且落在已使能的窗口里，空洞地址失败。
  *    不合法时置 ERROR 并锁存 DMA_FAULT，不搬运；
- * 3. 置 BUSY，把 VRAM 端映射成一段 Host 指针，再经 gpgpu_phys_rw()
+ * 3. 两端都直接读写后备存储，先维护 dcache：读端回写脏行，写端回写并
+ *    失效，避免读到旧值或旧脏行之后覆盖新数据。回写失败时按第 2 步
+ *    处理，不搬运；
+ * 4. 置 BUSY，把 VRAM 端映射成一段 Host 指针，再经 gpgpu_phys_rw()
  *    与 Host 端直接互拷。Host 访问失败时置 ERROR，已写入的部分保留；
- * 4. 搬运成功后安排 1 ms 定时器，到期才发布 COMPLETE 和完成中断，
+ * 5. 搬运成功后安排 1 ms 定时器，到期才发布 COMPLETE 和完成中断，
  *    模拟真实引擎的完成时延。BUSY 期间描述符不能改写。
+ *
+ * 搬运期间不释放主锁，其他客户端不会在第 3 步之后重新缓存这两段
+ * 地址。
  */
 static void dma_start(GPGPUState *s, uint32_t ctrl)
 {
@@ -52,6 +59,7 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 	bool to_host = ctrl & GPGPU_DMA_DIR_FROM_VRAM;
 	uint64_t vram_addr = to_host ? d->src_addr : d->dst_addr;
 	uint64_t host_addr = to_host ? d->dst_addr : d->src_addr;
+	const uint32_t flush = GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE;
 	MemTxResult result;
 	void *vram;
 
@@ -67,9 +75,16 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 		return;
 	}
 
+	/* 3. D2H 读 VRAM、写 Host；H2D 读 Host、写 VRAM。 */
+	if (gpgpu_dcache_maintain(s, vram_addr, d->size, to_host ? GPGPU_DCACHE_CLEAN : flush) ||
+	    gpgpu_dcache_maintain(s, host_addr, d->size, to_host ? flush : GPGPU_DCACHE_CLEAN)) {
+		dma_fail(s);
+		return;
+	}
+
 	/*
-	 * 3. VRAM 端映射：D2H 时只读，H2D 时只写；Host 端读写方向与之相反。
-	 *    Host 端走 Outbound 时经 vfio-user DMA，可能暂时释放主锁。
+	 * 4. VRAM 端映射：D2H 时只读，H2D 时只写；Host 端读写方向
+	 *    与之相反。
 	 */
 	d->status = GPGPU_DMA_BUSY;
 	vram = gpgpu_vram_map(s, vram_addr, d->size, !to_host);
@@ -80,7 +95,7 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 		return;
 	}
 
-	/* 4. 状态保持 BUSY，直到定时器回调 dma_complete() 发布 COMPLETE。 */
+	/* 5. 状态保持 BUSY，直到定时器回调 dma_complete() 发布 COMPLETE。 */
 	timer_mod(d->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DMA_COMPLETION_DELAY_MS);
 }
 

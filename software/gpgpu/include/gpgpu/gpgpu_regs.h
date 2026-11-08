@@ -8,9 +8,11 @@
  *   0x300 Dispatch（CP）  0x400 DMA             0x500 CP 控制
  *   0x600 HQD 选槽        0x700 HQD 窗口        0x800 IH
  *   0x900 GPUVM 控制      0xa00 GPUVM 故障      0xb00 Outbound
+ *   0xc00 dcache
  *
  * 0x300 组与 IH_SUBMIT 只能由 CP 经本地寄存器窗口写入（见 gpgpu_cp_map.h），
- * Host 写入锁存 INVALID_CMD。BAR2 为 VRAM，BAR4 为 Doorbell。
+ * Host 写入锁存 INVALID_CMD。0xc00 组 Host 与 CP 都能访问，两方各有一份
+ * 命令参数与结果。BAR2 为 VRAM，BAR4 为 Doorbell。
  */
 #ifndef GPGPU_REGS_H
 #define GPGPU_REGS_H
@@ -72,6 +74,8 @@
 #define GPGPU_ERR_IH_FAULT (1u << 3)
 /* ERROR_STATUS：CP 固件报告不可恢复异常；也是固件 DEVICE_ERROR 记录唯一允许的值。 */
 #define GPGPU_ERR_FIRMWARE (1u << 4)
+/* ERROR_STATUS：dcache 回写脏行失败；该行保持有效且脏，数据未丢弃。 */
+#define GPGPU_ERR_DCACHE_FAULT (1u << 5)
 
 /* ---- 0x200 中断 ---- */
 
@@ -433,5 +437,80 @@ enum GpgpuDispatchError {
 #define GPGPU_OUTBOUND_BUSY 2U
 /* OUTBOUND_STATUS：最近一次写入被拒绝（含写只读布局寄存器）。 */
 #define GPGPU_OUTBOUND_ERROR 4U
+
+/*
+ * ---- 0xc00 dcache：CP 用户数据窗口与 RV64 load/store 共用的数据缓存 ----
+ *
+ * 缓存按 GPU 物理地址组相联查找，写回加写分配；不可缓存区间内的访问
+ * 直接读写后备存储。地址位按下面的几何参数拆分（物理地址 32 位）：
+ *
+ *   位      31..13   12..6    5..0
+ *   用途    Tag      组号     行内偏移
+ *
+ * 维护命令先写 ADDR、LENGTH，再写 CMD，设备同步执行后把结果写入 STATUS。
+ * Host 经 BAR0、CP 经本地寄存器窗口访问同一组偏移，两方各有一份 ADDR、
+ * LENGTH 与 STATUS；登记和撤销不可缓存区间只接受 Host。
+ */
+
+/* 数据容量，单位字节，不含 Tag 与替换状态。 */
+#define GPGPU_DCACHE_SIZE 32768u
+/* 缓存行字节数；不可缓存区间与维护范围都以行为单位。 */
+#define GPGPU_DCACHE_LINE_SIZE 64u
+/* 每组路数，组内按最近最少使用替换。 */
+#define GPGPU_DCACHE_WAYS 4u
+/* 组数，组号 = (GPU 物理地址 / 行大小) % 组数。 */
+#define GPGPU_DCACHE_SETS (GPGPU_DCACHE_SIZE / GPGPU_DCACHE_LINE_SIZE / GPGPU_DCACHE_WAYS)
+/* 可同时登记的不可缓存区间数。 */
+#define GPGPU_DCACHE_UC_RANGES 64u
+
+/* 只读：可缓存请求按行查找的命中次数，32 位回绕，全设备共用。 */
+#define GPGPU_REG_DCACHE_HITS 0x0c00
+/* 只读：未命中次数，回填失败也计一次。 */
+#define GPGPU_REG_DCACHE_MISSES 0x0c04
+/* 只读：用新行替换有效旧行的次数。 */
+#define GPGPU_REG_DCACHE_EVICTIONS 0x0c08
+/* 只读：成功写回脏行的次数，含替换与各种维护。 */
+#define GPGPU_REG_DCACHE_WRITEBACKS 0x0c0c
+/* 命令起始 GPU 物理地址低 32 位。 */
+#define GPGPU_REG_DCACHE_ADDR_LO 0x0c10
+/* 命令起始 GPU 物理地址高 32 位。 */
+#define GPGPU_REG_DCACHE_ADDR_HI 0x0c14
+/* 命令字节数。 */
+#define GPGPU_REG_DCACHE_LENGTH 0x0c18
+/* 只写：GPGPU_DCACHE_* 命令，写入即同步执行；读为 0。 */
+#define GPGPU_REG_DCACHE_CMD 0x0c1c
+/* 只读：本方最近一次命令的 GpgpuDcacheStatus。 */
+#define GPGPU_REG_DCACHE_STATUS 0x0c20
+
+/* DCACHE_CMD：回写与范围重叠的脏行，保留有效副本。 */
+#define GPGPU_DCACHE_CLEAN (1u << 0)
+/* DCACHE_CMD：失效与范围重叠的行；与 CLEAN 同时给出时先回写再失效。 */
+#define GPGPU_DCACHE_INVALIDATE (1u << 1)
+/* DCACHE_CMD：作用于整个缓存，忽略地址与长度，须同带 CLEAN 或 INVALIDATE。 */
+#define GPGPU_DCACHE_ALL (1u << 2)
+/* DCACHE_CMD：把行对齐的 [ADDR, ADDR + LENGTH) 登记为不可缓存，单独使用。 */
+#define GPGPU_DCACHE_UC_ADD (1u << 3)
+/* DCACHE_CMD：撤销与 [ADDR, ADDR + LENGTH) 完全相同的已登记区间，单独使用。 */
+#define GPGPU_DCACHE_UC_REMOVE (1u << 4)
+
+/**
+ * enum GpgpuDcacheStatus - DCACHE_STATUS 的取值，依次为 0 到 5
+ * @GPGPU_DCACHE_OK: 复位值；最近一次命令已完成。
+ * @GPGPU_DCACHE_INVALID: 命令编码、地址或长度非法，区间重叠或不存在，
+ *                        或 CP 请求登记、撤销区间；没有改动任何状态。
+ * @GPGPU_DCACHE_DIRTY: 只失效时遇到脏行；之前的行已失效，该行及之后的行
+ *                      保持不变。
+ * @GPGPU_DCACHE_STORAGE: 回写失败；该行保持有效且脏，并锁存 DCACHE_FAULT。
+ * @GPGPU_DCACHE_FULL: 不可缓存区间表已满。
+ * @GPGPU_DCACHE_BUSY: 仍有在途物理访问，命令未执行。
+ */
+enum GpgpuDcacheStatus {
+	GPGPU_DCACHE_OK,
+	GPGPU_DCACHE_INVALID,
+	GPGPU_DCACHE_DIRTY,
+	GPGPU_DCACHE_STORAGE,
+	GPGPU_DCACHE_FULL,
+	GPGPU_DCACHE_BUSY,
+};
 
 #endif /* GPGPU_REGS_H */

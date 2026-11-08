@@ -21,6 +21,7 @@
 #include "mem/vram.h"
 #include "mem/phys.h"
 #include "mem/gpuvm.h"
+#include "mem/dcache.h"
 #include "mem/dma.h"
 #include "irq/ih.h"
 #include "irq/irq.h"
@@ -45,6 +46,7 @@
  * @vram: VRAM 存储与 BAR2。
  * @phys: Outbound 配置与在途物理访问计数。
  * @vm: GPUVM 上下文、TLB 与故障。
+ * @dcache: 数据缓存、不可缓存区间与维护命令。
  * @dma: DMA 描述符与完成定时器。
  * @ih: IH Ring。
  * @irq: 中断使能与锁存。
@@ -68,6 +70,7 @@ struct GPGPUState {
 	GPGPUVRAMState vram;
 	GPGPUPhysState phys;
 	GPGPUVMState vm;
+	GPGPUDcacheState dcache;
 	GPGPUDMAState dma;
 	GPGPUIHState ih;
 	GPGPUIRQState irq;

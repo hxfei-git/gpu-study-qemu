@@ -136,7 +136,7 @@ typedef struct GpgpuManagementResult {
  * @GPGPU_QUEUE_ERROR_RING: 读取 Ring、W 或相关地址失败。
  * @GPGPU_QUEUE_ERROR_PACKET: 已发布包的类型、格式或尺寸非法。
  * @GPGPU_QUEUE_ERROR_DESCRIPTOR: Kernel 描述对象非法或不可读。
- * @GPGPU_QUEUE_ERROR_EXECUTOR: 执行器拒绝派发或执行失败。
+ * @GPGPU_QUEUE_ERROR_EXECUTOR: 执行器拒绝派发、执行失败，或收尾回写失败。
  * @GPGPU_QUEUE_ERROR_SIGNAL: Signal 非法、不可读或完成值写入失败。
  * @GPGPU_QUEUE_ERROR_MAILBOX: 通知槽地址非法或写入失败。
  * @GPGPU_QUEUE_ERROR_RETIRE: Header 回收或 R 写回失败。

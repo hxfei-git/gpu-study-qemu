@@ -252,7 +252,7 @@
 <li class="lesson" data-nav-item data-search-text="2.2 术语 ¶ 未定义（undefined） ：实现可以产生任意结果；软件不得依赖其行为。 实现定义（implementation-defined） ：实现必须在某处给出选择；若未给出，软件仍不得依赖。 R / W / R/W / W1C ：分别表示只读、只写、可读写、写 1 清除；W1C 位写 0 不改变状态。表中复位值指设备冷复位或 GLOBAL_CTRL.RESET 后的值，单独 CP 复位的影响另行列出。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--22">2.2 术语</a></li>
 <li class="stage" data-nav-item data-search-text="3. 系统架构 ¶"><a href="#fragment-page-stage2--gpu--gpu-datasheet--3">3. 系统架构</a></li>
 <li class="lesson" data-nav-item data-search-text="3.1 顶层框图 ¶ +--------------------------------------------------------------------------+ | GPGPU Device Architecture | | | | Host CPU | | | | | | PCIe Bus | | | | | +--v-----------------------------------------------------------+ | | | GPGPU PCIe Device | | | | Vendor: 0x1234 Device: 0x1337 Class: 0x0302 (3D Ctrl) | | | | | | | | +------------+ +-------------+ +------------------+ | | | | | BAR0 | | BAR2 | | BAR4 | | | | | | 1 MB MMIO | | 64 MB VRAM | | 64 KB Doorbell | | | | | | Ctrl Regs | | Video Mem | | (Not Impl) | | | | | +-----+------+ +------+------+ +------------------+ | | | | | | | | | | +-----v------------------v------+ | | | | | Execution Engine | | | | | | Grid → Block → Warp (32 lane)| | | | | | RV64I + FP32 + LP-Float | | | | | +-------------------------------+ | | | | | | | | +------------------+ +------------------+ | | | | | DMA Engine | | Interrupt Ctrl | | | | | | Host ↔ VRAM | | MSI-X (3 vec) | | | | | +------------------+ +------------------+ | | | +--------------------------------------------------------------+ | +--------------------------------------------------------------------------+"><a href="#fragment-page-stage2--gpu--gpu-datasheet--31">3.1 顶层框图</a></li>
-<li class="lesson" data-nav-item data-search-text="3.2 PCI 配置 ¶ 项目 值 Vendor ID 0x1234 Device ID 0x1337 Revision 0x01 Class Code 0x0302 (PCI_CLASS_DISPLAY_3D) 设备标识寄存器 0x4750_5055 (&quot;GPPU&quot;) 版本寄存器 0x0004_0000 (v4.0.0) MSI-X 3 向量"><a href="#fragment-page-stage2--gpu--gpu-datasheet--32-pci">3.2 PCI 配置</a></li>
+<li class="lesson" data-nav-item data-search-text="3.2 PCI 配置 ¶ 项目 值 Vendor ID 0x1234 Device ID 0x1337 Revision 0x01 Class Code 0x0302 (PCI_CLASS_DISPLAY_3D) 设备标识寄存器 0x4750_5055 (&quot;GPPU&quot;) 版本寄存器 0x0006_0000 (v6.0.0) MSI-X 3 向量"><a href="#fragment-page-stage2--gpu--gpu-datasheet--32-pci">3.2 PCI 配置</a></li>
 <li class="lesson" data-nav-item data-search-text="3.3 默认配置 ¶ 参数 默认值 QEMU 属性 Compute Units 4 num_cus Warps / CU 4 warps_per_cu Warp Size 32 warp_size VRAM Size 64 MiB vram_size 命令行示例： -device gpgpu,num_cus=8,vram_size=128M"><a href="#fragment-page-stage2--gpu--gpu-datasheet--33">3.3 默认配置</a></li>
 <li class="lesson" data-nav-item data-search-text="3.4 双进程的 BAR、DMA 与中断路径 ¶ [DESIGN] A57 Linux 运行在进程 A，通过 vfio-user-pci 访问进程 B 的 gpu0 。进程 B 使用 gpgpu-cp machine，包含原有寄存器、VRAM、DMA、中断与计算解释器，以及由 TCG 执行的原生 RV64 CP。CP 默认保持复位；计算任务统一经 AQL 队列交给 CP，DMA 引擎用于存储拷贝。 进程 A：A57 Linux └─ PCIe 设备代理 ├─ 配置空间、BAR0/BAR2/BAR4 请求 ─→ 进程 B：GPGPU ├─ PCI DMA 接口 ←─ B 的读写请求 ├─ 原计算解释器 │ └─ SMMUv3（启用时）→ Host RAM └─ 原生 RV64 CP └─ Linux 驱动 ←─ 完成与错误中断 └─ 访问同一份 VRAM none 与 smmuv3 都使用 x-dma-via-socket=on ：B 把设备 DMA 地址、方向和数据请求发送给 A，A 调用该 PCI 设备的 DMA 接口，并返回数据或错误。SMMUv3 的翻译、权限检查和故障记录保留在 A。该启动选项只选择通信方式，不增加硬件寄存器。 BAR 访问通过消息转发，MSI-X 表和屏蔽状态在两端同步。Signal 完成通过 IH 通知；DMA 完成和错误事件沿相应向量传给 A 的 Linux 驱动。DMA 继续同步搬运数据，并通过原定时器报告完成。本版不支持断线重连和迁移。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--34-remote">3.4 双进程的 BAR、DMA 与中断路径</a></li>
 <li class="stage" data-nav-item data-search-text="4. 地址空间与 BAR 映射 ¶"><a href="#fragment-page-stage2--gpu--gpu-datasheet--4-bar">4. 地址空间与 BAR 映射</a></li>
@@ -261,14 +261,14 @@
 <li class="lesson" data-nav-item data-search-text="4.3 MMIO 访问规则 ¶ BAR0 寄存器采用小端、4 字节对齐的 32 位访问。64 位地址由低、高两个寄存器保存，完整地址为 (HI &lt;&lt; 32) | LO ；不得用一次 64 位访问代替两次寄存器访问。 BAR2 VRAM 支持 1～8 字节访问。BAR4 Doorbell 的访问规则见 11.5 节 。 表中标记为保留的位必须写 0；读值及非法访问的处理以各寄存器组的规定为准。 落在单一寄存器子区域内的 BAR0 非法宽度或未对齐访问不更新目标寄存器，读返回 0，并置位 ERROR_STATUS.INVALID_CMD 。IH 区域还记录 PROTOCOL 故障。HQD 和 CP 本地入口的权限见各节。 CP 控制窗口只开放分发、IH 和全局错误入口；访问其他寄存器组时读取返回 0，并置位 ERROR_STATUS.INVALID_CMD 。组内保留位置按各组规则处理。未映射的 CP 地址产生访存异常，HQD 槽号不截断或折返。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--43-mmio">4.3 MMIO 访问规则</a></li>
 <li class="lesson" data-nav-item data-search-text="4.4 CP 本地地址映射 CP 本地地址与 Host 的 BAR 地址属于不同地址空间。CP 使用下列固定映射；分发和 IH 的 CP 入口与 BAR0 入口访问同一份寄存器状态。 CP 本地地址 用途 寄存器说明 0x0000_0000～VRAM_SIZE−1 设备 VRAM 10. CP 控制与固件入口 0x8000_0000～0x8000_ffff Host 访存窗口（64 KiB） 10.4 Host 访存窗口 0xfffd_0108 ERROR_STATUS 6.4 全局错误 0xfffd_0300～0xfffd_0340 内核分发寄存器 8.1 内核分发 0xfffd_0800～0xfffd_081c IH 寄存器 7.3 IH 寄存器 0xfffe_0000 / 0xfffe_0004 IOVA_BASE_LO / IOVA_BASE_HI 10.4 IOVA_BASE 0xffff_0000～0xffff_03ff 4 组 HQD 寄存器 11.1 HQD 访问窗口 CP 控制窗口总范围为 0xfffd_0000～0xfffd_0fff ，表中列出其中开放的寄存器入口。"><a href="#cp-address-map">4.4 CP 本地地址映射</a></li>
 <li class="lesson" data-nav-item data-search-text="4.5 GPU 物理存储映射 CP 或计算线程给出用户地址后，GPUVM 开启时先查页表，关闭时直接使用该地址。两条路径最终交给同一个物理入口。当前 64 MiB VRAM 的地址布局为： [0x0000_0000, 0x0400_0000) VRAM [0x0400_0000, 0x8000_0000) 空洞，不可路由 [0x8000_0000, 0x1_0000_0000) Outbound → Host IOVA → PCIe DMA GPUVM 开：GPUVA → 页表 → GPU 物理地址 ─┐ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物理入口 → VRAM 或 Outbound Outbound 固定从 0x8000_0000 开始，与 VRAM 容量无关；VRAM 末端到窗口起点之间是空洞。访问空洞与访问未使能的窗口一样失败：用户访问记 GPUVM 故障，CP 管理域访问记队列错误，DMA 置 DMA_FAULT。窗口配置与换算见 第 18 章 。RV64 CP 自己的代码、栈和寄存器仍按 4.4 节的 CP 本地地址解释。"><a href="#gpu-physical-map">4.5 GPU 物理存储映射</a></li>
-<li class="stage" data-nav-item data-search-text="5. 设备信息寄存器 (0x0000) ¶ 只读。 Offset 寄存器 复位值 描述 0x0000 DEV_ID 0x4750_5055 设备标识 &quot;GPPU&quot; 0x0004 DEV_VERSION 0x0004_0000 版本 v4.0.0 0x0008 DEV_CAPS 见下 能力寄存器 0x000C VRAM_SIZE_LO 0x0400_0000 VRAM 大小低 32 位 0x0010 VRAM_SIZE_HI 0x0000_0000 VRAM 大小高 32 位"><a href="#fragment-page-stage2--gpu--gpu-datasheet--5-0x0000">5. 设备信息寄存器 (0x0000)</a></li>
+<li class="stage" data-nav-item data-search-text="5. 设备信息寄存器 (0x0000) ¶ 只读。 Offset 寄存器 复位值 描述 0x0000 DEV_ID 0x4750_5055 设备标识 &quot;GPPU&quot; 0x0004 DEV_VERSION 0x0006_0000 版本 v6.0.0 0x0008 DEV_CAPS 见下 能力寄存器 0x000C VRAM_SIZE_LO 0x0400_0000 VRAM 大小低 32 位 0x0010 VRAM_SIZE_HI 0x0000_0000 VRAM 大小高 32 位"><a href="#fragment-page-stage2--gpu--gpu-datasheet--5-0x0000">5. 设备信息寄存器 (0x0000)</a></li>
 <li class="lesson" data-nav-item data-search-text="5.1 DEV_CAPS (Offset 0x0008 ) — 能力寄存器 ¶ Bit 名称 描述 7:0 NUM_CUS Compute Unit 数量 15:8 WARPS_PER_CU 每 CU 的 Warp 数 23:16 WARP_SIZE Warp 宽度（线程数） 31:24 Reserved 保留"><a href="#fragment-page-stage2--gpu--gpu-datasheet--51-dev_caps-offset-0x0008">5.1 DEV_CAPS (Offset 0x0008) — 能力寄存器</a></li>
 <li class="stage" data-nav-item data-search-text="6. 全局控制寄存器 (0x0100) ¶"><a href="#fragment-page-stage2--gpu--gpu-datasheet--6-0x0100">6. 全局控制寄存器 (0x0100)</a></li>
 <li class="lesson" data-nav-item data-search-text="6.1 寄存器映射 ¶ Offset 寄存器 访问 复位值 描述 0x0100 GLOBAL_CTRL R/W 0x0000_0000 控制寄存器 0x0104 GLOBAL_STATUS R 0x0000_0001 状态寄存器 0x0108 ERROR_STATUS R/W1C 0x0000_0000 错误状态（W1C）"><a href="#fragment-page-stage2--gpu--gpu-datasheet--61">6.1 寄存器映射</a></li>
 <li class="lesson" data-nav-item data-search-text="6.2 GLOBAL_CTRL (Offset 0x0100 ) ¶ Bit 名称 访问 复位 描述 31:2 Reserved - 0 保留 1 RESET R/W 0 软复位：写 1 触发复位，自动清除 0 ENABLE R/W 0 设备使能"><a href="#fragment-page-stage2--gpu--gpu-datasheet--62-global_ctrl-offset-0x0100">6.2 GLOBAL_CTRL (Offset 0x0100)</a></li>
 <li class="lesson" data-nav-item data-search-text="6.3 GLOBAL_STATUS (Offset 0x0104 ) ¶ Bit 名称 访问 复位 描述 31:3 Reserved R 0 保留 2 ERROR R 0 错误标志 1 BUSY R 0 内核执行中 0 READY R 1 设备就绪"><a href="#fragment-page-stage2--gpu--gpu-datasheet--63-global_status-offset-0x0104">6.3 GLOBAL_STATUS (Offset 0x0104)</a></li>
-<li class="lesson" data-nav-item data-search-text="6.4 ERROR_STATUS (Offset 0x0108 ) ¶ Bit 名称 访问 复位 描述 31:5 Reserved - 0 保留 4 FIRMWARE R/W1C 0 无法归属队列的固件异常；写 1 清除此位。 3 IH_FAULT R/W1C 0 IH 通道故障；写 1 清除此位，不清 IH_STATUS。 2 DMA_FAULT R/W1C 0 DMA 错误；写 1 清除。 1 VRAM_FAULT R/W1C 0 VRAM 越界访问；写 1 清除。 0 INVALID_CMD R/W1C 0 无效命令；写 1 清除。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--64-error_status-offset-0x0108">6.4 ERROR_STATUS (Offset 0x0108)</a></li>
-<li class="lesson" data-nav-item data-search-text="6.5 软复位行为 ¶ 写 GLOBAL_CTRL.RESET = 1 后，设备停止 CP 与计算任务，清零全局控制、错误、中断、分发配置、DMA、HQD、Doorbell 提示和 IH 状态；GPUVM 清零，Outbound 恢复初始布局并停用； GLOBAL_STATUS 恢复 READY ， DISPATCH_STATUS 恢复 IDLE 。已连接的 CP 保持复位，启动入口与 Host 窗口基址清零。VRAM 内容保留。单独 CP 复位的范围见 10.5 节 。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--65">6.5 软复位行为</a></li>
+<li class="lesson" data-nav-item data-search-text="6.4 ERROR_STATUS (Offset 0x0108 ) ¶ Bit 名称 访问 复位 描述 31:6 Reserved - 0 保留 5 DCACHE_FAULT R/W1C 0 dcache 回写脏行失败，该行保持有效且脏；写 1 清除此位，不改变缓存内容。 4 FIRMWARE R/W1C 0 无法归属队列的固件异常；写 1 清除此位。 3 IH_FAULT R/W1C 0 IH 通道故障；写 1 清除此位，不清 IH_STATUS。 2 DMA_FAULT R/W1C 0 DMA 错误；写 1 清除。 1 VRAM_FAULT R/W1C 0 VRAM 越界访问；写 1 清除。 0 INVALID_CMD R/W1C 0 无效命令；写 1 清除。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--64-error_status-offset-0x0108">6.4 ERROR_STATUS (Offset 0x0108)</a></li>
+<li class="lesson" data-nav-item data-search-text="6.5 软复位行为 ¶ 写 GLOBAL_CTRL.RESET = 1 后，设备停止 CP 与计算任务，先回写并失效 dcache 的全部行，再清零全局控制、错误、中断、分发配置、DMA、HQD、Doorbell 提示和 IH 状态；GPUVM 清零，Outbound 恢复初始布局并停用； GLOBAL_STATUS 恢复 READY ， DISPATCH_STATUS 恢复 IDLE 。已连接的 CP 保持复位，启动入口与 Host 窗口基址清零。VRAM 内容保留。单独 CP 复位的范围见 10.5 节 。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--65">6.5 软复位行为</a></li>
 <li class="stage" data-nav-item data-search-text="7. 中断控制寄存器（IRQ 与 IH） ¶"><a href="#fragment-page-stage2--gpu--gpu-datasheet--7-0x0200">7. 中断控制寄存器（IRQ 与 IH）</a></li>
 <li class="lesson" data-nav-item data-search-text="7.1 寄存器映射 ¶ Offset 寄存器 访问 复位值 描述 0x0200 IRQ_ENABLE R/W 0x0000_0000 中断使能掩码 0x0204 IRQ_STATUS R 0x0000_0000 中断挂起状态 0x0208 IRQ_ACK W — 写 1 清除对应中断"><a href="#fragment-page-stage2--gpu--gpu-datasheet--71">7.1 寄存器映射</a></li>
 <li class="lesson" data-nav-item data-search-text="7.2 中断位定义 ¶ Bit 名称 MSI-X 向量 描述 0 DMA_DONE 0 DMA 传输完成 1 ERROR 1 错误条件 2 IH 2 IH Ring 中存在尚未消费的记录。 中断递送优先级：MSI-X &gt; MSI &gt; Legacy INTx。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--72">7.2 中断位定义</a></li>
@@ -310,13 +310,18 @@
 <li class="lesson" data-nav-item data-search-text="15.3 低精度浮点扩展（自定义） ¶ 所有指令均在 OP_FP (opcode 0x53 ) 编码空间内，通过 funct7 和 rs2 字段区分。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--133">15.3 低精度浮点扩展（自定义）</a></li>
 <li class="stage" data-nav-item data-search-text="16. 限制与已知约束 ¶ 约束 说明 Warp 大小固定 32 不可运行时修改 串行执行 Warp/Block 顺序执行，非并行仿真 num_cus / warps_per_cu 仅影响 DEV_CAPS 寄存器，不影响调度 Shared Memory 寄存器已定义，功能未实现 Kernel Args a0 直接保存参数的 GPUVA 或 GPU 物理地址；派发时检查 KERNEL_ARGS_SIZE，运行时按普通内存访问。 Barrier 当前未提供组内或跨 Warp 屏障指令 Doorbell BAR4 8 字节对齐的 64 位通知，高 32 位为零；访问规则见 11.5 节。 GPU 核心寻址 计算线程按 RV64 执行；GPUVM 开启时用户地址为 48 位 GPUVA，GPU 物理地址仍为 32 位。CP 的代码、栈和本地窗口使用独立 CP 地址空间。 DMA 延迟 固定 1ms 虚拟时间 RMM 舍入 近似为 RNE Thread ID Y/Z 计算线程索引由 Block 三维尺寸计算，X/Y/Z 均有效。"><a href="#fragment-page-stage2--gpu--gpu-datasheet--14">16. 限制与已知约束</a></li>
 <li class="stage" data-nav-item data-search-text="17. GPUVM 上下文与地址翻译 设备属性 gpuvm=on/off 在启动时固定，默认开启。两种状态都通过 AQL Queue、RV64 CP 与 Signal/IH 完成计算。GPUVM 开启时，用户访问沿下列路径翻译： 源 HQD / 任务快照 → VMID 1 或 2 → GPU 物理页表根 → TLB 命中，或经公共物理入口读取四级页表 → 检查权限 → GPU 物理地址 → 公共物理入口 → VRAM 或 Outbound → 返回数据，失败时保存源槽首次故障 关闭 GPUVM 时不创建页表，输入直接交给公共物理入口。队列仍保存 VMID 和源槽以便归属错误与管理资源，但用户共享物理地址空间，不提供页权限隔离。管理访问由显式访问域指定，与 VMID 是否为 0 无关。 下面寄存器均以对齐的 32 位小端值访问。未列出的读取返回 0；非法写入保留目标状态并设置全局 INVALID_CMD。GPUVM 关闭时保留版本、模式、固件握手和源槽故障记录，拒绝页表配置与失效请求。"><a href="#gpuvm-registers">17. GPUVM 上下文与地址翻译</a></li>
-<li class="lesson" data-nav-item data-search-text="17.1 模式与固件握手 BAR0 偏移 寄存器 访问 复位值 行为 0x0900 VM_VERSION Host / CP R 5 本版统一访存接口版本，固定为 5。 0x0904 VM_MODE Host / CP R 启动配置 GPUVM 开启时为 1，关闭时为 0。 0x0908 VM_FIRMWARE Host R / CP R/W 0 CP 在两种状态下均检查设备版本，再写 5。其他写值非法；CP 单独复位也清零。 CP 通过 0xfffd_0000 + BAR0 偏移 读取本组寄存器并发布握手。上下文和失效仅由 Host 配置，CP 不得通过该窗口修改。"><a href="#gpuvm-mode">17.1 模式与固件握手</a></li>
+<li class="lesson" data-nav-item data-search-text="17.1 模式与固件握手 BAR0 偏移 寄存器 访问 复位值 行为 0x0900 VM_VERSION Host / CP R 6 本版统一访存接口版本，固定为 6。 0x0904 VM_MODE Host / CP R 启动配置 GPUVM 开启时为 1，关闭时为 0。 0x0908 VM_FIRMWARE Host R / CP R/W 0 CP 在两种状态下均检查设备版本，再写 6。其他写值非法；CP 单独复位也清零。 CP 通过 0xfffd_0000 + BAR0 偏移 读取本组寄存器并发布握手。上下文和失效仅由 Host 配置，CP 不得通过该窗口修改。"><a href="#gpuvm-mode">17.1 模式与固件握手</a></li>
 <li class="lesson" data-nav-item data-search-text="17.2 页表根、使能与失效 上下文基址为 0x0940 + VMID × 0x20 ，用户 1、2 分别对应 0x0960 、 0x0980 。每组只实现以下字段，复位均为 0： 组内偏移 寄存器 访问 行为 0x00 ROOT_LO Host R/W / CP R 页表根的 GPU 物理地址低 32 位，按 4 KiB 对齐；仅禁用上下文时允许修改。 0x04 ROOT_HI Host R/W / CP R 本版 GPU 物理表地址高 32 位必须为 0；仅禁用上下文时允许修改。 0x08 ENABLE Host R/W / CP R 完整值 0 或 1；启用前检查根页可由公共物理入口访问，且不触及 VRAM 首页或固件区。 有激活的所属用户 HQD 或该 VM 在途访存时，拒绝修改根和使能。启用本身不失效 TLB；配置顺序为禁用、写根和页表、保证可见、完成失效、启用。仅看到 ACTIVE=0 不能替代软件的卸载完成检查。 BAR0 偏移 寄存器 访问 复位值 行为 0x0910 VM_INV_REQ Host W — bit 2:1 为 VMID 位图（bit 1 对应 VMID 1），bit 16 为 RANGE；其余位保留。写入即触发同步失效；读取为 0。 0x0914 VM_INV_ACK Host / CP R 0 bit 2:1 为最近一次完成失效的 VMID 位图，bit 31 为 ERROR；其余位为 0。 0x0918 / 0x091c 保留 — 0 读取为 0，写入锁存 INVALID_CMD。 0x0920 VM_TLB_HITS Host / CP R 0 TLB 命中次数。 0x0924 VM_TLB_MISSES Host / CP R 0 TLB 未命中次数，每次未命中随后遍历一次页表。 0x0928 VM_TLB_EVICTIONS Host / CP R 0 遍历成功后替换有效项的次数。 0x0930 / 0x0934 VM_INV_VPN_START_LO / HI Host R/W / CP R 0 范围失效的起始 VPN（GPUVA 的 [47:12]，共 36 位），低、高 32 位分开保存。 0x0938 / 0x093c VM_INV_VPN_END_LO / HI Host R/W / CP R 0 范围失效的结束 VPN，闭区间，须小于 2 36 。 设备在写 VM_INV_REQ 的同一次寄存器访问中完成失效并写好 ACK，没有忙状态。RANGE=0 时清除所选 VMID 的全部缓存项；RANGE=1 时只清 VPN 落在 [START, END] 内的项。例如 START = 0xf_fff8_a400 、END = 0xf_fff8_a402 、REQ = 0x0001_0002 只清 VMID 1 中 GPUVA 0x0000_ffff_8a40_0000～0x0000_ffff_8a40_2fff 的翻译，ACK 读回 0x2 。请求含保留位（包括 bit 0）、位图为空、RANGE=1 且 START 大于 END 或 END 不小于 2 36 时，整体拒绝，不清除任何项，ACK 只置 ERROR，不锁存全局错误。所选 VMID 有激活的队列时失效照常完成：设备在主锁下处理请求，此时没有进行到一半的翻译，清除后也不会有旧遍历再填回。ACK 只表示本次翻译失效，对象是否仍被任务使用由驱动和应用确认。三个计数全设备共用，32 位回绕，失效不清零；写只读寄存器锁存 INVALID_CMD。"><a href="#gpuvm-context">17.2 页表根、使能与失效</a></li>
 <li class="lesson" data-nav-item data-search-text="17.3 页表格式与访问检查 GPUVA 有效 48 位，位 63..48 必须为零，分为 L0 根目录索引 [47:39]、L1 目录索引 [38:30]、L2 目录索引 [29:21]、L3 叶表索引 [20:12] 和页内偏移 [11:0]。每张表占 4 KiB，64 位小端表项共 512 个。页表根保存 GPU 物理地址；各级表项的地址域按 SYSTEM 换算成 GPU 物理地址。遍历经公共物理入口读取表页，不递归经过 GPUVM 翻译。 位 名称 PDE PTE 0 VALID 下级目录有效 目标页有效 1 SYSTEM 1：地址域为 Host IOVA，GPU 物理页为 0x8000_0000 + IOVA ；0：地址域为 VRAM 偏移 4 / 5 / 6 EXEC / READ / WRITE 必须为 0 分别允许取指、读取、写入 31:12 ADDRESS 下一级表页的地址域 目标页的地址域 其余位 保留 包括 bit 2 和 bit 63:32；有效项中必须为 0，非法编码报页表错误。 地址掩码为 0xffff_f000 。SYSTEM=1 时整页须落在 2 GiB IOVA 窗口内，例如叶子项 0x4100_2000 | SYSTEM | VALID | R | W 得到 GPU 物理页 0xc100_2000 ；SYSTEM=0 时整页须落在 VRAM 内并避开首页和末尾固件区，当前 64 MiB 配置的普通 VRAM 区间为 0x1000～0x03bf_ffff 。地址域与 SYSTEM 不符报页表错误，例如不带 SYSTEM 的 0xc100_2000 。换算后的页同样由公共物理入口路由，Host 页要求 Outbound 已使能。软件负责保证表页不作为用户 BO 映射。SMMUv3 开启时，Outbound 得到的 IOVA 继续由系统 IOMMU 翻译。 用户可分配 GPUVA 为 [0x1000, 0x1_0000_0000_0000) ，即 48 位地址空间去掉零页；用户库以对象的 CPU 地址作 GPUVA，通知页也由用户态创建，不占保留页。TLB 为 64 组 × 4 路组相联，组号为 VPN % 64，以 VMID 和 VPN 区分，保存 GPU 物理页地址与权限，组内按最近最少使用替换，只缓存叶子翻译；每组如何记录使用先后见 GPUVM 规格第 5.2.1 节 。访问先检查已启用的上下文、完整范围低于 2 48 和自然对齐，再逐页检查目标与权限。翻译失败不尝试物理地址；跨页传输在后页失败时保留前面已经完成的写入，不自动重试或回滚。"><a href="#gpuvm-page-format">17.3 页表格式与访问检查</a></li>
-<li class="lesson" data-nav-item data-search-text="17.4 首次故障与复位 故障组基址为 0x0a00 + HQD 槽号 × 0x40 ，四组独立。访问入口携带源槽；每槽只保存首次错误，后续错误不覆盖。下面字段复位均为 0： 组内偏移 字段 Host 访问 含义 0x00 REASON R 0 无故障；1 上下文；2 地址范围或对齐；3 未映射；4 非法页表；5 权限；6 后备存储访问失败。 0x04 VMID R 出错访问携带的 VMID。 0x08 / 0x0c ADDR_LO / ADDR_HI R 原始访问地址的低、高 32 位，合起来是完整的 64 位地址。 0x10 ACCESS R 取指 0x10 、读 0x20 、写 0x40 。 0x14 PHASE R CP 沿用 HQD 错误阶段；执行器取指为 0x100 ，参数和普通数据访问为 0x102 。 0x18 CLEAR W 源 HQD 未激活时完整写 1，清除此组；读取为 0。软件须先确认旧访问和通知结束。 故障记录不自行发送额外中断。CP 窗口返回访存异常，计算执行器返回失败，固件沿已有源队列错误和 IH 路径通知 Host；另一 VM 可以继续运行。整体复位清除上下文、TLB、三个计数、故障、ACK、VPN 范围和固件握手；CP 单独复位仅清窗口与握手，保留 GPUVM 状态和已有执行任务。 [BOUNDARY] 下列固定提交记录 2026-10-19 的版本 1 实现，保留用于历史查阅。当前版本 5 的地址语义、CSR 和 Outbound 定义以本文各模块及本次工作区实现为准。 [SOURCE] 2026-10-19 固定实现提交 3600ff795dde9069a6e4f1405f6950a61ea75faa ；文件散列见子仓库 build/gpgpu-stage3-source.json 。寄存器编码： software/gpgpu/include/gpgpu_vm.h，第 1 行起 ；访问检查： hw/gpgpu/gpgpu_vm.c，第 63 行起 ；失效和配置写入： 第 176 行起 。 [BOUNDARY] BAR0 由寄存器组子区域组成。跨 0x100 字节组边界的非对齐 8 字节访问可能被 QEMU 拆为两次 4 字节访问并接受；驱动须使用对齐的 32 位寄存器访问，不能依赖跨组访问的原子性或统一拒绝行为。 Kernel 描述对象为 24 字节：偏移 0x00 为 64 位代码入口，偏移 0x10 的 kernel_abi_version 必须为 5，偏移 0x14 的保留字段必须为 0；CP 拒绝其他版本和非零保留字段。"><a href="#gpuvm-fault">17.4 首次故障与复位</a></li>
+<li class="lesson" data-nav-item data-search-text="17.4 首次故障与复位 故障组基址为 0x0a00 + HQD 槽号 × 0x40 ，四组独立。访问入口携带源槽；每槽只保存首次错误，后续错误不覆盖。下面字段复位均为 0： 组内偏移 字段 Host 访问 含义 0x00 REASON R 0 无故障；1 上下文；2 地址范围或对齐；3 未映射；4 非法页表；5 权限；6 后备存储访问失败。 0x04 VMID R 出错访问携带的 VMID。 0x08 / 0x0c ADDR_LO / ADDR_HI R 原始访问地址的低、高 32 位，合起来是完整的 64 位地址。 0x10 ACCESS R 取指 0x10 、读 0x20 、写 0x40 。 0x14 PHASE R CP 沿用 HQD 错误阶段；执行器取指为 0x100 ，参数和普通数据访问为 0x102 。 0x18 CLEAR W 源 HQD 未激活时完整写 1，清除此组；读取为 0。软件须先确认旧访问和通知结束。 故障记录不自行发送额外中断。CP 窗口返回访存异常，计算执行器返回失败，固件沿已有源队列错误和 IH 路径通知 Host；另一 VM 可以继续运行。整体复位清除上下文、TLB、三个计数、故障、ACK、VPN 范围和固件握手；CP 单独复位仅清窗口与握手，保留 GPUVM 状态和已有执行任务。 [BOUNDARY] 下列固定提交记录 2026-10-19 的版本 1 实现，保留用于历史查阅。当前版本 6 的地址语义、CSR 和 Outbound 定义以本文各模块及本次工作区实现为准。 [SOURCE] 2026-10-19 固定实现提交 3600ff795dde9069a6e4f1405f6950a61ea75faa ；文件散列见子仓库 build/gpgpu-stage3-source.json 。寄存器编码： software/gpgpu/include/gpgpu_vm.h，第 1 行起 ；访问检查： hw/gpgpu/gpgpu_vm.c，第 63 行起 ；失效和配置写入： 第 176 行起 。 [BOUNDARY] BAR0 由寄存器组子区域组成。跨 0x100 字节组边界的非对齐 8 字节访问可能被 QEMU 拆为两次 4 字节访问并接受；驱动须使用对齐的 32 位寄存器访问，不能依赖跨组访问的原子性或统一拒绝行为。 Kernel 描述对象为 24 字节：偏移 0x00 为 64 位代码入口，偏移 0x10 的 kernel_abi_version 必须为 6，偏移 0x14 的保留字段必须为 0；CP 拒绝其他版本和非零保留字段。"><a href="#gpuvm-fault">17.4 首次故障与复位</a></li>
 <li class="stage" data-nav-item data-search-text="18. Outbound 物理路由与窗口配置 Host 对象取得 IOVA 后，通过 GPU 物理地址 = 0x8000_0000 + IOVA 交给设备。公共物理入口先检查完整范围，再选择 VRAM 或 Outbound；Outbound 用窗口基址还原 IOVA，交给 PCIe DMA。 GPU_BASE = 0x8000_0000（固定，与 vram_size 无关） HOST_IOVA_BASE = 0 WINDOW_SIZE = 0x8000_0000（2 GiB） Host IOVA 0x4100_0000 → GPU 物理地址 0xc100_0000 设备访问 0xc100_0000 → 减去 GPU_BASE → IOVA 0x4100_0000 → PCIe DMA IOVA 0 对应 GPU 物理地址 0x8000_0000 ，位于 Outbound 起点。驱动的 31 位 DMA mask 正好覆盖窗口对应的 2 GiB IOVA。窗口覆盖只说明路由存在，Host 存储或 IOMMU 映射缺失时访问仍会失败。所有范围与末端计算使用 64 位数，GPU 物理地址空间末端为 0x1_0000_0000 （4 GiB）。"><a href="#outbound-registers">18. Outbound 物理路由与窗口配置</a></li>
 <li class="lesson" data-nav-item data-search-text="18.1 寄存器映射（0x0b00） 各项通过 BAR0 以对齐的 32 位小端值访问。GPU_BASE 只有低 32 位，窗口长度及 Host IOVA 基址各用两项保存。布局只读，固定覆盖 0x8000_0000 到 4 GiB，Host IOVA 基址为 0： BAR0 偏移 寄存器 Host 访问 复位值 含义 0x0b00 OUTBOUND_GPU_BASE R 0x8000_0000 GPU 物理窗口起点。 0x0b04 OUTBOUND_SIZE_LO R 0x8000_0000 窗口长度低 32 位，长度为 2 GiB。 0x0b08 OUTBOUND_SIZE_HI R 0 与 SIZE_LO 组成完整 64 位长度。 0x0b0c OUTBOUND_HOST_LO R 0 Host IOVA 起点低 32 位，本版为 0。 0x0b10 OUTBOUND_HOST_HI R 0 Host IOVA 起点高 32 位，本版为 0。 0x0b14 OUTBOUND_CONTROL R/W 0 bit 0 为 ENABLE；其他位必须为 0。 0x0b18 OUTBOUND_STATUS R 0 bit 0 ACK，bit 1 BUSY，bit 2 ERROR。"><a href="#outbound-register-map">18.1 寄存器映射（0x0b00）</a></li>
 <li class="lesson" data-nav-item data-search-text="18.2 配置确认与停止条件"><a href="#outbound-lifetime">18.2 配置确认与停止条件</a></li>
+<li class="stage" data-nav-item data-search-text="19. dcache 数据缓存 32 KiB 64 字节行 4 路组相联 写回 写分配 GPU 物理地址标签"><a href="#dcache-registers">19. dcache 数据缓存</a></li>
+<li class="lesson" data-nav-item data-search-text="19.1 寄存器映射（0x0c00） DCACHE_HITS DCACHE_MISSES DCACHE_EVICTIONS DCACHE_WRITEBACKS DCACHE_ADDR_LO DCACHE_ADDR_HI DCACHE_LENGTH DCACHE_CMD DCACHE_STATUS"><a href="#dcache-register-map">19.1 寄存器映射（0x0c00）</a></li>
+<li class="lesson" data-nav-item data-search-text="19.2 维护命令与结果 CLEAN INVALIDATE ALL UC_ADD UC_REMOVE OK INVALID DIRTY STORAGE FULL BUSY"><a href="#dcache-commands">19.2 维护命令与结果</a></li>
+<li class="lesson" data-nav-item data-search-text="19.3 不可缓存区间 GPGPU_DCACHE_UC_RANGES"><a href="#dcache-uncached">19.3 不可缓存区间</a></li>
+<li class="lesson" data-nav-item data-search-text="19.4 旁路访问与复位 BAR2 DMA Outbound 整体复位 DCACHE_FAULT"><a href="#dcache-bypass">19.4 旁路访问与复位</a></li>
 </ul><p class="nav-tip">正文搜索：Ctrl + F<br><a href="./%E8%AF%BE%E7%A8%8B%E8%B5%84%E6%96%99/QEMU_2026_%E5%AE%9E%E9%AA%8C.html#page-stage2--gpu">返回实验资料</a><br><a href="#source-and-license">来源与许可</a></p></aside><main class="main"><article class="lesson" id="page-stage2--gpu--gpu-datasheet" data-page-id="page-stage2--gpu--gpu-datasheet" data-page-title="GPGPU 虚拟加速器硬件手册" data-portable-saved-at="0"><div class="source-content md-typeset" spellcheck="false"><h1 id="gpgpu-虚拟加速器硬件手册">GPGPU 虚拟加速器硬件手册</h1>
 <details class="local-toc"><summary>缩写表</summary><div class="table-scroll"><table><thead><tr><th>缩写</th><th>英文全称</th><th>中文含义</th></tr></thead><tbody><tr><td>GPGPU</td><td>General-Purpose Computing on Graphics Processing Units</td><td>利用 GPU 进行通用计算</td></tr><tr class="even">
 <td>GPU</td>
@@ -510,7 +515,7 @@
 </tr>
 <tr>
 <td>版本寄存器</td>
-<td><code>0x0004_0000</code> (v4.0.0)</td>
+<td><code>0x0006_0000</code> (v6.0.0)</td>
 </tr>
 <tr>
 <td>MSI-X</td>
@@ -644,6 +649,7 @@
 <td>GPUVM 上下文</td><td><code>0x0900</code></td><td><code>0x09ff</code></td><td><a href="#gpuvm-context">版本、模式、页表根与同步失效</a></td></tr>
 <tr><td>GPUVM 故障</td><td><code>0x0a00</code></td><td><code>0x0aff</code></td><td><a href="#gpuvm-fault">四个源 HQD 的首次故障</a></td></tr>
 <tr><td>Outbound</td><td><code>0x0b00</code></td><td><code>0x0b1b</code></td><td><a href="#outbound-registers">全设备 GPU 物理地址到 Host IOVA 的窗口</a></td></tr>
+<tr><td>dcache</td><td><code>0x0c00</code></td><td><code>0x0c23</code></td><td><a href="#dcache-registers">数据缓存统计、维护命令与不可缓存区间</a></td></tr>
 <tr>
 <td>MSI-X 表</td>
 <td><code>0xF_E000</code></td>
@@ -664,13 +670,14 @@
 <li>BAR2 VRAM 支持 1～8 字节访问。BAR4 Doorbell 的访问规则见 <a href="#doorbell-bar4">11.5 节</a>。</li>
 <li>表中标记为保留的位必须写 0；读值及非法访问的处理以各寄存器组的规定为准。</li>
 <li>落在单一寄存器子区域内的 BAR0 非法宽度或未对齐访问不更新目标寄存器，读返回 0，并置位 <code>ERROR_STATUS.INVALID_CMD</code>。IH 区域还记录 <code>PROTOCOL</code> 故障。HQD 和 CP 本地入口的权限见各节。</li>
-<li>CP 控制窗口只开放分发、IH 和全局错误入口；访问其他寄存器组时读取返回 0，并置位 <code>ERROR_STATUS.INVALID_CMD</code>。组内保留位置按各组规则处理。未映射的 CP 地址产生访存异常，HQD 槽号不截断或折返。</li></ul><h4 id="cp-address-map">4.4 CP 本地地址映射</h4>
+<li>CP 控制窗口只开放 GPUVM 只读信息与固件握手、分发、IH、dcache 和全局错误入口；访问其他寄存器组时读取返回 0，并置位 <code>ERROR_STATUS.INVALID_CMD</code>。组内保留位置按各组规则处理。未映射的 CP 地址产生访存异常，HQD 槽号不截断或折返。</li></ul><h4 id="cp-address-map">4.4 CP 本地地址映射</h4>
 <p>CP 本地地址与 Host 的 BAR 地址属于不同地址空间。CP 使用下列固定映射；分发和 IH 的 CP 入口与 BAR0 入口访问同一份寄存器状态。</p><div class="table-scroll"><table><thead><tr><th>CP 本地地址</th><th>用途</th><th>寄存器说明</th></tr></thead><tbody>
 <tr><td><code>0x0000_0000～VRAM_SIZE−1</code></td><td>设备 VRAM</td><td><a href="#cp-control-registers">10. CP 控制与固件入口</a></td></tr>
 <tr><td><code>0x8000_0000～0x8000_ffff</code></td><td>Host 访存窗口（64 KiB）</td><td><a href="#cp-host-window-registers">10.4 Host 访存窗口</a></td></tr>
 <tr><td><code>0xfffd_0108</code></td><td><code>ERROR_STATUS</code></td><td><a href="#fragment-page-stage2--gpu--gpu-datasheet--64-error_status-offset-0x0108">6.4 全局错误</a></td></tr>
 <tr><td><code>0xfffd_0300～0xfffd_0340</code></td><td>内核分发寄存器</td><td><a href="#fragment-page-stage2--gpu--gpu-datasheet--81">8.1 内核分发</a></td></tr>
 <tr><td><code>0xfffd_0800～0xfffd_081c</code></td><td>IH 寄存器</td><td><a href="#ih-registers">7.3 IH 寄存器</a></td></tr>
+<tr><td><code>0xfffd_0c00～0xfffd_0c20</code></td><td>dcache 寄存器</td><td><a href="#dcache-registers">19. dcache</a></td></tr>
 <tr><td><code>0xfffe_0000 / 0xfffe_0004</code></td><td><code>IOVA_BASE_LO / IOVA_BASE_HI</code></td><td><a href="#cp-host-window-registers">10.4 IOVA_BASE</a></td></tr>
 <tr><td><code>0xffff_0000～0xffff_03ff</code></td><td>4 组 HQD 寄存器</td><td><a href="#hqd-select">11.1 HQD 访问窗口</a></td></tr>
 </tbody></table></div>
@@ -681,7 +688,10 @@
 [0x8000_0000, 0x1_0000_0000)   Outbound → Host IOVA → PCIe DMA
 
 GPUVM 开：GPUVA → 页表 → GPU 物理地址 ─┐
-GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物理入口 → VRAM 或 Outbound</code></pre>
+GPUVM 关：输入就是 GPU 物理地址 ───────┤
+                                       ├─ 数据读写 → dcache ─┐
+                                       └─ 取指 ──────────────┴→ 公共物理入口 → VRAM 或 Outbound</code></pre>
+<p>数据读写在权限检查之后经过 dcache，可缓存的行未命中时才经公共物理入口回填；不可缓存区间内的行直接使用公共物理入口，见<a href="#dcache-registers">第 19 章</a>。取指、页表遍历、CP 管理域、DMA 与 IH 不经过 dcache。</p>
 <p>Outbound 固定从 <code>0x8000_0000</code> 开始，与 VRAM 容量无关；VRAM 末端到窗口起点之间是空洞。访问空洞与访问未使能的窗口一样失败：用户访问记 GPUVM 故障，CP 管理域访问记队列错误，DMA 置 DMA_FAULT。窗口配置与换算见<a href="#outbound-registers">第 18 章</a>。RV64 CP 自己的代码、栈和寄存器仍按 4.4 节的 CP 本地地址解释。</p>
 <h3 id="fragment-page-stage2--gpu--gpu-datasheet--5-0x0000">5. 设备信息寄存器 (0x0000)<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--5-0x0000" title="Permanent link">¶</a></h3>
 <p>只读。</p>
@@ -704,8 +714,8 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 <tr>
 <td><code>0x0004</code></td>
 <td><code>DEV_VERSION</code></td>
-<td><code>0x0004_0000</code></td>
-<td>版本 v4.0.0</td>
+<td><code>0x0006_0000</code></td>
+<td>版本 v6.0.0</td>
 </tr>
 <tr>
 <td><code>0x0008</code></td>
@@ -884,7 +894,8 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 </tr>
 </thead>
 <tbody>
-<tr><td>31:5</td><td><code>Reserved</code></td><td>-</td><td>0</td><td>保留</td></tr>
+<tr><td>31:6</td><td><code>Reserved</code></td><td>-</td><td>0</td><td>保留</td></tr>
+<tr><td>5</td><td><code>DCACHE_FAULT</code></td><td>R/W1C</td><td>0</td><td>dcache 回写脏行失败，该行保持有效且脏；写 1 清除此位，不改变缓存内容。</td></tr>
 <tr><td>4</td><td><code>FIRMWARE</code></td><td>R/W1C</td><td>0</td><td>无法归属队列的固件异常；写 1 清除此位。</td></tr>
 <tr><td>3</td><td><code>IH_FAULT</code></td><td>R/W1C</td><td>0</td><td>IH 通道故障；写 1 清除此位，不清 IH_STATUS。</td></tr>
 <tr><td>2</td><td><code>DMA_FAULT</code></td><td>R/W1C</td><td>0</td><td>DMA 错误；写 1 清除。</td></tr>
@@ -893,7 +904,7 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 </tbody>
 </table>
 </div><h4 id="fragment-page-stage2--gpu--gpu-datasheet--65">6.5 软复位行为<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--65" title="Permanent link">¶</a></h4>
-<p>写 <code>GLOBAL_CTRL.RESET = 1</code> 后，设备停止 CP 与计算任务，清零全局控制、错误、中断、分发配置、DMA、HQD、Doorbell 提示和 IH 状态；GPUVM 清零，Outbound 恢复初始布局并停用；<code>GLOBAL_STATUS</code> 恢复 <code>READY</code>，<code>DISPATCH_STATUS</code> 恢复 <code>IDLE</code>。已连接的 CP 保持复位，启动入口与 Host 窗口基址清零。VRAM 内容保留。单独 CP 复位的范围见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--953-cp-reset">10.5 节</a>。</p><h3 id="fragment-page-stage2--gpu--gpu-datasheet--7-0x0200">7. 中断控制寄存器（IRQ 与 IH）<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--7-0x0200" title="Permanent link">¶</a></h3>
+<p>写 <code>GLOBAL_CTRL.RESET = 1</code> 后，设备停止 CP 与计算任务，先在 Outbound 与 VRAM 仍有效时回写并失效 dcache 的全部行。回写失败时复位停止：数据留在缓存中，<code>ERROR_STATUS.DCACHE_FAULT</code> 保持置位，已停止的 CP 与计算任务不自动恢复。回写成功后清零全局控制、错误、中断、分发配置、DMA、HQD、Doorbell 提示和 IH 状态；GPUVM 清零，Outbound 恢复初始布局并停用，dcache 的统计、命令和不可缓存区间清空；<code>GLOBAL_STATUS</code> 恢复 <code>READY</code>，<code>DISPATCH_STATUS</code> 恢复 <code>IDLE</code>。已连接的 CP 保持复位，启动入口与 Host 窗口基址清零。VRAM 内容保留。单独 CP 复位的范围见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--953-cp-reset">10.5 节</a>。</p><h3 id="fragment-page-stage2--gpu--gpu-datasheet--7-0x0200">7. 中断控制寄存器（IRQ 与 IH）<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--7-0x0200" title="Permanent link">¶</a></h3>
 <h4 id="fragment-page-stage2--gpu--gpu-datasheet--71">7.1 寄存器映射<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--71" title="Permanent link">¶</a></h4>
 <div class="table-scroll"><table>
 <thead>
@@ -1181,6 +1192,7 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 <li><strong>Host→VRAM</strong>：<code>SRC</code> = Host 对象的 Outbound GPU 物理地址，<code>DST</code> = VRAM GPU 物理地址，<code>DIR = 0</code>。</li>
 <li><strong>VRAM→Host</strong>：<code>SRC</code> = VRAM GPU 物理地址，<code>DST</code> = Host 对象的 Outbound GPU 物理地址，<code>DIR = 1</code>。</li>
 <li>写 <code>DMA_CTRL.START = 1</code> 触发传输。数据同步拷贝，完成通过 1ms 虚拟定时器通知。</li>
+<li>开始拷贝前，设备回写源范围内的 dcache 脏行，回写并失效目的范围内的行；维护失败时 <code>DMA_STATUS</code> 置 ERROR，不拷贝。</li>
 </ul>
 <h3 id="cp-control-registers">10. CP 控制寄存器<a class="headerlink" href="#cp-control-registers" title="Permanent link">¶</a><span id="fragment-page-stage2--gpu--gpu-datasheet--95-cp"></span></h3>
 <p>CP 的低地址映射到相同偏移的 VRAM。默认 64 MiB 配置中，<code>0x03c0_0000～0x03ff_ffff</code> 保留给 CP 固件，入口为 <code>0x03c0_0000</code>，最后 64 KiB 为栈。Host 经 BAR2 装载固件，写入入口并确认存储可见后解除复位。</p><h4 id="cp-register-map">10.1 寄存器映射（0x0500）</h4>
@@ -1272,7 +1284,7 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 <p>只接受 CSRRS 且 rs1 编码为 x0 的读取形式；rs1 指向其他寄存器时，即使该寄存器值为 0 也属于写请求。rd=x0 时仍检查 CSR 编号，再丢弃读取结果。未知 CSR、写请求和其他未支持形式报指令执行错误。mhartid 保留 0xF14 编号及第 14.3 节的编码。</p>
 <p>汇编器接受 <code>csrr rd, csr</code> 与 <code>csrrs rd, csr, rs1</code>，CSR 操作数可以是 0～4095 的数字或 .equ 常量。csrr 编码为 CSRRS rs1=x0。该接口仅提供启动值，不实现可写 SGPR/VGPR 或完整标量、向量指令体系。</p>
 <h3 id="fragment-page-stage2--gpu--gpu-datasheet--11-0x2000">13. 完成顺序与同步边界</h3>
-<p>任务成功后，CP 先写 Signal，再写通知槽并提交 IH，之后将包 Header 置为 INVALID，最后更新消费进度。等待方读取 Signal 确认完成后再读取计算结果；队列和存储的回收还需要排空并确认队列卸载。</p>
+<p>执行器给出终态后，CP 固件先回写 dcache 全部脏行并确认 <code>DCACHE_STATUS = OK</code>；回写失败时记 <code>EXECUTOR</code> 队列错误。任务成功后，CP 先写 Signal，再写通知槽并提交 IH，之后将包 Header 置为 INVALID，最后更新消费进度。等待方读取 Signal 确认完成后再读取计算结果；队列和存储的回收还需要排空并确认队列卸载。</p>
 <p>当前执行器不提供组间或跨 Warp 屏障。旧 BAR0 的 THREAD_MASK、BARRIER 和线程身份教学寄存器已移除，线程身份统一通过第 12 章的 CSR 获取。</p>
 <h3 id="fragment-page-stage2--gpu--gpu-datasheet--12">14. 执行模型<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--12" title="Permanent link">¶</a></h3>
 <h4 id="fragment-page-stage2--gpu--gpu-datasheet--121">14.1 线程层次<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--121" title="Permanent link">¶</a></h4>
@@ -1338,7 +1350,7 @@ GPUVM 关：输入就是 GPU 物理地址 ───────┴→ 公共物�
 <li>每 Warp 最多执行 <strong>100,000 轮</strong>，各分段累计计数，超出后任务报 <code>BUDGET</code> 错误。</li>
 </ul>
 <h4 id="fragment-page-stage2--gpu--gpu-datasheet--125-gpu">14.5 GPU 核心内存地址空间<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--125-gpu" title="Permanent link">¶</a></h4>
-<p>计算线程的 a0 直接保存 64 位派发参数地址：GPUVM 开启时解释为 GPUVA，数值等于参数块在应用进程中的 CPU 地址，位 63..48 为零；关闭时解释为 GPU 物理地址。参数读取、整数及浮点读写、取指均经过同一个用户访问入口；实际物理路由见<a href="#gpu-physical-map">4.5 节</a>。</p>
+<p>计算线程的 a0 直接保存 64 位派发参数地址：GPUVM 开启时解释为 GPUVA，数值等于参数块在应用进程中的 CPU 地址，位 63..48 为零；关闭时解释为 GPU 物理地址。参数读取、整数及浮点读写、取指均经过同一个用户访问入口；权限检查之后，数据读写经过 dcache，取指不经过。实际物理路由见<a href="#gpu-physical-map">4.5 节</a>。</p>
 <p>GPUVM 开启时，<code>0x8000_0000</code> 和 <code>0x9000_0000</code> 都是普通 GPUVA。关闭时，两者只按 VRAM／Outbound 布局解释。线程坐标从 CSR 读取，参数按普通内存处理，只有派发与取指保留声明范围检查。</p>
 <p>计算线程的 GPU 地址空间与 CP 的本地地址空间分别解释。CP 本地 <code>0x8000_0000</code> 窗口仍然存在，不对应计算线程的特殊页面。</p><h3 id="fragment-page-stage2--gpu--gpu-datasheet--13">15. 指令集<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--13" title="Permanent link">¶</a></h3>
 <h4 id="fragment-page-stage2--gpu--gpu-datasheet--131-rv32i">15.1 RV64I 整数指令子集<a class="headerlink" href="#fragment-page-stage2--gpu--gpu-datasheet--131-rv32i" title="Permanent link">¶</a></h4>
@@ -1627,9 +1639,9 @@ E5M2 下转换时，超出范围的有限值饱和到格式最大值；Inf 保�
 <p>下面寄存器均以对齐的 32 位小端值访问。未列出的读取返回 0；非法写入保留目标状态并设置全局 INVALID_CMD。GPUVM 关闭时保留版本、模式、固件握手和源槽故障记录，拒绝页表配置与失效请求。</p>
 <h4 id="gpuvm-mode">17.1 模式与固件握手</h4>
 <div class="table-scroll"><table><thead><tr><th>BAR0 偏移</th><th>寄存器</th><th>访问</th><th>复位值</th><th>行为</th></tr></thead><tbody>
-<tr><td><code>0x0900</code></td><td>VM_VERSION</td><td>Host / CP R</td><td>5</td><td>本版统一访存接口版本，固定为 5。</td></tr>
+<tr><td><code>0x0900</code></td><td>VM_VERSION</td><td>Host / CP R</td><td>6</td><td>本版统一访存接口版本，固定为 6。</td></tr>
 <tr><td><code>0x0904</code></td><td>VM_MODE</td><td>Host / CP R</td><td>启动配置</td><td>GPUVM 开启时为 1，关闭时为 0。</td></tr>
-<tr><td><code>0x0908</code></td><td>VM_FIRMWARE</td><td>Host R / CP R/W</td><td>0</td><td>CP 在两种状态下均检查设备版本，再写 5。其他写值非法；CP 单独复位也清零。</td></tr>
+<tr><td><code>0x0908</code></td><td>VM_FIRMWARE</td><td>Host R / CP R/W</td><td>0</td><td>CP 在两种状态下均检查设备版本，再写 6。其他写值非法；CP 单独复位也清零。</td></tr>
 </tbody></table></div>
 <p>CP 通过 <code>0xfffd_0000 + BAR0 偏移</code> 读取本组寄存器并发布握手。上下文和失效仅由 Host 配置，CP 不得通过该窗口修改。</p>
 
@@ -1676,11 +1688,11 @@ E5M2 下转换时，超出范围的有限值饱和到格式最大值；Inf 保�
 <tr><td><code>0x18</code></td><td>CLEAR</td><td>W</td><td>源 HQD 未激活时完整写 1，清除此组；读取为 0。软件须先确认旧访问和通知结束。</td></tr>
 </tbody></table></div>
 <p>故障记录不自行发送额外中断。CP 窗口返回访存异常，计算执行器返回失败，固件沿已有源队列错误和 IH 路径通知 Host；另一 VM 可以继续运行。整体复位清除上下文、TLB、三个计数、故障、ACK、VPN 范围和固件握手；CP 单独复位仅清窗口与握手，保留 GPUVM 状态和已有执行任务。</p>
-<blockquote><p><strong>[BOUNDARY]</strong> 下列固定提交记录 2026-10-19 的版本 1 实现，保留用于历史查阅。当前版本 5 的地址语义、CSR 和 Outbound 定义以本文各模块及本次工作区实现为准。</p>
+<blockquote><p><strong>[BOUNDARY]</strong> 下列固定提交记录 2026-10-19 的版本 1 实现，保留用于历史查阅。当前版本 6 的地址语义、CSR 和 Outbound 定义以本文各模块及本次工作区实现为准。</p>
 <p><strong>[SOURCE]</strong> 2026-10-19 固定实现提交 <code>3600ff795dde9069a6e4f1405f6950a61ea75faa</code>；文件散列见子仓库 <code>build/gpgpu-stage3-source.json</code>。寄存器编码：<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/software/gpgpu/include/gpgpu_vm.h#L1">software/gpgpu/include/gpgpu_vm.h，第 1 行起</a>；访问检查：<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L63">hw/gpgpu/gpgpu_vm.c，第 63 行起</a>；失效和配置写入：<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/3600ff795dde9069a6e4f1405f6950a61ea75faa/hw/gpgpu/gpgpu_vm.c#L176">第 176 行起</a>。</p></blockquote>
 
 <p><strong>[BOUNDARY]</strong> BAR0 由寄存器组子区域组成。跨 0x100 字节组边界的非对齐 8 字节访问可能被 QEMU 拆为两次 4 字节访问并接受；驱动须使用对齐的 32 位寄存器访问，不能依赖跨组访问的原子性或统一拒绝行为。</p>
-<p>Kernel 描述对象为 24 字节：偏移 0x00 为 64 位代码入口，偏移 0x10 的 <code>kernel_abi_version</code> 必须为 5，偏移 0x14 的保留字段必须为 0；CP 拒绝其他版本和非零保留字段。</p>
+<p>Kernel 描述对象为 24 字节：偏移 0x00 为 64 位代码入口，偏移 0x10 的 <code>kernel_abi_version</code> 必须为 6，偏移 0x14 的保留字段必须为 0；CP 拒绝其他版本和非零保留字段。</p>
 <h3 id="outbound-registers">18. Outbound 物理路由与窗口配置</h3>
 <p>Host 对象取得 IOVA 后，通过 <code>GPU 物理地址 = 0x8000_0000 + IOVA</code> 交给设备。公共物理入口先检查完整范围，再选择 VRAM 或 Outbound；Outbound 用窗口基址还原 IOVA，交给 PCIe DMA。</p>
 <pre><code>GPU_BASE       = 0x8000_0000（固定，与 vram_size 无关）
@@ -1703,7 +1715,58 @@ Host IOVA 0x4100_0000 → GPU 物理地址 0xc100_0000
 </tbody></table></div>
 <h4 id="outbound-lifetime">18.2 配置确认与停止条件</h4>
 <p>驱动在 CP 启动前读回核对基址和长度，再写 CONTROL 使能并读回 ACK。布局寄存器只读，写入置 OUTBOUND_STATUS.ERROR 并锁存 INVALID_CMD；合法 CONTROL 写入置 ACK。非法写入保留原配置，状态置 ERROR，并记录全局 INVALID_CMD。BUSY 反映物理在途访问。</p>
-<p>窗口由全设备共用，创建 BO、Queue 或切换进程时均不修改。写 CONTROL 要求 CP 保持复位、所有 HQD 停用、执行器和 DMA、IH 不忙且物理在途计数为零；基址和长度始终只读。停止时先确认设备访问已经结束，才能关闭窗口或重新初始化。CP 单独复位保留窗口；设备整体复位恢复上述初值并停用。</p>
+<p>窗口由全设备共用，创建 BO、Queue 或切换进程时均不修改。写 CONTROL 要求 CP 保持复位、所有 HQD 停用、执行器和 DMA、IH 不忙且物理在途计数为零；基址和长度始终只读。停止时先确认设备访问已经结束，才能关闭窗口或重新初始化。关闭窗口前，设备先回写并失效窗口内的 dcache 行；回写失败时窗口保持打开，状态置 ERROR。CP 单独复位保留窗口；设备整体复位恢复上述初值并停用。</p>
+<h3 id="dcache-registers">19. dcache 数据缓存</h3>
+<p>CP 用户访存窗口和计算执行器的数据读写，在 GPUVM 完成翻译和权限检查之后经过一份设备共用的数据缓存：数据容量 32 KiB，64 字节行，4 路组相联，组内按最近最少使用替换，写回加写分配。标签是 GPU 物理地址，与 GPUVA、VMID 无关；VRAM 和 Outbound 窗口内的 Host 数据都可以缓存。取指、页表遍历、CP 管理域、DMA 与 IH 不经过缓存。缓存行为、软件交接顺序与设计理由见 <a href="./dcache%20%E7%AC%AC%E4%B8%80%E7%89%88%E8%A7%84%E6%A0%BC.md">dcache 规格</a>。</p>
+<pre><code>GPU 物理地址位   31 ........ 13 | 12 ..... 6 | 5 ..... 0
+用途                  Tag       |    组号    |  行内偏移
+
+例：0x0123_4568 → 行起点 0x0123_4540，组号 0x15，Tag 0x91a，行内偏移 0x28</code></pre>
+<h4 id="dcache-register-map">19.1 寄存器映射（0x0c00）</h4>
+<p>Host 经 BAR0、CP 经本地寄存器窗口 <code>0xfffd_0000 + BAR0 偏移</code> 访问同一组偏移，均为对齐的 32 位小端访问。统计四项全设备共用；ADDR、LENGTH 与 STATUS 两方各有一份，一方写入不改变另一方读到的值。</p>
+<div class="table-scroll"><table><thead><tr><th>BAR0 偏移</th><th>寄存器</th><th>Host / CP 访问</th><th>复位值</th><th>含义</th></tr></thead><tbody>
+<tr><td><code>0x0c00</code></td><td>DCACHE_HITS</td><td>R</td><td>0</td><td>可缓存数据请求按行查找的命中次数，32 位回绕。</td></tr>
+<tr><td><code>0x0c04</code></td><td>DCACHE_MISSES</td><td>R</td><td>0</td><td>未命中次数，回填失败也计一次。</td></tr>
+<tr><td><code>0x0c08</code></td><td>DCACHE_EVICTIONS</td><td>R</td><td>0</td><td>用新行替换有效旧行的次数；填入空路和主动失效不计。</td></tr>
+<tr><td><code>0x0c0c</code></td><td>DCACHE_WRITEBACKS</td><td>R</td><td>0</td><td>成功写回脏行的次数，含替换、维护与任务收尾。</td></tr>
+<tr><td><code>0x0c10</code></td><td>DCACHE_ADDR_LO</td><td>R/W</td><td>0</td><td>本方命令起始 GPU 物理地址低 32 位。</td></tr>
+<tr><td><code>0x0c14</code></td><td>DCACHE_ADDR_HI</td><td>R/W</td><td>0</td><td>本方命令起始地址高 32 位。</td></tr>
+<tr><td><code>0x0c18</code></td><td>DCACHE_LENGTH</td><td>R/W</td><td>0</td><td>本方命令字节数。</td></tr>
+<tr><td><code>0x0c1c</code></td><td>DCACHE_CMD</td><td>W</td><td>—</td><td>写入即同步执行命令，读为 0。</td></tr>
+<tr><td><code>0x0c20</code></td><td>DCACHE_STATUS</td><td>R</td><td>0</td><td>本方最近一次命令的结果，见 19.2 节。</td></tr>
+</tbody></table></div>
+<p>写只读寄存器或组内未定义偏移时锁存 <code>ERROR_STATUS.INVALID_CMD</code>，读未定义偏移返回 0。命中率由软件计算：HITS ÷（HITS + MISSES），统计区间取前后两次读数之差。取指、页表遍历、不可缓存访问、DMA、IH、回填与维护本身都不计命中和未命中。</p>
+<h4 id="dcache-commands">19.2 维护命令与结果</h4>
+<p>软件先写 ADDR_LO、ADDR_HI 和 LENGTH，再写 CMD；设备在这次写入内同步完成命令，随后读 STATUS 即得到结果。CMD 的取值如下，未列出的组合返回 INVALID：</p>
+<div class="table-scroll"><table><thead><tr><th>CMD</th><th>名称</th><th>发起方</th><th>作用</th></tr></thead><tbody>
+<tr><td><code>0x01</code></td><td>CLEAN</td><td>Host / CP</td><td>回写与 [ADDR, ADDR + LENGTH) 重叠的脏行，行保持有效。</td></tr>
+<tr><td><code>0x02</code></td><td>INVALIDATE</td><td>Host / CP</td><td>失效重叠的干净行；遇到脏行停止，返回 DIRTY。</td></tr>
+<tr><td><code>0x03</code></td><td>CLEAN | INVALIDATE</td><td>Host / CP</td><td>先回写，成功后失效。</td></tr>
+<tr><td><code>0x04</code> 加上述任一项</td><td>ALL</td><td>Host / CP</td><td>作用于整个缓存，忽略 ADDR 与 LENGTH。单独写 ALL 返回 INVALID。</td></tr>
+<tr><td><code>0x08</code></td><td>UC_ADD</td><td>仅 Host</td><td>登记不可缓存区间，单独使用，见 19.3 节。</td></tr>
+<tr><td><code>0x10</code></td><td>UC_REMOVE</td><td>仅 Host</td><td>撤销与登记时完全相同的区间，单独使用。</td></tr>
+</tbody></table></div>
+<p>不带 ALL 的维护命令要求 LENGTH 非零、范围低于 4 GiB，作用于与范围重叠的整行。维护不改变替换顺序，遇到第一个失败的行即停止，之前的行保持已维护的状态。STATUS 的取值：</p>
+<div class="table-scroll"><table><thead><tr><th>值</th><th>名称</th><th>含义</th></tr></thead><tbody>
+<tr><td>0</td><td><code>OK</code></td><td>复位值；最近一次命令已完成。</td></tr>
+<tr><td>1</td><td><code>INVALID</code></td><td>命令编码、地址或长度非法，区间重叠或不存在，或 CP 请求登记、撤销区间；没有改动任何状态。</td></tr>
+<tr><td>2</td><td><code>DIRTY</code></td><td>只失效时遇到脏行；之前的行已失效，该行及之后的行不变。</td></tr>
+<tr><td>3</td><td><code>STORAGE</code></td><td>回写失败；该行保持有效且脏，并锁存 <code>ERROR_STATUS.DCACHE_FAULT</code>。</td></tr>
+<tr><td>4</td><td><code>FULL</code></td><td>不可缓存区间表已满。</td></tr>
+<tr><td>5</td><td><code>BUSY</code></td><td>仍有物理在途访问，命令未执行。</td></tr>
+</tbody></table></div>
+<h4 id="dcache-uncached">19.3 不可缓存区间</h4>
+<p>设备保存一张不可缓存的 GPU 物理区间表，表外地址默认可以缓存。数据访问完成翻译和权限检查后按行起点查表，表内的行直接读写后备存储，GPUVM 开启和关闭时规则相同。表项数为 <code>GPGPU_DCACHE_UC_RANGES</code>。</p>
+<p>UC_ADD 要求 ADDR 与 LENGTH 按 64 字节对齐、LENGTH 非零、区间完整落在 VRAM 或 Outbound 窗口的固定布局内，且不与已登记区间重叠。登记前设备先回写并失效区间内已缓存的行，回写失败时不登记并返回 STORAGE。UC_REMOVE 只接受与登记时完全相同的区间，区间内没有缓存行，撤销时不需要维护。整体复位清空区间表。</p>
+<h4 id="dcache-bypass">19.4 旁路访问与复位</h4>
+<p>直接读写后备存储的一方先维护重叠的缓存行：读之前回写脏行，写之前回写并失效。维护失败时不开始这次访问。</p>
+<ul>
+<li><strong>BAR2</strong>：读失败返回 0；写失败时丢弃本次写入。成功的写入只改变请求的字节。</li>
+<li><strong>DMA</strong>：源范围回写，目的范围回写并失效；失败时 <code>DMA_STATUS</code> 置 ERROR，不拷贝。见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--94">9.4 节</a>。</li>
+<li><strong>Outbound 关闭</strong>：先回写并失效窗口内的行，见 <a href="#outbound-lifetime">18.2 节</a>。</li>
+<li><strong>整体复位</strong>：停止 CP 与执行器后回写并失效全部行，再复位各模块；回写失败时复位停止，见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--65">6.5 节</a>。</li>
+</ul>
+<p>CP 单独复位、分发确认（ACK）和 TLB 失效都不清缓存、区间表或统计。CP 固件在每个任务的执行器终态之后回写全部脏行，再发布完成或错误，见<a href="#fragment-page-stage2--gpu--gpu-datasheet--11-0x2000">第 13 章</a>。</p>
 
               </div><section class="notes-wrap"><h2>我的笔记</h2><p class="notes-help">笔记可直接填写；修改后请点顶部「保存 HTML」。</p><div class="personal-notes" contenteditable="true" role="textbox" aria-multiline="true" aria-label="GPGPU 硬件手册的笔记" data-placeholder="记录你的理解与实验结果……"></div></section></article><section class="credits" id="source-and-license"><h2>来源与许可</h2><p>手册基于 QEMU Camp 2026 的 GPGPU 教学设备资料及本仓库的寄存器规格修订。原作者、贡献者署名与插图出处沿用原资料。</p><p>来源：<a href="https://qemu.gevico.online/exercise/2026/" target="_blank" rel="noopener noreferrer">QEMU Camp 2026 实验</a> · <a href="https://github.com/qemu-camp/qemu-camp-tutorial" target="_blank" rel="noopener noreferrer">qemu-camp/qemu-camp-tutorial</a>。</p><p>仓库 README 声明 docs/ 文档采用 <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a>，代码目录采用 MIT。本文档部分及离线改编按 CC BY-SA 4.0 提供；第三方图片与素材沿用各自原始许可和署名。原站页脚与根 LICENSE 的 MIT 声明同时保留在下方。</p><p>文档改编：将硬件手册独立保存，按硬件模块组织 CP、HQD、IH、Doorbell 与分发寄存器；保留原指令集、编辑、笔记与 HTML 导出功能。</p><p><strong>[SOURCE] 当前协议入口：</strong><a href="../software/gpgpu/include/gpgpu/gpgpu_version.h">版本号</a>、<a href="../software/gpgpu/include/gpgpu/gpgpu_regs.h">寄存器编码</a>、<a href="../software/gpgpu/include/gpgpu/gpgpu_ih_abi.h">IH 记录</a>、<a href="../software/gpgpu/include/gpgpu/gpgpu_queue_abi.h">Kernel 描述对象</a>；设备分发在 <a href="../hw/gpgpu/bar0.c">bar0.c</a>，存储与中断实现分别在 mem/、irq/。</p><details><summary>历史规格与寄存器定义依据</summary><p>以下链接保留版本 1 的固定提交，供历史查阅，不用于证明当前协议的接口。</p><p>[SPEC] <a href="./CP_MEC%20%E7%AC%AC%E4%B8%80%E7%89%88%E8%A7%84%E6%A0%BC.md">CP/MEC 规格</a>；硬件手册只收录硬件接口，软件约定与确认记录保留在原文。</p><p>[SOURCE] 寄存器核对版本：<code>6325a87e4c500f4930c4e0b502a1ec241f83bf26</code>。<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/hw/gpgpu/gpgpu_regs.h#L18-L109">基础寄存器与 CP 窗口</a>；<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/software/gpgpu/include/gpgpu_queue.h#L40-L137">HQD、IH 与分发寄存器编码</a>；<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/hw/gpgpu/gpgpu_hqd.c#L89-L158">HQD 访问权限与字段校验</a>；<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/hw/gpgpu/gpgpu_ih.c#L73-L210">IH 提交、访问与复位</a>；<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/hw/gpgpu/gpgpu_dispatch.c#L215-L266">分发结果与确认</a>；<a href="https://github.com/hxfei-git/gpu-study-qemu/blob/6325a87e4c500f4930c4e0b502a1ec241f83bf26/hw/riscv/gpgpu-cp.c#L103-L153">CP Host 窗口基址与复位</a>。</p></details><details><summary>原仓库 README（含许可说明）</summary><pre># QEMU Camp Tutorial
 

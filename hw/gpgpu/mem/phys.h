@@ -10,7 +10,8 @@
  *                                 再经 PCIe DMA 访问
  *
  * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都走 gpgpu_phys_rw()；
- * 用户地址先经 mem/gpuvm.c 翻译（或直通）再进入这里。
+ * 用户地址先经 mem/gpuvm.c 翻译（或直通），取指直接进入这里，数据读写
+ * 经 mem/dcache.c，未命中或不可缓存时再进入这里。
  */
 #ifndef HW_GPGPU_MEM_PHYS_H
 #define HW_GPGPU_MEM_PHYS_H

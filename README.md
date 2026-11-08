@@ -10,6 +10,7 @@
 | ARM64 | Arm 64-bit Architecture | Host 客体使用的 64 位 Arm 架构 |
 | RV64 | 64-bit RISC-V | 原生 CP 与计算执行器使用的 RISC-V 位宽 |
 | GPUVM | GPU Virtual Memory | GPU 虚拟内存 |
+| dcache | Data Cache | 数据缓存；本实验指翻译后的设备级数据缓存 |
 | GPL | GNU General Public License | GNU 通用公共许可证 |
 | CC BY-SA | Creative Commons Attribution-ShareAlike | 知识共享署名—相同方式共享许可 |
 | AMDGPU | AMD GPU Linux Kernel Driver | AMD GPU Linux 内核驱动 |
@@ -33,10 +34,10 @@
 ## 4. 文档导航
 
 - [实验进度](<./docs/实验进度.md>)、[四阶段实验大纲](<./docs/QEMU GPGPU 实验大纲.md>)
-- [CP/MEC 第一版规格](<./docs/CP_MEC 第一版规格.md>)、[GPUVM 第一版规格](<./docs/GPUVM 第一版规格.md>)
+- [CP/MEC 第一版规格](<./docs/CP_MEC 第一版规格.md>)、[GPUVM 第一版规格](<./docs/GPUVM 第一版规格.md>)、[dcache 第一版规格](<./docs/dcache 第一版规格.md>)
 - [Linux 驱动内存管理](<./docs/Linux 驱动内存管理.md>)：对象分配、GPU 绑定与资源回收的实现讲解，不属于待确认规格
 - [第三阶段规格评审](<./docs/第三阶段规格评审.md>)：与 AMD 的差异及改进草案；剩余方案见[待确认索引](<./docs/第三阶段规格评审.md#review-index>)
-- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V5.md>)
+- [GPGPU 硬件手册](<./docs/GPGPU_硬件手册.html>)、[协议版本差异](<./software/gpgpu/PROTOCOL_V6.md>)
 - [软件栈说明](<./software/gpgpu/README.md>)
 - 历史参考，按各自注明的版本阅读：[GPGPU 适配笔记](<./docs/GPGPU_适配.html>)、[CP/MEC 软件实现、参考与扩展](<./docs/历史/CP_MEC 软件实现、参考与扩展.md>)、[旧设备说明](<./docs/历史/gpgpu.rst>)
 

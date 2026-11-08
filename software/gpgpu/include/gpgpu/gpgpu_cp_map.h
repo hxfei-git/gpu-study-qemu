@@ -6,7 +6,7 @@
  *
  *   0x0000_0000  VRAM 别名（固件代码、数据与栈位于末尾 4 MiB）
  *   0x8000_0000  64 KiB 访存窗口：按当前窗口配置访问 GPU 物理地址或用户地址
- *   0xfffd_0000  本地寄存器窗口：Dispatch、IH、VM 只读信息的 CP 视图
+ *   0xfffd_0000  本地寄存器窗口：Dispatch、IH、dcache、VM 只读信息的 CP 视图
  *   0xfffe_0000  访存窗口配置寄存器
  *   0xffff_0000  HQD 直接访问窗口，每槽 0x100 字节
  *

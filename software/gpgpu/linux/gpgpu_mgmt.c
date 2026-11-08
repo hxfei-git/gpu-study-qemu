@@ -22,7 +22,7 @@
 #define MGMT_SLOTS (GPGPU_MGMT_BYTES / sizeof(GpgpuManagementPacket))
 
 /*
- * 为 KIQ 或 HIQ 分配 Ring、进度页与 MQD，并填好 MQD。
+ * 为 KIQ 或 HIQ 分配 Ring、进度页与 MQD，登记为不可缓存，并填好 MQD。
  *
  * Ring 之后紧跟一页进度：R 在偏移 GPGPU_MGMT_BYTES，W 在其后 8 字节。两条
  * 管理队列使用 Doorbell 第 0 页的入口 0、1（偏移 index * 8）。KIQ 由
@@ -35,9 +35,9 @@ static int mgmt_ring_init(struct gpgpu_device *dev, unsigned int index)
 	GpgpuMqd *mqd;
 	int ret;
 
-	ret = gpgpu_dma_buf_alloc(dev, &mq->storage, MGMT_STORAGE_BYTES, 1);
+	ret = gpgpu_ctrl_buf_alloc(dev, &mq->storage, MGMT_STORAGE_BYTES, 1);
 	if (!ret)
-		ret = gpgpu_dma_buf_alloc(dev, &mq->mqd, sizeof(GpgpuMqd), 1);
+		ret = gpgpu_ctrl_buf_alloc(dev, &mq->mqd, sizeof(GpgpuMqd), 1);
 	if (ret)
 		return ret;
 
@@ -65,7 +65,7 @@ int gpgpu_mgmt_init(struct gpgpu_device *dev)
 
 static void mgmt_request_free(struct gpgpu_device *dev, struct gpgpu_mgmt_request *req)
 {
-	gpgpu_dma_buf_free(dev, &req->result);
+	gpgpu_ctrl_buf_free(dev, &req->result);
 	list_del(&req->node);
 	kfree(req);
 }
@@ -81,15 +81,15 @@ void gpgpu_mgmt_fini(struct gpgpu_device *dev)
 	list_for_each_entry_safe(req, next, &dev->requests, node)
 		mgmt_request_free(dev, req);
 	for (unsigned int i = 0; i < ARRAY_SIZE(dev->mgmt); i++) {
-		gpgpu_dma_buf_free(dev, &dev->mgmt[i].mqd);
-		gpgpu_dma_buf_free(dev, &dev->mgmt[i].storage);
+		gpgpu_ctrl_buf_free(dev, &dev->mgmt[i].mqd);
+		gpgpu_ctrl_buf_free(dev, &dev->mgmt[i].storage);
 	}
 }
 
 /*
- * 第 1 步：分配 16 字节结果区，completion 已由 gpgpu_dma_buf_alloc()
- * 清零，status 置为 PENDING。请求挂到 dev->requests，未回收的
- * 结果区在设备释放时统一归还。调用者持 dev->lock。
+ * 第 1 步：分配 16 字节结果区并登记为不可缓存，completion 已由
+ * gpgpu_dma_buf_alloc() 清零，status 置为 PENDING。请求挂到
+ * dev->requests，未回收的结果区在设备释放时统一归还。调用者持 dev->lock。
  */
 static struct gpgpu_mgmt_request *mgmt_request_alloc(struct gpgpu_device *dev)
 {
@@ -98,7 +98,7 @@ static struct gpgpu_mgmt_request *mgmt_request_alloc(struct gpgpu_device *dev)
 
 	if (!req)
 		return NULL;
-	if (gpgpu_dma_buf_alloc(dev, &req->result, sizeof(*result), 8)) {
+	if (gpgpu_ctrl_buf_alloc(dev, &req->result, sizeof(*result), 8)) {
 		kfree(req);
 		return NULL;
 	}

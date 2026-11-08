@@ -245,7 +245,8 @@ out:
 /*
  * 同一运行时、同一队列连续派发两次向量加法：第一次完成后释放输出数组，
  * 队列不卸载，再分配新输出区并第二次派发。新输出区先写入 poison，
- * 第二次计算漏执行时比较会失败。
+ * 第二次计算漏执行时比较会失败。第二次派发前 X 换成另一组输入并重新
+ * 上传，设备若仍使用第一次缓存的旧 X，比较同样会失败。
  */
 static int lifecycle_demo(GpgpuKmtContext *ctx)
 {
@@ -297,12 +298,19 @@ static int lifecycle_demo(GpgpuKmtContext *ctx)
 	    verify("lifecycle first dispatch", out, ref, count))
 		goto out;
 
-	/* 3. 队列仍驻留：释放 Z，再分配写入 poison 的新输出区。 */
-	for (uint32_t i = 0; i < count; i++)
+	/*
+	 * 3. 队列仍驻留：释放 Z，再分配写入 poison 的新输出区；X 换成
+	 *    新输入并重新上传。
+	 */
+	for (uint32_t i = 0; i < count; i++) {
+		a[i] = ((int)(i % 31) - 15) * 0.75f;
+		ref[i] = a[i] + b[i];
 		out[i] = DEMO_POISON;
+	}
 	if (check(gpgpu_rt_buffer_free(rt, z), "队列存活时释放数组") ||
 	    check(gpgpu_rt_buffer_alloc(rt, bytes, &z), "队列存活时分配数组") ||
-	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组"))
+	    check(gpgpu_rt_upload(rt, z, out, bytes), "上传数组") ||
+	    check(gpgpu_rt_upload(rt, x, a, bytes), "上传数组"))
 		goto out;
 	args[2] = z->gpu_address;
 

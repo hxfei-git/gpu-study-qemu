@@ -3,6 +3,7 @@
 | 缩写   | 英文全称                                               | 中文含义                                                    |
 | ------ | ------------------------------------------------------ | ----------------------------------------------------------- |
 | GPUVM  | GPU Virtual Memory                                     | GPU 虚拟内存；设备地址空间及其映射管理                      |
+| dcache | Data Cache                                             | 数据缓存；本实验指翻译后的设备级数据缓存                    |
 | VM     | Virtual Memory                                         | 虚拟内存；本文指 GPU 地址空间及其上下文                     |
 | GPUVA  | GPU Virtual Address                                    | GPU 虚拟地址                                                |
 | GPU    | Graphics Processing Unit                               | 图形处理器                                                  |
@@ -52,9 +53,9 @@
 | PCIe   | Peripheral Component Interconnect Express | 高速外设互连总线 |
 | API    | Application Programming Interface                      | 应用编程接口                                                |
 
-本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 5，与版本 4 的差异见 [PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明](<../software/gpgpu/README.md#stage-three-gpuvm>)。
+本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 6，与版本 5 的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明](<../software/gpgpu/README.md#stage-three-gpuvm>)。
 
-**[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
+**[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口；数据读写在翻译和权限检查之后先经过设备的数据缓存，见 [dcache 第一版规格](<./dcache 第一版规格.md#dcache-paths>)。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
 
 建议先读第 1 节的使用流程，再读第 2～7 节的对象、访问和回收，最后检查第 9 节的范围记录。推进顺序见[第三阶段大纲](<./QEMU GPGPU 实验大纲.md#stage-three-vmid>)。
 
@@ -445,29 +446,29 @@ VPN = GPUVA[47:12]，组号 = VPN % 64
 
 > **[SOURCE] 可选源码索引**
 >
-> - 组与项的结构：[hw/gpgpu/mem/gpuvm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:31:1>) [第 31～55 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:31:1>)；
-> - 查找、未命中计数与填入：[hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:262:1>) [第 262～288 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:262:1>) 的 `vm_lookup()`；
-> - 选择无效路或替换 `order[3]`：[第 210～236 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:210:1>) 的 `tlb_fill()`；
-> - 失效只清有效位：[第 488～500 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:488:1>) 的 `tlb_invalidate()`。
+> - 组与项的结构：[hw/gpgpu/mem/gpuvm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:34:1>) [第 34～58 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:34:1>)；
+> - 查找、未命中计数与填入：[hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:263:1>) [第 263～289 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:263:1>) 的 `vm_lookup()`；
+> - 选择无效路或替换 `order[3]`：[第 211～237 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:211:1>) 的 `tlb_fill()`；
+> - 失效只清有效位：[第 502～514 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:502:1>) 的 `tlb_invalidate()`。
 
 下面的 `tlb_touch()` 维护排名，可以对照上例中“前面的路后移、后面的路不动”：
 
-> **[SOURCE]** [hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:199:1>) [第 199～208 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:199:1>)，协议版本 5 的实现。
+> **[SOURCE]** [hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:200:1>) [第 200～209 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:200:1>)，当前实现。
 
 ```c
-199	/* 把 way 移到 order[0] 成为 MRU，排在它前面的路依次后移一位。 */
-200	static void tlb_touch(GPGPUVMTlbSet *set, uint8_t way)
-201	{
-202		unsigned int pos = 0;
-203	
-204		while (pos < GPGPU_VM_TLB_WAYS - 1 && set->order[pos] != way)
-205			pos++;
-206		memmove(&set->order[1], &set->order[0], pos);
-207		set->order[0] = way;
-208	}
+200	/* 把 way 移到 order[0] 成为 MRU，排在它前面的路依次后移一位。 */
+201	static void tlb_touch(GPGPUVMTlbSet *set, uint8_t way)
+202	{
+203		unsigned int pos = 0;
+204	
+205		while (pos < GPGPU_VM_TLB_WAYS - 1 && set->order[pos] != way)
+206			pos++;
+207		memmove(&set->order[1], &set->order[0], pos);
+208		set->order[0] = way;
+209	}
 ```
 
-第 204～205 行找出这一路当前的名次 `pos`；第 206 行只把 `order[0..pos-1]` 后移一位，`order[pos+1..3]` 保持原值；第 207 行把这一路放到 `order[0]`。上例命中路 2 时 `pos = 2`，移动的是路 0 和路 3。
+第 205～206 行找出这一路当前的名次 `pos`；第 207 行只把 `order[0..pos-1]` 后移一位，`order[pos+1..3]` 保持原值；第 208 行把这一路放到 `order[0]`。上例命中路 2 时 `pos = 2`，移动的是路 0 和路 3。
 
 ### 5.3 结束旧访问和通知后才复用编号
 
@@ -596,7 +597,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数�
 
 ### 8.3 单一 DRM 入口与协议版本
 
-两种状态都只开放 DRM render node。驱动读取设备的 `gpuvm` 属性后固定使用，删除 `queue_mode`、`/dev/gpgpu0`、旧同步提交和旧 Runtime。设备／固件队列协议、DRM 与 GPUVM 编码均为版本 5，旧组件明确拒绝，不增加兼容转换。AQL 包仍为 64 字节，Kernel 描述对象为 24 字节。
+两种状态都只开放 DRM render node。驱动读取设备的 `gpuvm` 属性后固定使用，删除 `queue_mode`、`/dev/gpgpu0`、旧同步提交和旧 Runtime。设备／固件队列协议、DRM 与 GPUVM 编码均为版本 6，旧组件明确拒绝，不增加兼容转换。AQL 包仍为 64 字节，Kernel 描述对象为 24 字节。
 
 公共 HSAKMT 风格库承担槽位预留、Header 发布、8 字节 Doorbell 更新、Signal 等待与事件配合、排空和 Queue 销毁；示例通过 `lib/rt/` 调用 `lib/kmt/`，统一链接 `libgpgpu.a`。应用只使用 `cpu` 和 `gpu_address`，不选择 Host DMA 地址、VRAM 偏移或 GPUVA 三套字段。
 

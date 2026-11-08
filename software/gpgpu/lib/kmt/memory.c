@@ -95,7 +95,7 @@ static bool map_error_uncertain(int error)
  * 1. kmt_reserve_va() 申请一段对齐的 CPU 地址 va，先以 PROT_NONE 占住；
  * 2. GPGPU_DRM_BO_CREATE 创建 GEM 对象，驱动返回句柄、页对齐后的
  *    mapped_size 和 mmap 偏移；flags 带 GPGPU_BO_EVENT_PAGE 时驱动同时把它
- *    登记为会话的通知页；
+ *    登记为会话的通知页，带它或 GPGPU_BO_UNCACHED 时对象不进入 dcache；
  * 3. 用 MAP_FIXED 把对象映射到 va，替换占位：Host 对象可读写；VRAM 对象
  *    只能是 PROT_NONE，CPU 访问这段地址会触发段错误；
  * 4. GPGPU_DRM_MAP 绑定 GPU：GPUVM 开启时 address 就是 va，GPUVA 与 CPU
@@ -188,15 +188,19 @@ undo:
 	return status;
 }
 
-/* 创建并绑定一个整对象，成功后挂到连接的 memory 链表。 */
-GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t size,
-				   uint64_t alignment, uint32_t permissions, uint64_t fixed_va,
-				   GpgpuKmtMemory **memory)
+/*
+ * 创建并绑定一个整对象，成功后挂到连接的 memory 链表。通知页由 Open
+ * 单独创建，这里只接受 GPGPU_BO_UNCACHED。
+ */
+GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint32_t flags,
+				   uint64_t size, uint64_t alignment, uint32_t permissions,
+				   uint64_t fixed_va, GpgpuKmtMemory **memory)
 {
 	GpgpuKmtStatus status;
 	KmtMemory *m;
 
-	if (!memory || !size || !alignment || (alignment & (alignment - 1)))
+	if (!memory || !size || !alignment || (alignment & (alignment - 1)) ||
+	    (flags & ~GPGPU_BO_UNCACHED))
 		return GPGPU_KMT_INVALID_PARAMETER;
 	*memory = NULL;
 	m = calloc(1, sizeof(*m));
@@ -213,7 +217,7 @@ GpgpuKmtStatus gpgpuKmtAllocMemory(GpgpuKmtContext *c, uint32_t kind, uint64_t s
 		goto out;
 	}
 
-	status = kmt_memory_create(c, kind, 0, size, alignment, permissions, fixed_va, m);
+	status = kmt_memory_create(c, kind, flags, size, alignment, permissions, fixed_va, m);
 	if (status == GPGPU_KMT_SUCCESS) {
 		/* 挂入链表后把 m 置 NULL，避免末尾的 free 释放它。 */
 		m->next = c->memory;
@@ -323,4 +327,24 @@ GpgpuKmtStatus gpgpuKmtCopyMemory(GpgpuKmtMemory *host, uint64_t host_offset,
 		.size = size,
 	};
 	return kmt_call(h->context, GPGPU_DRM_COPY, &args);
+}
+
+/* 请驱动按对象范围回写或失效 dcache，返回时设备已完成维护。 */
+GpgpuKmtStatus gpgpuKmtSyncMemory(GpgpuKmtMemory *memory, uint64_t offset, uint64_t size,
+				  uint32_t op)
+{
+	KmtMemory *m = kmt_memory(memory);
+	struct gpgpu_cache_sync args;
+
+	if (!kmt_range_ok(m, offset, size))
+		return GPGPU_KMT_INVALID_PARAMETER;
+
+	args = (struct gpgpu_cache_sync) {
+		.version = GPGPU_DRM_VERSION,
+		.handle = m->handle,
+		.offset = offset,
+		.size = size,
+		.op = op,
+	};
+	return kmt_call(m->context, GPGPU_DRM_CACHE_SYNC, &args);
 }

@@ -3,10 +3,10 @@
  * GPGPU 驱动：用户 AQL 队列与 Doorbell
  *
  * 创建队列（gpgpu_queue_create）：
- *   1. 检查 Ring 与进度：两个 BO 都已绑定、属于 Host 内存、不被别的队列占用，
- *      偏移对齐且 Ring 与 R/W 不重叠；当前 R == W；
+ *   1. 检查 Ring 与进度：两个 BO 都已绑定、属于不可缓存的 Host 内存、不被
+ *      别的队列占用，偏移对齐且 Ring 与 R/W 不重叠；当前 R == W；
  *   2. 分配会话的 Doorbell 页和页内入口；
- *   3. 分配 MQD；
+ *   3. 分配 MQD 并登记为不可缓存；
  *   4. 取得 VMID（gpgpu_vm_attach()），填写 MQD，Ring 全部置为 INVALID；
  *   5. 经 HIQ 发送 MAP_QUEUES。CP 可能仍持有队列时（结果未知、重复映射、
  *      需要恢复）队列保留为 FAULTED，VMID 也一并保留；CP 明确拒绝且没有
@@ -51,7 +51,7 @@ void gpgpu_queue_free(struct gpgpu_queue *q)
 		q->ring->users--;
 		q->progress->users--;
 	}
-	gpgpu_dma_buf_free(q->fpriv->dev, &q->mqd);
+	gpgpu_ctrl_buf_free(q->fpriv->dev, &q->mqd);
 	list_del(&q->node);
 	kfree(q);
 }
@@ -83,12 +83,16 @@ static bool ranges_overlap(u64 a, u64 a_size, u64 b, u64 b_size)
 	return a < b + b_size && b < a + a_size;
 }
 
-/* 第 1 步：Ring 与进度对象及偏移。 */
+/*
+ * 第 1 步：Ring 与进度对象及偏移。两个对象都须是不可缓存的 Host 对象：
+ * CP 持续轮询 W 与 Header，R、W 还可能落在同一条缓存行内，经 dcache
+ * 访问会读到旧值，整行回写也会覆盖 CPU 新写的字段。
+ */
 static bool queue_args_valid(struct gpgpu_bo *ring, struct gpgpu_bo *progress,
 			     const struct gpgpu_queue_create *args)
 {
 	if (args->reserved || ring->kind != GPGPU_MEMORY_HOST ||
-	    progress->kind != GPGPU_MEMORY_HOST)
+	    progress->kind != GPGPU_MEMORY_HOST || !ring->uncached || !progress->uncached)
 		return false;
 	if (!is_power_of_2(args->ring_size) || args->ring_size < GPGPU_QUEUE_RING_MIN ||
 	    args->ring_size > GPGPU_QUEUE_RING_MAX || (args->ring_offset & 63) ||
@@ -256,7 +260,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
-	ret = gpgpu_dma_buf_alloc(dev, &q->mqd, sizeof(GpgpuMqd), 8);
+	ret = gpgpu_ctrl_buf_alloc(dev, &q->mqd, sizeof(GpgpuMqd), 8);
 	if (ret) {
 		kfree(q);
 		return ret;
@@ -269,7 +273,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	 */
 	ret = gpgpu_vm_attach(fpriv);
 	if (ret) {
-		gpgpu_dma_buf_free(dev, &q->mqd);
+		gpgpu_ctrl_buf_free(dev, &q->mqd);
 		kfree(q);
 		return ret;
 	}

@@ -4,7 +4,8 @@
  *
  * 用户态经 render node 调用这些 ioctl：先 INFO 查询地址模式，再 BO_CREATE 创建
  * 固定存储的 GEM 对象并 MAP 绑定到 GPU 地址，然后 QUEUE_CREATE 建立 AQL 队列、
- * EVENT_CREATE 建立完成事件。本文件只描述 ioctl 参数，不含设备寄存器。
+ * EVENT_CREATE 建立完成事件。CPU 直接改写可缓存对象后，先用 CACHE_SYNC 失效
+ * 设备中的旧副本再发布任务。本文件只描述 ioctl 参数，不含设备寄存器。
  */
 #ifndef GPGPU_DRM_H
 #define GPGPU_DRM_H
@@ -32,8 +33,17 @@ typedef uint64_t gpgpu_u64;
 #define GPGPU_MEMORY_HOST 1U
 /* 内存种类：gpu_buddy 管理的设备 VRAM。 */
 #define GPGPU_MEMORY_VRAM 2U
-/* BO_CREATE 标志：对象是会话的通知页，须为一页 Host 对象。 */
+/* BO_CREATE 标志：对象是会话的通知页，须为一页 Host 对象，总不可缓存。 */
 #define GPGPU_BO_EVENT_PAGE (1U << 0)
+/*
+ * BO_CREATE 标志：设备访问对象时绕过 dcache，供 Ring、进度、Signal 等与
+ * CPU 持续共享的对象使用；创建后不能改变。
+ */
+#define GPGPU_BO_UNCACHED (1U << 1)
+/* CACHE_SYNC：回写范围内的 dcache 脏行，GPU 写出的数据随后对 CPU 可见。 */
+#define GPGPU_CACHE_CLEAN (1U << 0)
+/* CACHE_SYNC：失效范围内的行，CPU 写入随后对设备可见；遇脏行失败。 */
+#define GPGPU_CACHE_INVALIDATE (1U << 1)
 /* 通知页字节数；每个事件占其中一个 8 字节通知槽。 */
 #define GPGPU_EVENT_PAGE_SIZE 4096U
 /* 队列可提交，尚未记录故障。 */
@@ -180,8 +190,9 @@ struct gpgpu_vm_info {
  * @size: 逻辑大小，单位为字节。
  * @alignment: 存储对齐，单位为字节，必须为 2 的幂。
  * @handle: 输出的本文件 GEM handle，不暴露设备物理地址。
- * @flags: 输入 0 或 GPGPU_BO_EVENT_PAGE；带后者时驱动把对象登记为会话的
- *         通知页，每个会话只能有一个，登记后不能解绑。
+ * @flags: 输入 GPGPU_BO_EVENT_PAGE 与 GPGPU_BO_UNCACHED 的组合。带前者时
+ *         驱动把对象登记为会话的通知页，每个会话只能有一个，登记后
+ *         不能解绑；带任一位时对象不进入 dcache。
  * @mapped_size: 输出的整页映射大小，包含已清零的尾部。
  * @mmap_offset: CPU 映射偏移。Host 对象可读写映射；VRAM 对象只能以
  *               PROT_NONE 映射，用来占住与 GPUVA 相同的 CPU 地址，内容经
@@ -235,6 +246,27 @@ struct gpgpu_vm_fault {
 	gpgpu_u32 phase;
 };
 
+/**
+ * struct gpgpu_cache_sync - 在 CPU 与设备之间交接一段对象数据
+ * @version: 输入接口版本 GPGPU_DRM_VERSION。
+ * @handle: 本文件的 GEM handle。
+ * @offset: 对象内的字节偏移。
+ * @size: 字节数，非零，范围不超过对象请求的长度。
+ * @op: GPGPU_CACHE_CLEAN、GPGPU_CACHE_INVALIDATE 或两者之和。
+ * @reserved: 保留，输入必须为零。
+ *
+ * 设备按整条缓存行处理，对象存储按页对齐，不会触及其他对象。
+ * 不可缓存对象没有缓存行，直接返回成功。
+ */
+struct gpgpu_cache_sync {
+	gpgpu_u32 version;
+	gpgpu_u32 handle;
+	gpgpu_u64 offset;
+	gpgpu_u64 size;
+	gpgpu_u32 op;
+	gpgpu_u32 reserved;
+};
+
 /*
  * 用户态库运行在只有 musl 头文件的客体中，没有 <drm/drm.h>，因此这里按
  * DRM 的约定自行展开：DRM 命令的类型码为 'd'，驱动私有命令从
@@ -255,7 +287,7 @@ struct gpgpu_gem_close {
 	gpgpu_u32 pad;
 };
 
-/* ioctl 编号：GEM_CLOSE 沿用 DRM 核心命令，其余是驱动私有命令 0x00～0x0c。 */
+/* ioctl 编号：GEM_CLOSE 沿用 DRM 核心命令，其余是驱动私有命令 0x00～0x0d。 */
 #define GPGPU_DRM_GEM_CLOSE _IOW(GPGPU_DRM_IOCTL_BASE, 0x09, struct gpgpu_gem_close)
 #define GPGPU_DRM_INFO GPGPU_DRM_IOWR(0x00, struct gpgpu_vm_info)
 #define GPGPU_DRM_BO_CREATE GPGPU_DRM_IOWR(0x01, struct gpgpu_bo_create)
@@ -270,9 +302,11 @@ struct gpgpu_gem_close {
 #define GPGPU_DRM_EVENT_WAIT GPGPU_DRM_IOWR(0x0a, struct gpgpu_event_request)
 #define GPGPU_DRM_EVENT_DESTROY GPGPU_DRM_IOWR(0x0b, struct gpgpu_event_request)
 #define GPGPU_DRM_FAULT GPGPU_DRM_IOWR(0x0c, struct gpgpu_vm_fault)
+#define GPGPU_DRM_CACHE_SYNC GPGPU_DRM_IOW(0x0d, struct gpgpu_cache_sync)
 
 /* 布局检查：内核与用户态的结构体大小或关键偏移不一致时编译失败。 */
 _Static_assert(sizeof(struct gpgpu_memory_copy) == 40, "copy ABI");
+_Static_assert(sizeof(struct gpgpu_cache_sync) == 32, "cache sync ABI");
 _Static_assert(sizeof(struct gpgpu_queue_create) == 64, "queue create ABI");
 _Static_assert(sizeof(struct gpgpu_queue_state) == 24, "queue state ABI");
 _Static_assert(sizeof(struct gpgpu_event_request) == 32, "event ABI");

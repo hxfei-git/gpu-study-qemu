@@ -17,6 +17,7 @@
 | ROCm   | Radeon Open Compute                       | AMD GPU 计算软件平台                           |
 | ROCr   | ROCm Runtime                              | AMD 的 HSA 用户态运行时                        |
 | GPUVM  | GPU Virtual Memory                        | GPU 虚拟内存管理                               |
+| dcache | Data Cache                                | 数据缓存；本实验指翻译后的设备级数据缓存       |
 | AQL    | Architected Queuing Language              | HSA 定义的队列包格式与提交协议                 |
 | ABI    | Application Binary Interface | 二进制接口 |
 | GPUVA  | GPU Virtual Address | GPU 虚拟地址 |
@@ -57,9 +58,9 @@
 
 本文集中保存本实验已经确认的架构、行为与接口约束。寄存器名称参考 AMD，实验语义以本文的 `[DESIGN]` 为准，不声明兼容 AMD 的完整硬件协议。
 
-**[DESIGN]** 当前接口为协议版本 5。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
+**[DESIGN]** 当前接口为协议版本 6。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
 
-设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 4 的差异见 [PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>)，更早的差异见 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
+设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 5 的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)，更早的差异见 [PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>) 与 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
 
 <a id="spec-overview"></a>
 
@@ -1850,6 +1851,8 @@ CP 取得并保存 Signal 的事件编号和通知槽地址后，成功路径按
 ```
 
 确认取走结果后再发布 Signal，Signal 写回成功后再写通知槽，通知槽写入成功后再提交 IH。各次 Host 访问必须确认成功，后端也须保证前一步写入已对后续观察者可见，才能继续后一步；不能把仅已排入请求队列当作写入完成。任何一步失败都转入[第 7.3 节](#spec-failure-retirement)的异常退出流程，停止正常收尾并保留已经发生的写入。
+
+**[DESIGN]** 协议版本 6 加入设备级数据缓存后，执行结果可能还在缓存的脏行中。CP 等到执行器给出终态后，先回写整个数据缓存并确认成功，再进入上面的发布顺序；执行失败时同样先回写，再记录错误。回写失败时记 `EXECUTOR` 错误，不发布成功的 Signal。Ring、进度对象和 Signal 都不可缓存，CP 读写它们时直接访问内存。缓存属性与 CPU、GPU 之间的交接顺序见 [dcache 规格第 5～7 节](<./dcache 第一版规格.md#dcache-uncached>)。
 
 包槽继续在 Signal 发布后按第 6 节归还，完整字段访问仍按[第 2.2.1 节](#spec-shared-value-integrity)执行。内存屏障只补齐顺序要求，不能替代动态字段的完整读写约定。
 

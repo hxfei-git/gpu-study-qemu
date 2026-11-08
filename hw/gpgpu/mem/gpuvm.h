@@ -4,8 +4,11 @@
  *
  * CP 用户域访问和 RV64 执行器的取指、数据访问都调用 gpgpu_user_rw()：
  *
- *   gpuvm=on   GPUVA ─TLB/四级页表─▶ GPU 物理地址 ─▶ gpgpu_phys_rw()
- *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区 ─▶ gpgpu_phys_rw()
+ *   gpuvm=on   GPUVA ─TLB/四级页表、R/W/X 权限─▶ GPU 物理地址
+ *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区
+ *
+ * 检查通过后，READ/WRITE 经 gpgpu_dcache_rw()，EXEC 直接调用
+ * gpgpu_phys_rw()。
  *
  * 两种模式下用户都不能访问 VRAM 首页和固件保留区。访问失败时按来源
  * HQD 槽记录首次故障，供 Host 经 BAR0 0xa00 读取。

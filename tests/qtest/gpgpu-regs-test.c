@@ -71,6 +71,16 @@ static void wr(RegsTest *t, uint64_t reg, uint32_t value)
 	qpci_io_writel(t->dev, t->regs, reg, value);
 }
 
+/* 以 Host 身份发出一条 dcache 命令；设备同步执行，返回 STATUS。 */
+static uint32_t dcache_cmd(RegsTest *t, uint32_t cmd, uint64_t addr, uint32_t length)
+{
+	wr(t, GPGPU_REG_DCACHE_ADDR_LO, (uint32_t)addr);
+	wr(t, GPGPU_REG_DCACHE_ADDR_HI, addr >> 32);
+	wr(t, GPGPU_REG_DCACHE_LENGTH, length);
+	wr(t, GPGPU_REG_DCACHE_CMD, cmd);
+	return rd(t, GPGPU_REG_DCACHE_STATUS);
+}
+
 /*
  * 读取并清除全部全局错误，返回清除前的值。ERROR_STATUS 写 1 清除对应位；
  * 清除后 GLOBAL_STATUS 的 ERROR 位也应随之消失，函数顺带检查这一点。
@@ -321,6 +331,45 @@ static void test_gpuvm_context(void)
 	regs_stop(&t);
 }
 
+/*
+ * test_dcache_commands() - 不可缓存区间与维护命令的接受规则
+ *
+ * 期望：行对齐的 VRAM 区间可以登记，与已登记区间重叠或未对齐的区间
+ * 返回 INVALID；撤销必须与登记的区间完全相同，撤销后同一位置可以重新
+ * 登记；维护命令至少带 CLEAN 或 INVALIDATE，带 ALL 时忽略地址与长度。
+ * 这些结果只写入 STATUS，不锁存全局错误。
+ */
+static void test_dcache_commands(void)
+{
+	const uint32_t line = GPGPU_DCACHE_LINE_SIZE;
+	const uint64_t base = 0x10000;
+	RegsTest t = { 0 };
+
+	regs_start(&t, true);
+
+	/* 1. 登记两行；与它重叠、或起点未对齐的区间都被拒绝。 */
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base, 2 * line), ==, GPGPU_DCACHE_OK);
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + line, line), ==,
+			 GPGPU_DCACHE_INVALID);
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + 4 * line + 4, line), ==,
+			 GPGPU_DCACHE_INVALID);
+
+	/* 2. 部分撤销被拒绝；按原区间撤销后，那一行可以登记。 */
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_REMOVE, base, line), ==,
+			 GPGPU_DCACHE_INVALID);
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_REMOVE, base, 2 * line), ==,
+			 GPGPU_DCACHE_OK);
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + line, line), ==,
+			 GPGPU_DCACHE_OK);
+
+	/* 3. 只有 ALL 的命令没有操作；带 ALL 的回写不看范围。 */
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_ALL, 0, 0), ==, GPGPU_DCACHE_INVALID);
+	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_ALL, 0, 0), ==,
+			 GPGPU_DCACHE_OK);
+	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
+	regs_stop(&t);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -330,5 +379,6 @@ int main(int argc, char **argv)
 	qtest_add_func("/gpgpu/regs/vram", test_vram);
 	qtest_add_func("/gpgpu/regs/dma-unrouted", test_dma_unrouted);
 	qtest_add_func("/gpgpu/regs/gpuvm-context", test_gpuvm_context);
+	qtest_add_func("/gpgpu/regs/dcache-commands", test_dcache_commands);
 	return g_test_run();
 }
