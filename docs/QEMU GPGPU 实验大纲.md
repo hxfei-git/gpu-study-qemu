@@ -44,6 +44,7 @@
 | TTM    | Translation Table Maps                                 | Linux 图形内存管理框架；用于对象存储位置管理     |
 | MMU    | Memory Management Unit                                 | 内存管理单元                                     |
 | VMID   | Virtual Memory Identifier                              | 设备虚拟地址空间标识                             |
+| PASID  | Process Address Space Identifier                       | 进程地址空间标识                                 |
 | TLB    | Translation Lookaside Buffer                           | 地址翻译缓存                                     |
 | VPN    | Virtual Page Number                                    | 虚拟页号，即 GPUVA 除以 4 KiB                    |
 | ReLU   | Rectified Linear Unit                                  | 修正线性单元；本实验的计算示例之一               |
@@ -197,6 +198,24 @@ Queue 存活期间可以绑定和解绑对象，Ring、进度对象和通知页�
 第三阶段早期实现的固定提交、验收归档和日志见[历史验收记录](<../software/gpgpu/README.md#stage-three-validation>)。其中的旧控制页、参数窗口、同步模式及专项回归不再列入当前执行要求。
 
 **[BOUNDARY]** 固定存储与 AQL 提交继续用于项目讲解。TTM、迁移、驱逐、换页、按需补页和异步页表更新留在后续；强制中止及运行中复位恢复归[第四阶段](#24-第四阶段完善异常处理与资源释放)。教学设备不作为 MI300X 硬件结论。
+
+<a id="pasid-scope"></a>
+
+**[BOUNDARY]** 第三阶段不增加 PASID（原评审 A1），也不将其作为第四阶段的必做前置任务。[现行 VMID 驻留绑定与 MQD 通知路由](<./GPUVM 第一版规格.md#gpuvm-context-tlb>)已能支持当前队列管理、通知归属和正常回收，本期不增加独立地址空间编号及相应的协议字段。
+
+需要跨队列或跨驻留时段关联同一 VM 的诊断记录时，再评估是否引入稳定标识；当前不预先固定编号位宽、协议字段或实施阶段。
+
+<a id="tlb-cache-scope"></a>
+
+**[BOUNDARY]** TLB 分层与目录缓存（原评审 A3）不纳入第三阶段，也不作为第四阶段的必做前置任务。本期保持[单级共享 TLB](<./GPUVM 第一版规格.md#gpuvm-tlb-lru>)，不增加客户端私有 TLB 或目录缓存，不为此扩展统计或协议。
+
+后续若要研究客户端局部性、减少页表遍历开销或演示多级失效，再分别评估 TLB 分层与目录缓存；当前不固定缓存容量、接口或实施阶段。
+
+<a id="event-reuse-scope"></a>
+
+**[BOUNDARY]** 可复用事件不纳入第三阶段，也不作为第四阶段的必做前置任务。本期保持[一次性事件的等待与回收规则](<./CP_MEC 第一版规格.md#spec-hsakmt-event>)，不增加自动复位或通知代次接口。
+
+后续若高频派发中事件创建、销毁的开销成为实际问题，再评估事件复用；届时一起确定通知代次、多个等待者与迟到通知的处理，当前不预先固定接口或实施阶段。
 
 ### 2.4 第四阶段：完善异常处理与资源释放
 
