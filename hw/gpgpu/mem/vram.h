@@ -6,8 +6,9 @@
  * 访存；设备内部（GPU 物理访问、DMA、IH）经本模块的 AddressSpace。设备内部
  * 写入必须走 AddressSpace，原生 CP 已翻译的代码才会随之失效。
  *
- * 本模块是后备存储，不经过 dcache。BAR2 在读写前维护重叠的 dcache 行；
- * 其他直接读写本模块的一方自行维护，见 mem/dcache.h。
+ * 本模块是后备存储，不经过 dcache。BAR2 把每次访问交给访存入口，按 DEVICE
+ * 处理重叠的缓存行；直接读写后备 RAM 的函数只对 mem/ 可见，声明在
+ * mem/backend.h。
  */
 #ifndef HW_GPGPU_MEM_VRAM_H
 #define HW_GPGPU_MEM_VRAM_H
@@ -20,13 +21,11 @@
  * @ram: 后备 RAM，也供板级代码建立 CP 别名。
  * @bar: BAR2 的 MMIO 窗口，带越界检查。
  * @as: 设备内部访问使用的地址空间。
- * @ptr: 后备 RAM 的宿主机指针，只在 vram.c 内使用。
  */
 typedef struct GPGPUVRAMState {
 	MemoryRegion ram;
 	MemoryRegion bar;
 	AddressSpace as;
-	uint8_t *ptr;
 } GPGPUVRAMState;
 
 /**
@@ -59,41 +58,5 @@ uint64_t gpgpu_vram_size(GPGPUState *s);
  * Return: 范围完整位于 VRAM 内时为 true；size 为 0 时只检查起点。
  */
 bool gpgpu_vram_contains(GPGPUState *s, uint64_t addr, uint64_t size);
-
-/**
- * gpgpu_vram_rw() - 经内部地址空间读写 VRAM
- * @s: 设备实例。
- * @addr: VRAM 字节偏移，调用者已检查范围。
- * @buf: 数据缓冲区。
- * @len: 字节数。
- * @is_write: 为 true 时写入 VRAM。
- *
- * Return: 访问结果。
- */
-MemTxResult gpgpu_vram_rw(GPGPUState *s, uint64_t addr, void *buf, uint64_t len, bool is_write);
-
-/**
- * gpgpu_vram_map() - 把一段 VRAM 映射为可直接读写的宿主机指针
- * @s: 设备实例。
- * @addr: VRAM 字节偏移，调用者已检查范围。
- * @len: 字节数。
- * @is_write: 映射期间是否写入。
- *
- * VRAM 是连续 RAM，已检查的范围总能完整映射。DMA 用它直接在 VRAM 与 Host
- * 之间搬运，失败时已写入的部分保留。
- *
- * Return: 映射起点，必须用 gpgpu_vram_unmap() 归还。
- */
-void *gpgpu_vram_map(GPGPUState *s, uint64_t addr, uint64_t len, bool is_write);
-
-/**
- * gpgpu_vram_unmap() - 归还 gpgpu_vram_map() 的映射
- * @s: 设备实例。
- * @ptr: 映射起点。
- * @len: 映射字节数。
- * @is_write: 与映射时相同；为 true 时整个范围按已写入处理，
- *            使 CP 代码缓存失效。
- */
-void gpgpu_vram_unmap(GPGPUState *s, void *ptr, uint64_t len, bool is_write);
 
 #endif /* HW_GPGPU_MEM_VRAM_H */

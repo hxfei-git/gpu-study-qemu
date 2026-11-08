@@ -332,37 +332,18 @@ static void test_gpuvm_context(void)
 }
 
 /*
- * test_dcache_commands() - 不可缓存区间与维护命令的接受规则
+ * test_dcache_commands() - 维护命令的接受规则
  *
- * 期望：行对齐的 VRAM 区间可以登记，与已登记区间重叠或未对齐的区间
- * 返回 INVALID；撤销必须与登记的区间完全相同，撤销后同一位置可以重新
- * 登记；维护命令至少带 CLEAN 或 INVALIDATE，带 ALL 时忽略地址与长度。
- * 这些结果只写入 STATUS，不锁存全局错误。
+ * 期望：维护命令至少带 CLEAN 或 INVALIDATE，带 ALL 时忽略地址与长度。
+ * 结果只写入 STATUS，不锁存全局错误。
  */
 static void test_dcache_commands(void)
 {
-	const uint32_t line = GPGPU_DCACHE_LINE_SIZE;
-	const uint64_t base = 0x10000;
 	RegsTest t = { 0 };
 
 	regs_start(&t, true);
 
-	/* 1. 登记两行；与它重叠、或起点未对齐的区间都被拒绝。 */
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base, 2 * line), ==, GPGPU_DCACHE_OK);
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + line, line), ==,
-			 GPGPU_DCACHE_INVALID);
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + 4 * line + 4, line), ==,
-			 GPGPU_DCACHE_INVALID);
-
-	/* 2. 部分撤销被拒绝；按原区间撤销后，那一行可以登记。 */
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_REMOVE, base, line), ==,
-			 GPGPU_DCACHE_INVALID);
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_REMOVE, base, 2 * line), ==,
-			 GPGPU_DCACHE_OK);
-	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_UC_ADD, base + line, line), ==,
-			 GPGPU_DCACHE_OK);
-
-	/* 3. 只有 ALL 的命令没有操作；带 ALL 的回写不看范围。 */
+	/* 只有 ALL 的命令没有操作；带 ALL 的回写不看范围。 */
 	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_ALL, 0, 0), ==, GPGPU_DCACHE_INVALID);
 	g_assert_cmpuint(dcache_cmd(&t, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_ALL, 0, 0), ==,
 			 GPGPU_DCACHE_OK);

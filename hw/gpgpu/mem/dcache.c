@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * dcache：组相联查找、写回与写分配、维护命令与不可缓存区间
+ * dcache：组相联查找、写回与写分配、维护命令
  */
 #include "qemu/osdep.h"
 #include "hw/gpgpu/gpgpu_state.h"
+#include "access.h"
+#include "backend.h"
 #include "dcache.h"
-#include "phys.h"
-#include "vram.h"
 
 /* 行内偏移位数，即 log2(行大小)。 */
 #define DCACHE_OFFSET_BITS __builtin_ctz(GPGPU_DCACHE_LINE_SIZE)
@@ -70,18 +70,6 @@ static void dcache_touch(uint8_t *order, unsigned int way)
 		pos++;
 	memmove(&order[1], &order[0], pos);
 	order[0] = way;
-}
-
-/* 行起点不在不可缓存区间内时可以缓存；区间按行对齐，整行同属性。 */
-static bool dcache_cacheable_ok(const GPGPUDcacheState *c, uint64_t line)
-{
-	for (unsigned int i = 0; i < GPGPU_DCACHE_UC_RANGES; i++) {
-		const GPGPUDcacheRange *r = &c->uncached[i];
-
-		if (r->size && line - r->base < r->size)
-			return false;
-	}
-	return true;
 }
 
 /* 回写一条有效的脏行；成功后清除 DIRTY 并计数，失败时该行保持不变。 */
@@ -151,17 +139,14 @@ static int dcache_fill(GPGPUState *s, unsigned int set, uint64_t line)
 /*
  * dcache_line_rw() - 在一条行内读写 [addr, addr + len)
  *
- * gpgpu_dcache_rw() 逐行调用，调用者保证不跨行。登记不可缓存区间时
- * 已清掉区间内的行，之后也不会为它回填，所以命中的行一定可以缓存；
- * 只在未命中时才扫描区间表，命中路径不查表：
+ * gpgpu_dcache_rw() 逐行调用，调用者保证不跨行。只有 WB 页的数据访问
+ * 进入这里，属性已由访存入口确定，本函数不再判断能否缓存：
  *
- * 1. 组内查找；未命中且行在不可缓存区间内时，直接读写后备存储，
- *    不分配行，也不计命中与未命中；
- * 2. 命中计一次 HITS；可缓存的行未命中时计一次 MISSES 并回填，回填失败
- *    返回错误；
+ * 1. 组内查找；命中计一次 HITS；
+ * 2. 未命中计一次 MISSES 并回填，回填失败返回错误；
  * 3. 读写数据，写入置 DIRTY，最后把这一路置为 MRU。
  *
- * Return: MEMTX_OK，或不可缓存访问、回填失败时的错误。
+ * Return: MEMTX_OK，或回填失败时的错误。
  */
 static MemTxResult dcache_line_rw(GPGPUState *s, uint64_t addr, uint8_t *buf, size_t len,
 				  bool is_write)
@@ -171,14 +156,11 @@ static MemTxResult dcache_line_rw(GPGPUState *s, uint64_t addr, uint8_t *buf, si
 	unsigned int offset = addr & (GPGPU_DCACHE_LINE_SIZE - 1);
 	int way = dcache_lookup(c, set, dcache_tag_of(addr));
 
-	/* 1. 只有未命中才查区间表；不可缓存的行每次都访问后备存储。 */
-	if (way < 0 && !dcache_cacheable_ok(c, addr - offset))
-		return gpgpu_phys_rw(s, addr, buf, len, is_write);
-
-	/* 2. 命中直接使用，可缓存的行未命中时回填。 */
+	/* 1. 命中直接使用。 */
 	if (way >= 0) {
 		c->hits++;
 	} else {
+		/* 2. 未命中时回填整行。 */
 		c->misses++;
 		way = dcache_fill(s, set, addr - offset);
 		if (way < 0)
@@ -199,10 +181,6 @@ static MemTxResult dcache_line_rw(GPGPUState *s, uint64_t addr, uint8_t *buf, si
 MemTxResult gpgpu_dcache_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, bool is_write)
 {
 	uint8_t *p = buf;
-
-	/* 范围不可路由时直接失败，不计命中与未命中。 */
-	if (!gpgpu_phys_contains(s, addr, len))
-		return MEMTX_ERROR;
 
 	while (len) {
 		uint64_t line = addr & ~(uint64_t)(GPGPU_DCACHE_LINE_SIZE - 1);
@@ -240,9 +218,9 @@ static uint32_t dcache_maintain_way(GPGPUState *s, unsigned int set, unsigned in
 }
 
 /*
- * dcache_maintain() - 按范围或全部行执行回写与失效
+ * gpgpu_dcache_maintain() - 按范围或全部行执行回写与失效
  *
- * gpgpu_dcache_maintain()、区间登记和维护命令共用。BAR 的单次写入只
+ * DEVICE 访问之前的处理和 gpgpu_mem_sync() 共用。BAR 的单次写入只
  * 涉及一两行，DMA 和复位可能覆盖整份缓存，所以按范围大小选择查找
  * 方式。范围用行号表示：行号 = 物理地址 >> 6。
  *
@@ -252,164 +230,64 @@ static uint32_t dcache_maintain_way(GPGPUState *s, unsigned int set, unsigned in
  * 1. 带 ALL，或范围覆盖的行数不少于缓存行总数时，逐路扫描整份缓存
  *    一遍，只处理行号落在范围内的有效行；
  * 2. 否则逐个行号计算组号与 Tag，只查可能缓存这一行的那一组；
- * 3. 任一行失败即停止，返回原因；回写失败另锁存 DCACHE_FAULT。
+ * 3. 任一行失败即停止，经 @status 给出原因；回写失败另锁存 DCACHE_FAULT。
  *
- * Return: GPGPU_DCACHE_OK、GPGPU_DCACHE_DIRTY 或 GPGPU_DCACHE_STORAGE。
+ * Return: 全部行维护完成时为 true。
  */
-static uint32_t dcache_maintain(GPGPUState *s, uint64_t addr, uint64_t len, uint32_t op)
+bool gpgpu_dcache_maintain(GPGPUState *s, uint64_t addr, uint64_t len, uint32_t op,
+			   uint32_t *status)
 {
 	GPGPUDcacheState *c = &s->dcache;
 	bool all = op & GPGPU_DCACHE_ALL;
 	uint64_t first = all ? 0 : addr >> DCACHE_OFFSET_BITS;
 	uint64_t last = all ? 0 : (addr + len - 1) >> DCACHE_OFFSET_BITS;
-	uint32_t status = GPGPU_DCACHE_OK;
+	uint32_t result = GPGPU_DCACHE_OK;
 
 	/* 1. 整份扫描：每路按自己的 Tag 与组号判断是否在范围内。 */
 	if (all || last - first + 1 >= DCACHE_LINES) {
-		for (unsigned int set = 0; set < GPGPU_DCACHE_SETS && !status; set++) {
-			for (unsigned int way = 0; way < GPGPU_DCACHE_WAYS && !status; way++) {
+		for (unsigned int set = 0; set < GPGPU_DCACHE_SETS && !result; set++) {
+			for (unsigned int way = 0; way < GPGPU_DCACHE_WAYS && !result; way++) {
 				uint64_t index = dcache_line_addr(c->meta[set][way], set) >>
 						 DCACHE_OFFSET_BITS;
 
 				if (all || (index >= first && index <= last))
-					status = dcache_maintain_way(s, set, way, op);
+					result = dcache_maintain_way(s, set, way, op);
 			}
 		}
 	} else {
 		/* 2. 小范围：逐行定位到唯一可能的组与路。 */
-		for (uint64_t index = first; index <= last && !status; index++) {
+		for (uint64_t index = first; index <= last && !result; index++) {
 			uint64_t line = index << DCACHE_OFFSET_BITS;
 			unsigned int set = dcache_set_of(line);
 			int way = dcache_lookup(c, set, dcache_tag_of(line));
 
 			if (way >= 0)
-				status = dcache_maintain_way(s, set, way, op);
+				result = dcache_maintain_way(s, set, way, op);
 		}
 	}
 
 	/* 3. 脏数据仍留在缓存中，只有回写失败才算存储故障。 */
-	if (status == GPGPU_DCACHE_STORAGE)
+	if (result == GPGPU_DCACHE_STORAGE)
 		gpgpu_set_error(s, GPGPU_ERR_DCACHE_FAULT);
-	return status;
-}
-
-bool gpgpu_dcache_maintain(GPGPUState *s, uint64_t addr, uint64_t len, uint32_t op)
-{
-	return dcache_maintain(s, addr, len, op) == GPGPU_DCACHE_OK;
-}
-
-/* 区间完整位于 VRAM 或 Outbound 窗口的固定布局内；不要求窗口已经打开。 */
-static bool dcache_range_valid(GPGPUState *s, uint64_t base, uint64_t size)
-{
-	if (gpgpu_vram_contains(s, base, size))
-		return true;
-	return base >= GPGPU_OUTBOUND_BASE &&
-		gpgpu_range_ok(base - GPGPU_OUTBOUND_BASE, size, GPGPU_OUTBOUND_SIZE);
-}
-
-/*
- * dcache_uc_add() - 登记一个不可缓存区间
- *
- * 驱动在发布 Ring、进度、Signal 等控制对象前登记。登记后这段物理地址
- * 的数据访问都直接读写后备存储，任何用户地址别名都不会再产生缓存
- * 副本：
- *
- * 1. 起点与长度按行对齐、长度非零、位于 VRAM 或 Outbound 布局内，且与
- *    已登记的区间不重叠，否则返回 INVALID；
- * 2. 找一个空表项，表满返回 FULL；
- * 3. 回写并失效区间内已经缓存的行；回写失败不登记，返回 STORAGE；
- * 4. 写入表项。
- *
- * Return: GpgpuDcacheStatus。
- */
-static uint32_t dcache_uc_add(GPGPUState *s, uint64_t base, uint64_t size)
-{
-	GPGPUDcacheState *c = &s->dcache;
-	GPGPUDcacheRange *slot = NULL;
-	uint32_t status;
-
-	/* 1. 对齐、范围与重叠。 */
-	if (!size || ((base | size) & (GPGPU_DCACHE_LINE_SIZE - 1)) ||
-	    !dcache_range_valid(s, base, size))
-		return GPGPU_DCACHE_INVALID;
-	for (unsigned int i = 0; i < GPGPU_DCACHE_UC_RANGES; i++) {
-		GPGPUDcacheRange *r = &c->uncached[i];
-
-		if (!r->size) {
-			slot = slot ? slot : r;
-			continue;
-		}
-		if (base < r->base + r->size && r->base < base + size)
-			return GPGPU_DCACHE_INVALID;
-	}
-
-	/* 2. 表满时不做任何维护。 */
-	if (!slot)
-		return GPGPU_DCACHE_FULL;
-
-	/* 3. 清掉区间内已有的缓存行。 */
-	status = dcache_maintain(s, base, size, DCACHE_OPS);
 	if (status)
-		return status;
-
-	/* 4. 登记。 */
-	*slot = (GPGPUDcacheRange) {
-		.base = base,
-		.size = size,
-	};
-	return GPGPU_DCACHE_OK;
-}
-
-/* 撤销与 [base, base + size) 完全相同的区间；其中没有缓存行，无需维护。 */
-static uint32_t dcache_uc_remove(GPGPUState *s, uint64_t base, uint64_t size)
-{
-	for (unsigned int i = 0; i < GPGPU_DCACHE_UC_RANGES; i++) {
-		GPGPUDcacheRange *r = &s->dcache.uncached[i];
-
-		if (r->size && r->base == base && r->size == size) {
-			memset(r, 0, sizeof(*r));
-			return GPGPU_DCACHE_OK;
-		}
-	}
-	return GPGPU_DCACHE_INVALID;
+		*status = result;
+	return result == GPGPU_DCACHE_OK;
 }
 
 /*
- * dcache_command() - 执行一方写入 CMD 的命令，结果写回该方的 STATUS
- *
- * host 为 false 时命令来自 CP，只接受维护操作：
- *
- * 1. 仍有在途物理访问时整体拒绝，返回 BUSY；
- * 2. UC_ADD、UC_REMOVE 只接受 Host，且不能与其他位同时出现；
- * 3. 维护操作至少带 CLEAN 或 INVALIDATE，只能另加 ALL；不带 ALL 时范围
- *    非空且低于 4 GiB。
+ * 执行一方写入 CMD 的维护命令，结果写回该方的 STATUS。命令至少带 CLEAN
+ * 或 INVALIDATE，只能另加 ALL；不带 ALL 时范围非空且低于 4 GiB。编码
+ * 合法后交给 gpgpu_mem_sync()，仍有在途物理访问时结果为 BUSY。
  */
-static void dcache_command(GPGPUState *s, GPGPUDcacheRequest *req, uint32_t cmd, bool host)
+static void dcache_command(GPGPUState *s, GPGPUDcacheRequest *req, uint32_t cmd)
 {
-	/* 1. 防御检查：在途访问期间不改动缓存。 */
-	if (gpgpu_phys_busy(s)) {
-		req->status = GPGPU_DCACHE_BUSY;
-		return;
-	}
-
-	/* 2. 区间登记与撤销。 */
-	if (host && cmd == GPGPU_DCACHE_UC_ADD) {
-		req->status = dcache_uc_add(s, req->addr, req->length);
-		return;
-	}
-	if (host && cmd == GPGPU_DCACHE_UC_REMOVE) {
-		req->status = dcache_uc_remove(s, req->addr, req->length);
-		return;
-	}
-
-	/* 3. 维护操作。 */
 	if (!(cmd & DCACHE_OPS) || (cmd & ~(DCACHE_OPS | GPGPU_DCACHE_ALL)) ||
 	    (!(cmd & GPGPU_DCACHE_ALL) &&
 	     (!req->length || !gpgpu_range_ok(req->addr, req->length, GPGPU_PHYS_ADDRESS_LIMIT)))) {
 		req->status = GPGPU_DCACHE_INVALID;
 		return;
 	}
-	req->status = dcache_maintain(s, req->addr, req->length, cmd);
+	gpgpu_mem_sync(s, req->addr, req->length, cmd, &req->status);
 }
 
 /* 两方共用的读取：统计全设备共享，ADDR、LENGTH、STATUS 取 req 的值。 */
@@ -438,8 +316,7 @@ static uint32_t dcache_reg_read(const GPGPUDcacheState *c, const GPGPUDcacheRequ
 }
 
 /* 两方共用的写入：写只读寄存器或未定义偏移时锁存 INVALID_CMD。 */
-static void dcache_reg_write(GPGPUState *s, GPGPUDcacheRequest *req, hwaddr reg, uint32_t value,
-			     bool host)
+static void dcache_reg_write(GPGPUState *s, GPGPUDcacheRequest *req, hwaddr reg, uint32_t value)
 {
 	switch (reg) {
 	case GPGPU_REG_DCACHE_ADDR_LO:
@@ -450,7 +327,7 @@ static void dcache_reg_write(GPGPUState *s, GPGPUDcacheRequest *req, hwaddr reg,
 		req->length = value;
 		break;
 	case GPGPU_REG_DCACHE_CMD:
-		dcache_command(s, req, value, host);
+		dcache_command(s, req, value);
 		break;
 	default:
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
@@ -465,7 +342,7 @@ uint32_t gpgpu_dcache_read(GPGPUState *s, hwaddr reg)
 
 void gpgpu_dcache_write(GPGPUState *s, hwaddr reg, uint32_t value)
 {
-	dcache_reg_write(s, &s->dcache.host, reg, value, true);
+	dcache_reg_write(s, &s->dcache.host, reg, value);
 }
 
 uint32_t gpgpu_dcache_cp_read(GPGPUState *s, hwaddr reg)
@@ -475,7 +352,7 @@ uint32_t gpgpu_dcache_cp_read(GPGPUState *s, hwaddr reg)
 
 void gpgpu_dcache_cp_write(GPGPUState *s, hwaddr reg, uint32_t value)
 {
-	dcache_reg_write(s, &s->dcache.cp, reg, value, false);
+	dcache_reg_write(s, &s->dcache.cp, reg, value);
 }
 
 void gpgpu_dcache_reset(GPGPUState *s)

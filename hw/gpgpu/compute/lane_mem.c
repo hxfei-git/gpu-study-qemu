@@ -31,8 +31,8 @@ bool gpgpu_lane_fetch(GPGPUExecContext *ctx, uint64_t pc, uint32_t *insn)
 	}
 
 	/* 翻译或读取失败时故障已由 gpgpu_user_rw() 记录，同样报 CODE_RANGE。 */
-	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, pc, buf, sizeof(buf),
-			   GPGPU_VM_EXEC, GPGPU_VM_PHASE_FETCH))
+	if (!gpgpu_user_rw(ctx->device, GPGPU_MEM_EXECUTOR, p->vmid, p->source_slot, pc, buf,
+			   sizeof(buf), GPGPU_VM_EXEC, GPGPU_VM_PHASE_FETCH))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_CODE_RANGE);
 	*insn = ldl_le_p(buf);
 	return true;
@@ -43,8 +43,8 @@ bool gpgpu_lane_load(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, ui
 	const GPGPUKernelParams *p = &ctx->params;
 	uint8_t buf[8];
 
-	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, size, GPGPU_VM_READ,
-			   GPGPU_VM_PHASE_DATA))
+	if (!gpgpu_user_rw(ctx->device, GPGPU_MEM_EXECUTOR, p->vmid, p->source_slot, addr, buf,
+			   size, GPGPU_VM_READ, GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);
 	*value = size == 8 ? ldq_le_p(buf) : ldl_le_p(buf);
 	return true;
@@ -59,8 +59,8 @@ bool gpgpu_lane_store(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, u
 		stq_le_p(buf, value);
 	else
 		stl_le_p(buf, value);
-	if (!gpgpu_user_rw(ctx->device, p->vmid, p->source_slot, addr, buf, size, GPGPU_VM_WRITE,
-			   GPGPU_VM_PHASE_DATA))
+	if (!gpgpu_user_rw(ctx->device, GPGPU_MEM_EXECUTOR, p->vmid, p->source_slot, addr, buf,
+			   size, GPGPU_VM_WRITE, GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);
 	return true;
 }

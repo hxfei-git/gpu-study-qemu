@@ -24,7 +24,7 @@ int gpgpu_vram_init(struct gpgpu_device *dev)
 				      &dev->reserved_blocks, GPU_BUDDY_RANGE_ALLOCATION);
 }
 
-/* 所有用户块与页表页都已归还后调用。 */
+/* 所有用户块与页表页都已归还后调用；保留块随首页一起归还。 */
 void gpgpu_vram_fini(struct gpgpu_device *dev)
 {
 	if (!dev->buddy_ready)
@@ -67,7 +67,21 @@ int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *block
 	return 0;
 }
 
+/*
+ * 归还 blocks 中的全部块，之后 blocks 为空。任一块不能确认 dcache 已处置
+ * 时整组转入 dev->reserved_blocks，不再分给新对象，设备释放时归还。
+ * 调用者持 dev->lock，或设备已不再被并发使用。
+ */
 void gpgpu_vram_free(struct gpgpu_device *dev, struct list_head *blocks)
 {
+	struct gpu_buddy_block *block;
+
+	list_for_each_entry(block, blocks, link) {
+		if (!gpgpu_storage_release_ok(dev, gpu_buddy_block_offset(block),
+					      gpu_buddy_block_size(&dev->buddy, block))) {
+			list_splice_tail_init(blocks, &dev->reserved_blocks);
+			return;
+		}
+	}
 	gpu_buddy_free_list(&dev->buddy, blocks, 0);
 }

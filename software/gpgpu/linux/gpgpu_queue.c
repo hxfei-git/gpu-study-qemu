@@ -51,7 +51,7 @@ void gpgpu_queue_free(struct gpgpu_queue *q)
 		q->ring->users--;
 		q->progress->users--;
 	}
-	gpgpu_ctrl_buf_free(q->fpriv->dev, &q->mqd);
+	gpgpu_dma_buf_free(q->fpriv->dev, &q->mqd);
 	list_del(&q->node);
 	kfree(q);
 }
@@ -260,7 +260,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
-	ret = gpgpu_ctrl_buf_alloc(dev, &q->mqd, sizeof(GpgpuMqd), 8);
+	ret = gpgpu_dma_buf_alloc(dev, &q->mqd, sizeof(GpgpuMqd), 8);
 	if (ret) {
 		kfree(q);
 		return ret;
@@ -273,7 +273,7 @@ int gpgpu_queue_create(struct gpgpu_fpriv *fpriv, struct gpgpu_queue_create *arg
 	 */
 	ret = gpgpu_vm_attach(fpriv);
 	if (ret) {
-		gpgpu_ctrl_buf_free(dev, &q->mqd);
+		gpgpu_dma_buf_free(dev, &q->mqd);
 		kfree(q);
 		return ret;
 	}

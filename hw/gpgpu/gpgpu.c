@@ -11,6 +11,7 @@
 #include "migration/vmstate.h"
 #include "gpgpu_state.h"
 #include "bar0.h"
+#include "mem/access.h"
 
 /* vram_size 属性的下限与上限（不含），单位字节；上限即 Outbound 起点。 */
 #define VRAM_SIZE_MIN 4096
@@ -88,8 +89,8 @@ bool gpgpu_reset_registers(GPGPUState *s, bool discard)
 	gpgpu_dispatch_reset(s);
 
 	/* 3. 发起方已停，把缓存数据写回后备存储；冷复位失败也继续。 */
-	if (!gpgpu_dcache_maintain(s, 0, 0, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE |
-						GPGPU_DCACHE_ALL) && !discard)
+	if (!gpgpu_mem_sync(s, 0, 0, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE |
+					   GPGPU_DCACHE_ALL, NULL) && !discard)
 		return false;
 
 	/* 4. 可以安全清空发起方会访问的状态。 */
@@ -103,8 +104,7 @@ bool gpgpu_reset_registers(GPGPUState *s, bool discard)
 	s->error_status = 0;
 	gpgpu_irq_reset(s);
 	gpgpu_dma_reset(s);
-	gpgpu_outbound_reset(s);
-	gpgpu_dcache_reset(s);
+	gpgpu_mem_reset(s);
 	return true;
 }
 
@@ -212,8 +212,7 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 	/* 4. 定时器与复位后状态，此后 Host 读到 GLOBAL_STATUS = READY。 */
 	gpgpu_dma_init(s);
 	gpgpu_dispatch_init(s);
-	gpgpu_outbound_reset(s);
-	gpgpu_dcache_reset(s);
+	gpgpu_mem_reset(s);
 	s->global_status = GPGPU_STATUS_READY;
 	return;
 

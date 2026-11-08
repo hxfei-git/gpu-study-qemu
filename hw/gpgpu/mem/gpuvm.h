@@ -4,11 +4,12 @@
  *
  * CP 用户域访问和 RV64 执行器的取指、数据访问都调用 gpgpu_user_rw()：
  *
- *   gpuvm=on   GPUVA ─TLB/四级页表、R/W/X 权限─▶ GPU 物理地址
- *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区
+ *   gpuvm=on   GPUVA ─TLB/四级页表、R/W/X 权限─▶ GPU 物理地址 + 页属性
+ *   gpuvm=off  用户地址就是 GPU 物理地址，只检查保护区，属性固定为 DEVICE
  *
- * 检查通过后，READ/WRITE 经 gpgpu_dcache_rw()，EXEC 直接调用
- * gpgpu_phys_rw()。
+ * 检查通过后逐页生成物理请求交给 gpgpu_mem_access()：叶子项带
+ * GPGPU_VM_UNCACHED 的页按 DEVICE，其余页按 WB。本模块只解析和传递
+ * 属性，不调用 dcache，也不直接读写后备存储。
  *
  * 两种模式下用户都不能访问 VRAM 首页和固件保留区。访问失败时按来源
  * HQD 槽记录首次故障，供 Host 经 BAR0 0xa00 读取。
@@ -17,6 +18,7 @@
 #define HW_GPGPU_MEM_GPUVM_H
 
 #include "hw/gpgpu/gpgpu.h"
+#include "hw/gpgpu/mem/access.h"
 #include "exec/hwaddr.h"
 
 /**
@@ -37,6 +39,7 @@ typedef struct GPGPUVMContext {
  * @vpn: GPU 虚拟页号，即 GPUVA / GPGPU_VM_PAGE_SIZE，有效 36 位。
  * @vmid: 所属 VMID。
  * @perms: 叶子项的 R/W/X 位，取值为 GPGPU_VM_PERMS 的子集。
+ * @uncached: 叶子项带 GPGPU_VM_UNCACHED，这一页的数据访问按 DEVICE 处理。
  * @valid: 本项有效。
  */
 typedef struct GPGPUVMTlbEntry {
@@ -44,6 +47,7 @@ typedef struct GPGPUVMTlbEntry {
 	uint64_t vpn;
 	uint32_t vmid;
 	uint32_t perms;
+	bool uncached;
 	bool valid;
 } GPGPUVMTlbEntry;
 
@@ -102,6 +106,7 @@ typedef struct GPGPUVMState {
 /**
  * gpgpu_user_rw() - 以用户身份访问一段地址
  * @s: 设备实例，调用者持有主锁。
+ * @client: GPGPU_MEM_CP_USER 或 GPGPU_MEM_EXECUTOR。
  * @vmid: 用户 VMID。
  * @slot: 故障归属的 HQD 槽。
  * @addr: 用户地址（GPUVA 或 GPU 物理地址）。
@@ -110,12 +115,13 @@ typedef struct GPGPUVMState {
  * @access: GPGPU_VM_READ、GPGPU_VM_WRITE 或 GPGPU_VM_EXEC。
  * @phase: 记录到故障中的访问阶段。
  *
- * 标量一次完成；更长的块逐页翻译，失败时保留已完成的部分。
+ * 标量一次完成；更长的块逐页翻译，每页使用自己的缓存属性，
+ * 失败时保留已完成的部分。
  *
  * Return: 成功为 true；失败时记录 slot 的首次故障并返回 false。
  */
-bool gpgpu_user_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addr, void *buf,
-		   size_t len, uint32_t access, uint32_t phase);
+bool gpgpu_user_rw(GPGPUState *s, enum GPGPUMemClient client, uint32_t vmid, uint32_t slot,
+		   uint64_t addr, void *buf, size_t len, uint32_t access, uint32_t phase);
 
 /**
  * gpgpu_vm_record_fault() - 为 slot 记录首次用户访问故障

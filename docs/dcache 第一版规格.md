@@ -24,6 +24,7 @@
 | DRM | Direct Rendering Manager | Linux 图形设备框架 |
 | KMT | Kernel Mode Thunk | 本仓库 `lib/kmt/` 薄层的简称 |
 | LRU / MRU | Least Recently Used / Most Recently Used | 最久未用／最近使用 |
+| WB | Write-Back | 写回；本文指页属性允许进入 dcache 的访问类型 |
 | MMIO | Memory-Mapped I/O | 内存映射输入输出 |
 | TCG | Tiny Code Generator | QEMU 动态翻译后端 |
 | AMDGPU | AMD GPU Linux Kernel Driver | AMD GPU Linux 内核驱动 |
@@ -51,55 +52,64 @@ dcache 加在 GPUVM 翻译之后。CP 与执行器访问同一 GPU 物理行时�
   → CP 读描述对象：经 dcache，未命中时回填
   → 执行器读 X、Y 和参数，写 Z：经 dcache，Z 留在脏行中
   → 执行器结束 → CP 回写整个 dcache → 写 Signal、通知槽，提交 IH
-  → 应用看到 Signal 归零，下载 Z ── DMA 读 VRAM 前，设备先回写脏行
+  → 应用看到 Signal 归零，下载 Z ── DMA 读 VRAM 前，设备先回写并失效相关缓存行
 ```
 
-图中 DMA 前的维护由设备完成，任务结束时的回写由 CP 固件完成。应用只在 CPU 直接改写可缓存对象之后调用维护接口，见[第 6 节](#dcache-handoff)。
+这条路径以 GPUVM 开启为前提：哪些对象可以缓存由页表叶子项决定。关闭 GPUVM 时没有页表给出属性，所有数据访问都直接读写内存，见[第 2 节](#dcache-paths)。图中 DMA 前的维护由设备完成，任务结束时的回写由 CP 固件完成。应用只在 CPU 直接改写可缓存对象之后调用维护接口，见[第 6 节](#dcache-handoff)。
 
 ### 1.2 本版包含与不包含的内容
 
-**[DESIGN]** 本版提供一份设备级共享数据缓存：32 KiB 数据容量、64 字节行、4 路组相联、True LRU 替换、Write-Back 加 Write-Allocate。CP 用户数据窗口和 RV64 计算执行器的 load/store 使用它，普通 VRAM 数据和普通 Host 数据都可以缓存。
+**[DESIGN]** 本版提供一份设备级共享数据缓存：32 KiB 数据容量、64 字节行、4 路组相联、True LRU 替换、Write-Back 加 Write-Allocate。CP 用户数据窗口和 RV64 计算执行器的 load/store 使用它；GPUVM 开启时，叶子项没有标为不可缓存的 VRAM 页和 Host 页都可以缓存。
 
 本版不实现指令缓存、多级缓存、预取、MSHR 和周期时序，也不实现多份私有缓存之间的一致性协议。访问仍按现有模型同步完成，执行器继续逐 warp 推进。CPU、DMA、BAR 与缓存之间的可见性由缓存属性和软件维护保证，设备不自动跟踪 CPU 写入。
 
 <a id="dcache-paths"></a>
 
-## 2. 访问路径与缓存范围
+## 2. 访问路径与缓存属性
 
-用户访问先完成地址翻译和本次权限检查，再按 GPU 物理地址选择数据缓存或取指路径：
+设备内部的 GPU 业务访存都进入同一个访存入口 `gpgpu_mem_access()`。发起方给出 GPU 物理地址、操作和访问类型（WB 或 DEVICE），入口据此决定是否经过 dcache，并在旁路访问之前处理重叠的缓存行。用户地址先由 GPUVM 换成物理地址并给出类型：
 
 ```text
 CP 用户窗口 / RV64 计算执行器
-  │ GPUVA、VMID、READ / WRITE / EXEC
+  │ 用户地址、VMID、READ / WRITE / EXEC
   ▼
-GPUVM：查 TLB，必要时遍历页表，检查 R/W/X 权限
-  │ GPU 物理地址
-  ├─ READ / WRITE → 查不可缓存区间
-  │                  ├─ 可缓存 → dcache 组相联查找
-  │                  └─ 不可缓存 → 直接读写后备存储
-  │
-  └─ EXEC → 直接读后备存储；以后接独立的 icache
+GPUVM
+  ├─ gpuvm=on：查 TLB 或遍历页表，检查 R/W/X
+  │             → GPU 物理地址 + 叶子项属性（WB 或 DEVICE）
+  └─ gpuvm=off：检查保护区与可路由范围
+                → GPU 物理地址 + DEVICE
+                                                       ┐
+CP 管理域、页表遍历、IH、BAR2、DMA                     │
+  → 已有 GPU 物理地址，类型固定为 DEVICE ──────────────┤
+                                                       ▼
+            gpgpu_mem_access()：检查来源、操作、类型与范围
+              ├─ WB 读写 ──────▶ dcache 组相联查找，未命中时回写旧行再回填
+              ├─ DEVICE 读写 ──▶ 回写并失效重叠的行，再直接读写，不分配行
+              ├─ FETCH ────────▶ 直接读后备存储；以后接独立的 icache
+              └─ COPY ─────────▶ 两端都按 DEVICE 处理，再整段搬运
                          │
-              共用原始 GPU 物理路由
+              后备存储（只对内存层可见，不再进入入口）
                 ├─ VRAM → 后备 RAM
                 └─ Outbound → Host IOVA → vfio-user DMA
 
-页表遍历、CP 管理域、DMA、IH ─▶ 直接读写后备存储
 CP 自身的指令、全局变量和栈 ─▶ 原生 RAM 别名（见第 8 节）
 ```
 
 沿图说明几条规则：
 
 - **先翻译，再查缓存。** 缓存命中不能代替本次权限检查。`gpuvm=off` 时输入已经是 GPU 物理地址，仍先检查 VRAM 首页、固件保留区和可路由范围。
+- **属性来自页表。** 只有 GPUVM 开启、叶子项没有置 `UNCACHED` 的用户数据访问是 WB；`gpuvm=off` 时用户数据访问都是 DEVICE。编码和从遍历到 TLB 的传递见 [GPUVM 规格第 3.2.1 节](<./GPUVM 第一版规格.md#gpuvm-cache-attribute>)。页表是用户数据缓存属性的唯一来源，发起方不能把 DEVICE 改成 WB。
 - **物理标签。** 标签不含 GPUVA、CP 本地窗口地址或 VMID。两个用户地址映射到同一 GPU 物理行时，读写同一份缓存数据。
 - **Host 数据。** Host 数据以 Outbound 窗口内的 GPU 物理地址作标签。Outbound 把它换算成 IOVA，系统 IOMMU 可以继续翻译；缓存行存活期间，对应 IOVA 映射必须有效。
-- **取指不进入 dcache。** 取指检查代码范围与执行权限后直接读后备存储，不分配数据行，也不改变 dcache 的替换顺序和统计。
-- **原始访问方。** 页表遍历和 CP 管理域本来使用 GPU 物理地址，不再经过 GPUVM。它们与 DMA、IH 直接读写后备存储，回填与回写也只走这条路由，不会再次进入缓存。
+- **操作与属性分开。** 取指走单独的分支：检查代码范围与执行权限后直接读后备存储，不分配数据行，也不改变 dcache 的替换顺序和统计。以后的 icache 只接在这个分支上。
+- **其他发起方使用 DEVICE。** 页表遍历、CP 管理域、IH、BAR2 和 DMA 本来使用 GPU 物理地址，不经过 GPUVM。入口按来源检查请求：只有 CP 用户窗口和执行器可以提交 WB，只有执行器可以取指，只有 DMA 可以 COPY。类型未填写的请求直接失败，不会默认进入缓存。
+- **一次事务一次计数。** 入口把整次请求计入在途物理访问，DEVICE 前的维护、WB 的回填与回写、COPY 的搬运都在计数期间完成。dcache 的回填和回写直接调用后备存储，不会再次进入入口。
 
 > **[SOURCE] 访问分流**
 >
-> - 翻译后按访问类型分流：[gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:295:1>) [第 295 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:295:1>) 的 `user_phys_rw()`，由[第 360 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:360:1>)（`gpuvm=on`）与[第 391 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:391:1>)（`gpuvm=off`）在权限检查之后调用；
-> - 数据访问入口：[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:199:1>) [第 199 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:199:1>) 的 `gpgpu_dcache_rw()`。
+> - 入口与来源约束：[access.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:110:1>) [第 110 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:110:1>) 的 `gpgpu_mem_access()`，各来源允许的操作与类型见[第 17 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:17:1>)的 `mem_clients`；后备存储接口只在 [backend.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/backend.h:1:1>) 中声明；
+> - 用户访问生成请求：[gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:308:1>) [第 308 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:308:1>) 的 `user_phys_rw()`，由[第 344 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:344:1>)（`gpuvm=on`）与[第 412 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:412:1>)（`gpuvm=off`）在权限检查之后调用；
+> - WB 数据访问：[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:181:1>) [第 181 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:181:1>) 的 `gpgpu_dcache_rw()`。
 
 <a id="dcache-geometry"></a>
 
@@ -126,7 +136,7 @@ GPU 物理地址为 32 位，按下面拆分：
 - `meta[组][路]` 每行一个 32 位值，低 19 位是 Tag，其上是 VALID 与 DIRTY，共 2 KiB；
 - `order[组][路]` 按 MRU 到 LRU 保存路号，每项 1 字节，共 512 字节。
 
-32 KiB 只指数据容量，三个数组合计 34.5 KiB，统计、命令和不可缓存区间另计。缓存属于整个设备，不随某个任务、队列或 VMID 创建和销毁。复位后各行无效，各组的 `order` 为 `{0, 1, 2, 3}`。
+32 KiB 只指数据容量，三个数组合计 34.5 KiB，统计与命令另计。缓存属于整个设备，不随某个任务、队列或 VMID 创建和销毁。复位后各行无效，各组的 `order` 为 `{0, 1, 2, 3}`。
 
 <a id="dcache-replacement"></a>
 
@@ -150,11 +160,11 @@ GPU 物理地址为 32 位，按下面拆分：
 
 请求的后续行失败时，前面已经完成的行保留，整个请求不当作原子操作。设备不会留下“新 Tag + 旧数据”的半成品行。现有自然对齐的 4、8 字节共享字段不跨行，在主锁下一次读写完成。
 
-> **[SOURCE] 查找与替换**：[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:119:1>) [第 119 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:119:1>) 的 `dcache_fill()` 实现第 4.2 节的步骤，[第 166 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:166:1>) 的 `dcache_line_rw()` 处理命中、未命中时的区间查表、写入置脏与 MRU 更新，[第 65 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:65:1>) 的 `dcache_touch()` 维护替换顺序。
+> **[SOURCE] 查找与替换**：[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:107:1>) [第 107 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:107:1>) 的 `dcache_fill()` 实现第 4.2 节的步骤，[第 151 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:151:1>) 的 `dcache_line_rw()` 处理命中、未命中回填、写入置脏与 MRU 更新，[第 65 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:65:1>) 的 `dcache_touch()` 维护替换顺序。
 
 <a id="dcache-uncached"></a>
 
-## 5. 普通数据与持续共享的控制对象
+## 5. WB、DEVICE 与持续共享的控制对象
 
 ### 5.1 控制对象不能缓存
 
@@ -170,37 +180,38 @@ CP 回收一个包：R=10    W=11  R=9
 整行回写               W=10  R=10   ← CPU 写入的 W=11 被覆盖
 ```
 
-所以这类对象整体不可缓存，CP 每次都读写内存中的字段。
+所以这类对象整体不可缓存，叶子项置 `UNCACHED`，CP 每次都读写内存中的字段。
 
-### 5.2 不可缓存区间表
+### 5.2 DEVICE 访问与已有的缓存副本
 
-**[DESIGN]** 设备保存一张不可缓存的 GPU 物理区间表，表外地址默认可以缓存。`gpuvm=on` 与 `gpuvm=off` 使用同一规则，页表项不再保存另一份缓存属性。一段物理地址的所有用户地址别名因此属性相同。
+**[DESIGN]** DEVICE 访问不分配缓存行，按请求宽度直接读写后备存储。同一段物理地址可能还留着 WB 访问的副本，例如任务刚写过的结果马上被 BAR2 读取。入口因此先回写并失效与请求范围重叠的行，再开始读写：
 
-数据访问完成翻译和权限检查后，先在组内查找，命中就直接读写缓存行；未命中时才按行起点查这张表，表内的行直接读写后备存储，表外的行回填。命中路径不查表，是因为登记区间时设备已清掉区间内的行，之后也不会为它回填，命中的行不可能落在表内。
+```text
+WB store 留在脏行
+  → DEVICE 读：先回写并失效这一行，再读到最新值
 
-区间表只接受 Host 的登记与撤销，规则如下：
+DEVICE 部分写
+  → 先回写并失效重叠的行，没有被覆盖的字节已经在内存中
+  → 只写请求的字节
+  → 之后的 WB 读重新回填，取得新内容
+```
 
-- 起点与长度按缓存行对齐，长度非零，区间完整落在 VRAM 或 Outbound 窗口的固定布局内；
-- 不能与已登记的区间重叠；撤销时必须与登记时的区间完全相同；
-- 登记前，设备先回写并失效区间内已经缓存的行，回写失败时不登记；
-- 表项数为 `GPGPU_DCACHE_UC_RANGES`，表满时登记失败。
+维护失败时不开始本次读写。维护不计命中与未命中，也不改变替换顺序；成功的回写计入回写次数。读和写使用同一条规则，入口不必区分方向；代价是旁路读也会丢掉干净行，之后的 WB 访问要重新回填。
 
-设备只保存物理范围，不保存 GEM 句柄或对象引用。整体复位清空区间表。
+**[BOUNDARY]** DEVICE 只表示“不进入 dcache、同步读写后备存储”，不改变 VRAM／Outbound 路由，也不模拟 Arm Device 内存的排序与合并规则。
 
-### 5.3 登记哪些对象
+### 5.3 哪些对象不可缓存
 
-驱动在把对象交给设备之前登记：
+- **驱动自己的控制对象**：KIQ、HIQ 的 Ring 与进度页，各队列的 MQD，管理请求结果区，IH Ring。CP 管理域和 IH 访问它们时请求固定为 DEVICE，驱动不需要为它们登记任何属性。
+- **用户的控制对象**：带 `GPGPU_BO_UNCACHED` 创建的 BO；通知页（`GPGPU_BO_EVENT_PAGE`）总是不可缓存。MAP 时驱动在这些对象的叶子项置 `UNCACHED`。`QUEUE_CREATE` 检查 Ring 与进度对象都按不可缓存创建，否则返回 `-EINVAL`。Signal 由用户库放进不可缓存对象，驱动不知道 Signal 的位置，不做检查。
+- **GPUVM 关闭时**：所有数据访问都是 DEVICE，对象标志不改变任何访问。
 
-- **驱动自己的控制对象**：KIQ、HIQ 的 Ring 与进度页，各队列的 MQD，管理请求结果区，IH Ring。CP 管理域和 IH 本来就直接读写后备存储；登记后，`gpuvm=off` 时用户域经物理地址访问它们也不会产生缓存副本。
-- **用户的控制对象**：带 `GPGPU_BO_UNCACHED` 创建的 BO。通知页（`GPGPU_BO_EVENT_PAGE`）总是不可缓存。`QUEUE_CREATE` 要求 Ring 与进度对象都不可缓存，否则返回 `-EINVAL`。Signal 由用户库放进不可缓存对象，驱动不知道 Signal 的位置，不做检查。
+对象的缓存属性在创建后不变。
 
-对象的缓存属性在创建后不变。登记失败时对象不发布；对象释放时，驱动在存储仍有效时撤销登记。
-
-> **[SOURCE] 区间表与登记**
+> **[SOURCE] 属性的落实**
 >
-> - 设备登记规则：[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:325:1>) [第 325 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:325:1>) 的 `dcache_uc_add()`；未命中时的查表见[第 76 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:76:1>)的 `dcache_cacheable_ok()`；
-> - 驱动控制对象：[gpgpu_dev.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:117:1>) [第 117 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:117:1>) 的 `gpgpu_ctrl_buf_alloc()`；
-> - 用户对象：[gpgpu_bo.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:265:1>) [第 265～278 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:265:1>)；Ring 与进度的检查见 [gpgpu_queue.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:91:1>) [第 91 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:91:1>)。
+> - DEVICE 前的维护与分派：[access.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:48:1>) [第 48 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:48:1>) 的 `mem_device_prepare()`、[第 100 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:100:1>) 的 `mem_data_rw()`；
+> - 用户对象：[gpgpu_bo.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:219:1>) [第 219 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:219:1>) 记录创建标志，[gpgpu_vm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:316:1>) [第 316 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:316:1>) 写入叶子项；Ring 与进度的检查见 [gpgpu_queue.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:91:1>) [第 91 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:91:1>)。
 
 <a id="dcache-handoff"></a>
 
@@ -222,7 +233,7 @@ CP 回收一个包：R=10    W=11  R=9
 
 Host 经 BAR0、CP 经本地寄存器窗口访问同一组寄存器。两方各有一份地址、长度和结果：Host 先写地址和长度，CP 在两次写之间插入自己的命令，也不会改掉 Host 的参数。写命令寄存器时设备同步执行，随后读到的状态就是本次结果。
 
-CP 只能发维护命令，登记和撤销区间只接受 Host。驱动的所有 Host 命令都在设备锁下串行发出。仍有在途物理访问时，设备拒绝命令并返回 BUSY；vfio-user DMA 同步等待期间不释放主锁，这项检查只作防御。
+两方的命令相同，都只有维护命令。驱动的所有 Host 命令都在设备锁下串行发出。编码合法的命令交给 `gpgpu_mem_sync()`：仍有在途物理访问时，设备拒绝命令并返回 BUSY；vfio-user DMA 同步等待期间不释放主锁，这项检查只作防御。
 
 ### 6.3 CPU 与 GPU 之间的交接
 
@@ -245,8 +256,8 @@ CP 固件的 `fence` 与用户库的 `gpgpuKmtHostFence()` 只保证访存顺序
 
 ### 6.4 驱动与用户库的接口
 
-- `BO_CREATE` 的 `GPGPU_BO_UNCACHED` 标志创建不可缓存对象；
-- `CACHE_SYNC` 按对象内的范围回写或失效。驱动把范围换算成对象的 GPU 物理地址，用户态不能维护任意物理范围。对象存储按页对齐，按整行处理不会触及其他对象。不可缓存对象直接返回成功；只失效时遇到脏行返回 `-EBUSY`；
+- `BO_CREATE` 的 `GPGPU_BO_UNCACHED` 标志创建不可缓存对象，MAP 时驱动把它写进叶子项；
+- `CACHE_SYNC` 按对象内的范围回写或失效。驱动把范围换算成对象的 GPU 物理地址，用户态不能维护任意物理范围。对象存储按页对齐，按整行处理不会触及其他对象。不可缓存对象同样按范围处理，范围内没有缓存行时直接成功；只失效时遇到脏行返回 `-EBUSY`；
 - 用户库 `gpgpuKmtAllocMemory()` 增加 `flags` 参数，`gpgpuKmtSyncMemory()` 封装 `CACHE_SYNC`；
 - 运行时把 Ring、进度页和 Signal 建为不可缓存对象。参数块和暂存区可以缓存：参数块每次派发前失效，暂存区只经 COPY 访问，由设备的 DMA 维护两端。
 
@@ -254,35 +265,38 @@ CP 固件的 `fence` 与用户库的 `gpgpuKmtHostFence()` 只保证访存顺序
 
 ## 7. 旁路访问、释放与复位
 
-直接读写后备存储的一方遵守同一条规则：读之前回写重叠的脏行，写之前回写并失效重叠的行。维护失败时不开始原始访问。
+BAR2、DMA、IH、页表遍历和 CP 管理域都向入口提交 DEVICE 请求，按第 5.2 节先回写并失效重叠的行，维护失败时不开始原始访问。各模块只做自己的格式、地址范围和错误归属检查，缓存维护由入口完成。
 
 ### 7.1 BAR2
 
-BAR2 读之前回写重叠的脏行，再读后备存储。BAR2 写之前回写并失效重叠的行，再精确写入请求的字节，同一行的其余字节保持最新值。写入仍经 VRAM 的内部地址空间，原生 CP 已翻译的代码照常失效。驱动对页表项、对象清零和固件的写入都经过这条路径，之后的页表遍历和数据访问都读到新值。
+BAR2 读写都按 DEVICE 处理：先回写并失效重叠的行，读时再读后备存储，写时精确写入请求的字节，同一行的其余字节保持最新值。写入仍经 VRAM 的内部地址空间，原生 CP 已翻译的代码照常失效。驱动对页表项、对象清零和固件的写入都经过这条路径，之后的页表遍历和数据访问都读到新值。
 
 ### 7.2 DMA
 
-DMA 两端都直接读写后备存储，两端都要维护：
+DMA 写 `DMA_CTRL` 时向入口提交一次 COPY。`dma.c` 只检查设备使能、长度和方向位指定的 VRAM 端；Host 端是否落在已使能的 Outbound 窗口，由入口检查。入口把两端都按 DEVICE 处理，两端都维护成功后，才把 VRAM 端映射成宿主机指针，与 Host 端整段互拷，避免逐行经 socket 往返。
 
-- Host 到 VRAM：Host 源回写，VRAM 目的回写并失效；
-- VRAM 到 Host：VRAM 源回写，Host 目的回写并失效。
-
-维护完成后才映射 VRAM、开始搬运；维护失败时 DMA 置 ERROR，不搬运。搬运在写寄存器的同一次调用中完成，期间不释放主锁，其他客户端不会在维护之后重新缓存这两段地址。
+维护或搬运失败时 DMA 置 ERROR，失败前已完成的维护与写入不回退。搬运在写寄存器的同一次调用中完成，期间不释放主锁，其他客户端不会在维护之后重新缓存这两段地址。
 
 ### 7.3 对象释放与存储复用
 
-驱动释放可缓存 BO 的存储前，先对整个对象回写并失效；不可缓存 BO 撤销区间登记。维护失败时，设备可能仍缓存这段物理地址，驱动把存储转入保留列表，到设备释放时才归还，不分给新对象。
+缓存行按 GPU 物理地址标记。存储交还分配器之前，驱动要先处理这段地址在 dcache 中的旧行：旧脏行之后回写会覆盖新对象的内容，旧干净行会让新对象读到旧数据。驱动在两类实际存储的释放函数里统一处理，不区分 BO、MQD 或结果区这些用途：
+
+- Host DMA 内存：`gpgpu_dma_buf_free()` 先回写并失效整段，成功后才 `dma_free_coherent()`；
+- VRAM：`gpgpu_vram_free()` 逐块推导范围并维护，全部成功才归还 buddy。
+
+维护失败，或设备已移除但还没确认停止时，存储不能归还。Host 内存的描述转入设备的 `retired` 列表，存放描述的记录在分配存储时已一并分配，释放路径上不再申请内存；VRAM 块整组转入 `reserved_blocks`。两者都到设备释放时才回收。分配时地址不合格的存储从未交给设备，直接归还，不发维护。
 
 设备移除时，驱动先停止接受请求，再整体复位设备；复位的第 3 步会回写缓存中残留的脏行。以一个已解绑但仍有脏行的 Host 对象为例：
 
 ```text
 驱动拒绝新请求（present 清零）
-  → 应用此时关闭对象：驱动不再发维护命令，存储转入保留列表
+  → 应用此时关闭对象：驱动不再发维护命令，存储转入 retired
   → 驱动整体复位设备：脏行回写到仍属于这个对象的存储
-  → 设备释放：确认复位完成后，归还保留列表中的存储
+  → 设备确认停止：之后释放的存储直接归还
+  → 设备释放：归还 retired 与 reserved_blocks 中的存储
 ```
 
-如果第二步直接归还存储，第三步的回写会落进已经交还给内核的内存。所以设备移除后释放的可缓存对象都先保留。不可缓存对象登记时已清掉区间内的旧行，之后不会产生缓存行，也不会被复位回写。
+如果第二步直接归还存储，第三步的回写会落进已经交还给内核的内存。所以设备已移除、尚未确认停止时释放的存储都先保留。
 
 ### 7.4 Outbound 关闭与整体复位
 
@@ -294,14 +308,14 @@ Outbound 关闭后，窗口内的缓存行再也无法回写。所以关闭前�
 2. CP 保持复位，执行器停止，不再产生新访问；
 3. 在 Outbound 和后备存储仍有效时回写并失效全部行；
 4. 清空 GPUVM、HQD、IH 等状态；
-5. 复位全局寄存器、中断、DMA、Outbound 与 dcache，清空区间表和统计。
+5. 复位全局寄存器、中断、DMA、Outbound 与 dcache，清空统计。
 
 第 3 步回写失败时，两个入口的处理不同：
 
 - `GLOBAL_CTRL.RESET` 停在第 3 步：数据留在缓存中，`DCACHE_FAULT` 保持锁存，已停止的 CP 与执行器不自动恢复。这时 Host 系统仍在运行，没写回去的数据不能悄悄丢掉；
 - 冷复位继续执行，第 5 步丢弃剩余的行。冷复位本来就清零 VRAM，设备缓存也随之作废。如果冷复位也停下，一条始终写不回去的 Host 脏行会让设备再也无法复位，客体重启和驱动重载都恢复不了。
 
-保留 VRAM 的复位因此不丢失已完成的写入。冷复位在第 5 步之后才清零 VRAM，清零之后不会再有旧脏行写回。CP 单独复位不清缓存、区间表或统计；CP 保持复位并不代表执行器已经停止。
+保留 VRAM 的复位因此不丢失已完成的写入。冷复位在第 5 步之后才清零 VRAM，清零之后不会再有旧脏行写回。CP 单独复位不清缓存或统计；CP 保持复位并不代表执行器已经停止。
 
 **[BOUNDARY]** 冷复位时写不回去的 Host 脏行会丢失。冷复位意味着设备状态整体作废，本设备不为这些数据另设恢复通道。
 
@@ -313,31 +327,31 @@ Outbound 关闭后，窗口内的缓存行再也无法回写。所以关闭前�
 
 > **[SOURCE] 旁路与收尾**
 >
-> - BAR2：[vram.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:15:1>) [第 15 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:15:1>)、[第 33 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:33:1>)；DMA：[dma.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dma.c:78:1>) [第 78～83 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dma.c:78:1>)；
-> - Outbound 关闭：[phys.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/phys.c:106:1>) [第 106 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/phys.c:106:1>)；整体复位：[gpgpu.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:78:1>) [第 78 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:78:1>) 的 `gpgpu_reset_registers()`，`discard` 参数区分 `GLOBAL_CTRL.RESET` 与冷复位；
-> - 对象释放：[gpgpu_bo.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:48:1>) [第 48 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:48:1>)、[第 64 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:64:1>)；
+> - BAR2：[vram.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:17:1>) [第 17 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:17:1>)、[第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/vram.c:44:1>)；DMA：[dma.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dma.c:49:1>) [第 49 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dma.c:49:1>) 的 `dma_start()` 提交请求，[access.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:75:1>) [第 75 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:75:1>) 的 `mem_copy()` 处理两端；
+> - Outbound 关闭：[phys.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/phys.c:111:1>) [第 111 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/phys.c:111:1>)；整体复位：[gpgpu.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:79:1>) [第 79 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:79:1>) 的 `gpgpu_reset_registers()`，`discard` 参数区分 `GLOBAL_CTRL.RESET` 与冷复位；
+> - 存储归还：[gpgpu_dev.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:78:1>) [第 78 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:78:1>) 的 `gpgpu_storage_release_ok()`、[第 143 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:143:1>) 的 `gpgpu_dma_buf_free()`，[gpgpu_vram.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vram.c:75:1>) [第 75 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vram.c:75:1>) 的 `gpgpu_vram_free()`；
 > - 固件收尾：[aql.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:272:1>) [第 272 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:272:1>) 的 `aql_clean()`，由[第 368 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/aql.c:368:1>)在执行器终态之后、发布完成之前调用。
 
 <a id="dcache-cp-native"></a>
 
 ## 8. CP 原生访存与固件保留区
 
-CP 有两条访存路径，只有经访存窗口的数据访问会进入 dcache：
+CP 有两条访存路径，只有经访存窗口用户域、页属性为 WB 的数据访问会进入 dcache：
 
 ```text
 原生 RV64 CP
   ├─ 固件取指、全局变量、栈
-  │    → CP 本地 RAM 别名 → VRAM 后备存储（不经 GPUVM，不经 dcache）
+  │    → CP 本地 RAM 别名 → VRAM 后备存储（不经 GPUVM，不经访存入口）
   │
   └─ cp_read* / cp_write* 访问 GPU 对象
        → CP 本地 64 KiB 访存窗口
-       ├─ 用户域 → GPUVM → 数据访问前端（dcache 或不可缓存）
-       └─ 管理域 → 直接读写后备存储
+       ├─ 用户域 → GPUVM → 访存入口（叶子项属性 WB 或 DEVICE）
+       └─ 管理域 → 访存入口（DEVICE）
 ```
 
-固件代码、数据和栈位于固定保留区 `[0x03c0_0000, 0x0400_0000)`。用户域访问这段地址时被 GPUVM 拒绝，管理域又不经过 dcache，所以固件区的字节不会有缓存副本，dcache 也不需要按地址范围排除它。
+固件代码、数据和栈位于固定保留区 `[0x03c0_0000, 0x0400_0000)`。用户域访问这段地址时被 GPUVM 拒绝，管理域又按 DEVICE 访问，所以固件区的字节不会有缓存副本，dcache 也不需要按地址范围排除它。
 
-CP 在固件区原生写入临时 IH 记录，设备 IH 模块直接读它；驱动经 BAR2 装载固件。两者都读写后备存储，按原有发布顺序进行。
+CP 在固件区原生写入临时 IH 记录，IH 模块按 DEVICE 读它；驱动经 BAR2 装载固件。两者都按原有发布顺序进行。
 
 原生 RAM 别名覆盖整个 VRAM，复位向量仍沿用现有入口规则。现有固件经访存窗口访问公共 GPU 对象；自定义 CP 程序若用原生指针访问可缓存对象，必须先完成第 6 节的交接，不能与 dcache 同时访问同一行。本版不提供强制隔离。
 
@@ -349,12 +363,12 @@ CP 在固件区原生写入临时 IH 记录，设备 IH 模块直接读它；驱
 
 四个统计计数全设备共用，32 位无符号回绕：
 
-- **命中**：可缓存数据请求按行查找命中的次数；
+- **命中**：WB 数据请求按行查找命中的次数；
 - **未命中**：按行查找未命中的次数，之后回填失败也算一次；
 - **替换**：成功用新行替换有效旧行的次数，填入空路和主动失效都不算；
 - **回写**：成功写回脏行的次数，包括替换、维护和任务收尾，失败的回写不算。
 
-取指、页表遍历、不可缓存访问、DMA、IH、回填与维护本身都不计命中和未命中；入口范围检查失败的请求也不计数。
+取指、页表遍历、DEVICE 访问、DMA、IH、回填与维护本身都不计命中和未命中；入口检查失败的请求也不计数。GPUVM 关闭时没有 WB 访问，命中与未命中保持不变。
 
 命中率由读取者计算：命中 ÷（命中 + 未命中），分母为 0 表示还没有样本。统计区间用前后两次读数之差，求和使用足够的位宽。运行中只保证每个寄存器单独读取的值，需要准确采样时在没有新数据访问时读取。整体复位清零统计；CP 复位、ACK、TLB 失效和普通维护不清零。
 
@@ -372,7 +386,11 @@ CP 在固件区原生写入临时 IH 记录，设备 IH 模块直接读它；驱
 
 规范中的 system scope 是同步作用域，不表示数据位于 Host RAM。访存经过缓存路径也不意味着数据一定驻留缓存。规范里的维护指令只作用于 GPU 缓存，不负责 CPU 缓存，也不能单独保证 CPU 与 GPU 之间的可见性。
 
-**[BOUNDARY]** 本文的不可缓存区间表、维护命令和交接顺序都是本设备的设计，用来在这份自定义缓存上保证正确性，不是 AMD 硬件接口的复现。
+本设备把缓存属性放在页表叶子项里，这一点与 AMDGPU 的做法一致：属性按对象确定，在建立映射时写进页表项。
+
+> **[SOURCE]** 同一固定提交，[gmc_v9_0.c，第 1125～1158 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c#L1125-L1158)：对象带 `uncached` 标志时选择 `MTYPE_UC`；函数末尾把选出的 MTYPE 与 snoop 位写进页表项标志。
+
+**[BOUNDARY]** 本文的叶子项缓存属性位、DEVICE 访问语义、维护命令和交接顺序都是本设备的设计，用来在这份自定义缓存上保证正确性，不复现 AMD 的 MTYPE 编码与硬件接口，也不复现 Arm 的内存类型。
 
 <a id="dcache-implementation"></a>
 
@@ -380,10 +398,11 @@ CP 在固件区原生写入临时 IH 记录，设备 IH 模块直接读它；驱
 
 > **[SOURCE] 实现索引**
 >
-> - 缓存核心：[dcache.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.h:1:1>)、[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:1:1>)；维护命令的范围处理见 dcache.c [第 259 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:259:1>)，Host／CP 两方命令见[第 387 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:387:1>)；
-> - 寄存器与协议常量：[gpgpu_regs.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:441:1>) [第 441 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:441:1>) 起；用户接口：[gpgpu_drm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/uapi/gpgpu_drm.h:261:1>) [第 261 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/uapi/gpgpu_drm.h:261:1>)；
+> - 访存入口：[access.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.h:1:1>)、[access.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:1:1>)；后备存储接口：[backend.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/backend.h:1:1>)；
+> - 缓存核心：[dcache.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.h:1:1>)、[dcache.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:1:1>)；维护的范围处理见 dcache.c [第 237 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:237:1>)，Host／CP 两方命令见[第 282 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/dcache.c:282:1>)；维护命令与复位共用的入口见 access.c [第 135 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/access.c:135:1>) 的 `gpgpu_mem_sync()`；
+> - 寄存器与协议常量：[gpgpu_regs.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:441:1>) [第 441 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:441:1>) 起；叶子项属性位：[gpgpu_vm_abi.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:50:1>) [第 50～54 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:50:1>)；用户接口：[gpgpu_drm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/uapi/gpgpu_drm.h:262:1>) [第 262 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/uapi/gpgpu_drm.h:262:1>)；
 > - CP 本地寄存器窗口的转发：[bar0.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/bar0.c:196:1>) [第 196 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/bar0.c:196:1>)、[第 223 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/bar0.c:223:1>)；
-> - 驱动命令通道：[gpgpu_dev.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:80:1>) [第 80 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:80:1>)；`CACHE_SYNC`：[gpgpu_bo.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:471:1>) [第 471 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:471:1>)；
+> - 驱动命令通道：[gpgpu_dev.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:44:1>)；`CACHE_SYNC`：[gpgpu_bo.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:420:1>) [第 420 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:420:1>)；
 > - 运行时的对象属性与参数块失效：[runtime.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/rt/runtime.c:95:1>) [第 95 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/rt/runtime.c:95:1>)、[第 379 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/rt/runtime.c:379:1>)。
 
 核心行为由现有 QTest 与 Linux 全栈覆盖，命令与实际结果只记录在[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。

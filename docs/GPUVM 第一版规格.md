@@ -52,10 +52,12 @@
 | ABI    | Application Binary Interface | 二进制接口 |
 | PCIe   | Peripheral Component Interconnect Express | 高速外设互连总线 |
 | API    | Application Programming Interface                      | 应用编程接口                                                |
+| WB     | Write-Back | 写回；本实验指页属性允许进入数据缓存的访问类型 |
+| MTYPE  | Memory Type | AMDGPU 页表项中的内存类型字段 |
 
 本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 6，与版本 5 的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明](<../software/gpgpu/README.md#stage-three-gpuvm>)。
 
-**[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口；数据读写在翻译和权限检查之后先经过设备的数据缓存，见 [dcache 第一版规格](<./dcache 第一版规格.md#dcache-paths>)。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
+**[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口。开启时，数据读写在翻译和权限检查之后按叶子项的缓存属性决定是否经过设备的数据缓存；关闭时没有页表给出属性，数据访问都不进入缓存。缓存行为见 [dcache 第一版规格](<./dcache 第一版规格.md#dcache-paths>)。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
 
 建议先读第 1 节的使用流程，再读第 2～7 节的对象、访问和回收，最后检查第 9 节的范围记录。推进顺序见[第三阶段大纲](<./QEMU GPGPU 实验大纲.md#stage-three-vmid>)。
 
@@ -198,7 +200,7 @@ Queue B → VMID 2 → 页表 B
   → 查该 VMID 的 TLB
   → 未命中时，从页表根逐级读取表项
   → 检查有效位、读/写/取指权限及完整目标范围
-  → GPU 物理页地址 + 页内偏移 → 公共物理入口 → VRAM 或 Outbound
+  → GPU 物理页地址 + 页内偏移，连同缓存属性 → 公共物理入口 → VRAM 或 Outbound
   → 返回数据或报告本次访问错误
 ```
 
@@ -213,7 +215,7 @@ Queue B → VMID 2 → 页表 B
   ├─ [20:12]：L3 叶页表索引，9 位
   └─ [11:0] ：页内偏移，12 位
 
-根目录 GPU 物理地址 → L1 目录 → L2 目录 → L3 叶页表 → GPU 物理页与权限
+根目录 GPU 物理地址 → L1 目录 → L2 目录 → L3 叶页表 → GPU 物理页、权限与缓存属性
 ```
 
 例如 `0x0000_ffff_8a40_2000` 的四个索引依次为 `0x1ff`、`0x1fe`、`0x52`、`0x2`，页内偏移为 0。首次建立这条路径需要四张表，共 16 KiB；同一 2 MiB 区段内的页复用已有叶页表。四级、每级 9 位与 AMD 9.4.3 的 48 位 VA 划分相同，见下方证据。
@@ -230,9 +232,9 @@ Queue B → VMID 2 → 页表 B
 
 因此表页占用取决于 VM 曾经触及的地址区段，不只取决于当前有效映射；空表也会继续占用与 BO 共用的 VRAM 池。是否引入回收的范围约定见[大纲的空表回收边界](<./QEMU GPGPU 实验大纲.md#page-table-reclaim-extension>)。
 
-> **[SOURCE]** 本仓库 `ec9a9c0`：UNMAP 只清叶子项并结束绑定，见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1) [第 331～364 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1)；表页统一归还见[第 508～519 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:508:1)。
+> **[SOURCE]** 本仓库 `ec9a9c0`：UNMAP 只清叶子项并结束绑定，见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1) [第 334～367 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1)；表页统一归还见[第 511～522 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:511:1)。
 
-目录项保存 bit 0 `VALID`、bit 1 `SYSTEM` 和下一级表的地址域。叶子项在此基础上再保存 bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`。GPU 物理地址仍为 32 位，地址域为 `[31:12]`，掩码为 `0xffff_f000`；bit 2、bit 63..32 及其余未定义位保留，有效项中出现即报页表错误。
+目录项保存 bit 0 `VALID`、bit 1 `SYSTEM` 和下一级表的地址域。叶子项在此基础上再保存 bit 2 `UNCACHED`、bit 4 `EXECUTABLE`、bit 5 `READABLE`、bit 6 `WRITEABLE`。GPU 物理地址仍为 32 位，地址域为 `[31:12]`，掩码为 `0xffff_f000`；bit 63..32 及其余未定义位保留，有效项中出现即报页表错误。目录项带 `UNCACHED` 同样报页表错误，缓存属性只属于叶子项。
 
 SYSTEM 决定地址域的含义，设备据此换算出 GPU 物理页，再交给公共物理入口：
 
@@ -254,6 +256,37 @@ SYSTEM 决定地址域的含义，设备据此换算出 GPU 物理页，再交�
 地址域与 SYSTEM 不一致时报页表错误，设备不按地址数值去猜它属于 VRAM 还是 Outbound。最后一个例子是版本 3 的写法：当时 PTE 直接保存 GPU 物理地址，bit 1 必须为 0。版本 4 把 bit 1 定义为 SYSTEM，Host 页的叶子项改存 IOVA 并置 SYSTEM。
 
 驱动给 Host 对象和通知页写叶子项时，直接使用 DMA API 返回的 IOVA 并置 SYSTEM；VRAM 对象写 VRAM 偏移。对象的 GPU 物理地址只用于 GPUVM 关闭时的直通访问和管理域字段。页表根没有 SYSTEM 位，上下文寄存器直接保存根页的 GPU 物理地址；根页位于 Host 时，Outbound 未使能则不能启用上下文。遍历通过公共物理入口读取表页，不递归进行 GPUVM 翻译。驱动只从受保护 VRAM 分配表页，写出的中间项都不带 SYSTEM。
+
+<a id="gpuvm-cache-attribute"></a>
+
+#### 3.2.1 叶子项的缓存属性
+
+翻译除了给出物理页和权限，还要告诉设备这一页能否进入数据缓存。以运行时的进度页为例：CPU 随时写 W，CP 每轮轮询它，如果 CP 读到的是缓存中的旧 W，新包就永远取不走。驱动因此在这一页的叶子项置 `UNCACHED`，设备每次读 W 都直接读内存。属性随翻译结果依次传递：
+
+```text
+BO_CREATE 带 GPGPU_BO_UNCACHED 或 GPGPU_BO_EVENT_PAGE
+  → MAP：驱动写叶子项 0x4100_5000 | SYSTEM | UNCACHED | VALID | R | W
+  → 遍历：解析出 GPU 物理页 0xc100_5000、权限 R/W、UNCACHED
+  → TLB 填充：权限与缓存属性分开保存
+  → 之后的命中：从 TLB 项重建同样的物理页、权限与属性
+  → 检查本次访问的权限，再按属性生成物理请求：UNCACHED 为 DEVICE，否则为 WB
+```
+
+- **权限在前。** 属性只决定通过检查后的访问怎样完成，缓存命中不能绕过权限。
+- **逐页使用。** 一次跨页访问拆成多页，每页使用自己的叶子项属性。
+- **创建后不变。** 对象的缓存属性在 BO_CREATE 时确定，不提供运行中修改属性的接口；TLB 失效只更新翻译，不负责数据缓存维护。
+- **GPUVM 关闭时一律 DEVICE。** 直通访问没有页表给出属性，CP 用户域与执行器的数据访问都不进入数据缓存，发起方也不能把它改成 WB。
+
+`GPGPU_BO_UNCACHED` 是 BO_CREATE 的用户接口标志，位号与页表编码无关，驱动写叶子项时显式换算成 `GPGPU_VM_UNCACHED`。`MAP.permissions` 仍只接受 R/W/X，用户不能直接写缓存属性。WB 与 DEVICE 的具体行为见 [dcache 规格第 5 节](<./dcache 第一版规格.md#dcache-uncached>)。
+
+> **[SOURCE] 缓存属性的传递**
+>
+> - 编码：[gpgpu_vm_abi.h](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:50:1) [第 50～54 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:50:1)；
+> - 驱动写叶子项：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:316:1) [第 316 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:316:1)；
+> - 遍历解析与 TLB：[gpuvm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:206:1) [第 206 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:206:1)、[第 245 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:245:1)、[第 289 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:289:1)；
+> - 生成请求：`gpuvm=on` 见[第 384 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:384:1)，`gpuvm=off` 见[第 412 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:412:1)的 `vm_direct_rw()`。
+
+**[BOUNDARY]** `UNCACHED` 的位置和含义是本设备的设计，不声明复现 AMDGPU 的 `MTYPE` 编码。
 
 完整表项写入前校验对齐、位宽及目标范围，不能靠掩码隐藏非法地址。无效项写零，不支持的有效项编码报页表错误。代码页开放读与取指，参数和输入页开放读，输出及共享状态按需要开放读写；不同权限的对象分开占页。
 
@@ -446,14 +479,14 @@ VPN = GPUVA[47:12]，组号 = VPN % 64
 
 > **[SOURCE] 可选源码索引**
 >
-> - 组与项的结构：[hw/gpgpu/mem/gpuvm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:34:1>) [第 34～58 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:34:1>)；
-> - 查找、未命中计数与填入：[hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:263:1>) [第 263～289 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:263:1>) 的 `vm_lookup()`；
-> - 选择无效路或替换 `order[3]`：[第 211～237 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:211:1>) 的 `tlb_fill()`；
-> - 失效只清有效位：[第 502～514 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:502:1>) 的 `tlb_invalidate()`。
+> - 组与项的结构：[hw/gpgpu/mem/gpuvm.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:36:1>) [第 36～62 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.h:36:1>)；
+> - 查找、未命中计数与填入：[hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:275:1>) [第 275～302 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:275:1>) 的 `vm_lookup()`；
+> - 选择无效路或替换 `order[3]`：[第 222～249 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:222:1>) 的 `tlb_fill()`；
+> - 失效只清有效位：[第 531～543 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:531:1>) 的 `tlb_invalidate()`。
 
 下面的 `tlb_touch()` 维护排名，可以对照上例中“前面的路后移、后面的路不动”：
 
-> **[SOURCE]** [hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:200:1>) [第 200～209 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:200:1>)，当前实现。
+> **[SOURCE]** [hw/gpgpu/mem/gpuvm.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:211:1>) [第 211～220 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/mem/gpuvm.c:211:1>)，当前实现。
 
 ```c
 200	/* 把 way 移到 order[0] 成为 MRU，排在它前面的路依次后移一位。 */

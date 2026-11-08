@@ -5,8 +5,8 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "hw/gpgpu/gpgpu_state.h"
+#include "hw/gpgpu/mem/access.h"
 #include "hw/gpgpu/mem/gpuvm.h"
-#include "hw/gpgpu/mem/phys.h"
 #include "cp_window.h"
 
 /*
@@ -17,9 +17,10 @@
  *
  * 1. 检查访问不越出 64 KiB 窗口，基址加偏移、再加访问长度都不溢出
  *    64 位，否则返回 MEMTX_ERROR；
- * 2. 管理域把目标当 GPU 物理地址访问（MQD、Ring、IH 等驱动对象）；
- *    用户域按配置的 VMID 访问用户地址，gpuvm=on 时经页表翻译，失败时
- *    故障记到配置的 HQD 槽和阶段。未定义的域直接失败。
+ * 2. 管理域把目标当 GPU 物理地址按 DEVICE 访问（MQD、管理 Ring、
+ *    结果区等驱动对象）；用户域按配置的 VMID 访问用户地址，gpuvm=on
+ *    时经页表翻译并取页属性，失败时故障记到配置的 HQD 槽和阶段。
+ *    未定义的域直接失败。
  *
  * 返回 MEMTX_ERROR 时 CP 收到 access fault，由固件陷阱处理恢复。
  */
@@ -27,6 +28,7 @@ static MemTxResult window_rw(GPGPUState *s, hwaddr off, uint8_t *buf, unsigned i
 			     bool is_write)
 {
 	GPGPUCPWindowState *w = &s->window;
+	GPGPUMemRequest req;
 	uint64_t addr;
 
 	/* 1. 窗口内范围与目标地址的 64 位溢出检查。 */
@@ -39,9 +41,17 @@ static MemTxResult window_rw(GPGPUState *s, hwaddr off, uint8_t *buf, unsigned i
 	/* 2. 管理域走物理地址，用户域走 gpgpu_user_rw()。 */
 	switch (w->domain) {
 	case GPGPU_CP_DOMAIN_MANAGEMENT:
-		return gpgpu_phys_rw(s, addr, buf, size, is_write);
+		req = (GPGPUMemRequest) {
+			.client = GPGPU_MEM_CP_MGMT,
+			.op = is_write ? GPGPU_MEM_WRITE : GPGPU_MEM_READ,
+			.type = GPGPU_MEM_DEVICE,
+			.addr = addr,
+			.len = size,
+			.buf = buf,
+		};
+		return gpgpu_mem_access(s, &req) ? MEMTX_OK : MEMTX_ERROR;
 	case GPGPU_CP_DOMAIN_USER:
-		if (!gpgpu_user_rw(s, w->vmid, w->slot, addr, buf, size,
+		if (!gpgpu_user_rw(s, GPGPU_MEM_CP_USER, w->vmid, w->slot, addr, buf, size,
 				   is_write ? GPGPU_VM_WRITE : GPGPU_VM_READ, w->phase))
 			return MEMTX_ERROR;
 		return MEMTX_OK;

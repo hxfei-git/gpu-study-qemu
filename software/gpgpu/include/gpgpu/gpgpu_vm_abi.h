@@ -45,8 +45,13 @@
 #define GPGPU_VM_ADDR_MASK 0xfffff000ULL
 /* 页表项有效位。 */
 #define GPGPU_VM_VALID (1ULL << 0)
-/* 地址域保存 Host IOVA；中间项与叶子项都可以设置，bit 2 仍保留。 */
+/* 地址域保存 Host IOVA；中间项与叶子项都可以设置。 */
 #define GPGPU_VM_SYSTEM (1ULL << 1)
+/*
+ * 叶子项缓存属性：置位时这一页的数据访问按 DEVICE 处理，不进入 dcache；
+ * 清零时按 WB 缓存。只有叶子项可以设置，中间项带它视为页表损坏。
+ */
+#define GPGPU_VM_UNCACHED (1ULL << 2)
 /* 叶子项取指权限，也用作访问类型 EXEC。 */
 #define GPGPU_VM_EXEC (1ULL << 4)
 /* 叶子项读权限，也用作访问类型 READ。 */
@@ -57,7 +62,10 @@
 #define GPGPU_VM_PERMS (GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_EXEC)
 /* 中间项允许出现的全部标志位。 */
 #define GPGPU_VM_DIR_FLAGS (GPGPU_VM_VALID | GPGPU_VM_SYSTEM)
-/* 叶子项允许出现的全部标志位；用户映射的权限只能取 GPGPU_VM_PERMS。 */
-#define GPGPU_VM_FLAGS (GPGPU_VM_DIR_FLAGS | GPGPU_VM_PERMS)
+/*
+ * 叶子项允许出现的全部标志位；用户映射的权限只能取 GPGPU_VM_PERMS，
+ * 缓存属性由驱动按对象创建时的标志写入。
+ */
+#define GPGPU_VM_FLAGS (GPGPU_VM_DIR_FLAGS | GPGPU_VM_UNCACHED | GPGPU_VM_PERMS)
 
 #endif /* GPGPU_VM_ABI_H */

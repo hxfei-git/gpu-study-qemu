@@ -12,7 +12,11 @@
  *
  * 停止顺序（gpgpu_device_stop）：拒绝新请求并让等待者失败，保持 CP 复位，
  * 等跨进程访问结束后整体复位设备，最后回收 orphan 会话。整体复位会先
- * 回写并清空 dcache 与不可缓存区间表，之后释放存储不再需要维护。
+ * 回写并清空 dcache，确认停止后释放存储不再需要维护。
+ *
+ * 存储归还：Host DMA 内存和 VRAM 块归还前都经 gpgpu_storage_release_ok()
+ * 回写并失效 dcache 中的旧行；不能确认时不归还，Host 内存转入
+ * dev->retired，VRAM 块转入 dev->reserved_blocks，设备释放时再回收。
  */
 #include <linux/delay.h>
 #include <linux/dma-map-ops.h>
@@ -22,6 +26,64 @@
 
 /* DMA 地址的可用范围，等于 Outbound 窗口长度（31 位）。 */
 #define GPGPU_DMA_LIMIT GPGPU_OUTBOUND_SIZE
+
+/* ---- dcache ---- */
+
+/**
+ * gpgpu_dcache_command() - 经 BAR0 发出一条 Host dcache 命令
+ * @dev: 设备；调用者持 dev->lock，或设备尚未对外发布、已不再被并发使用。
+ * @cmd: GPGPU_DCACHE_* 命令。
+ * @addr: GPU 物理地址；@cmd 含 GPGPU_DCACHE_ALL 时忽略。
+ * @size: 字节数，不超过 32 位。
+ *
+ * 设备在 CMD 写入时同步执行，随后读到的 STATUS 就是本次结果。
+ *
+ * Return: 0；遇到脏行或有在途访问为 -EBUSY；参数被拒绝为 -EINVAL；回写
+ * 失败为 -EIO。
+ */
+int gpgpu_dcache_command(struct gpgpu_device *dev, u32 cmd, u64 addr, u64 size)
+{
+	if (size > U32_MAX)
+		return -EINVAL;
+	gpgpu_wreg64(dev, GPGPU_REG_DCACHE_ADDR_LO, addr);
+	gpgpu_wreg(dev, GPGPU_REG_DCACHE_LENGTH, size);
+	gpgpu_wreg(dev, GPGPU_REG_DCACHE_CMD, cmd);
+	switch (gpgpu_rreg(dev, GPGPU_REG_DCACHE_STATUS)) {
+	case GPGPU_DCACHE_OK:
+		return 0;
+	case GPGPU_DCACHE_DIRTY:
+	case GPGPU_DCACHE_BUSY:
+		return -EBUSY;
+	case GPGPU_DCACHE_INVALID:
+		return -EINVAL;
+	default:
+		return -EIO;
+	}
+}
+
+/**
+ * gpgpu_storage_release_ok() - 归还一段存储前处理 dcache 中的旧行
+ * @dev: 设备；调用者持 dev->lock，或设备尚未对外发布、已不再被并发使用。
+ * @addr: 存储的 GPU 物理地址。
+ * @size: 字节数，不超过 32 位。
+ *
+ * 缓存行按 GPU 物理地址标记。存储分给新对象后，旧脏行回写会覆盖
+ * 新内容，旧干净行会让新对象读到旧数据。设备在位时回写并失效这段
+ * 范围；设备已移除时不再发命令，只有确认停止时整体复位已经清空
+ * dcache，才可以归还。
+ *
+ * Return: 可以归还为 true；维护失败，或设备已移除但未确认停止时为
+ * false，调用者必须保留存储。
+ */
+bool gpgpu_storage_release_ok(struct gpgpu_device *dev, u64 addr, u64 size)
+{
+	if (!READ_ONCE(dev->present))
+		return dev->stopped;
+	if (!gpgpu_dcache_command(dev, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE, addr, size))
+		return true;
+	dev_err(&dev->pdev->dev, "dcache 维护失败，保留存储 0x%llx+%llu\n", addr, size);
+	return false;
+}
 
 /* ---- DMA 缓冲区 ---- */
 
@@ -37,117 +99,92 @@
  * GPU 物理地址 GPGPU_OUTBOUND_BASE + IOVA。例：IOVA 0x4100_2000 对应
  * 0xc100_2000；IOVA 0 也合法，对应窗口起点。
  *
+ * 退役记录与存储一起分配，释放失败时直接使用它，不在释放路径上
+ * 申请内存。地址不合格的存储从未交给设备，直接归还，不经 dcache
+ * 维护。
+ *
  * Return: 0，或 -ENOMEM / -ERANGE（失败时不保留任何分配）。
  */
 int gpgpu_dma_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
 			size_t align)
 {
-	buf->cpu = dma_alloc_coherent(&dev->pdev->dev, size, &buf->dma, GFP_KERNEL);
-	if (!buf->cpu)
+	struct gpgpu_retired_buf *retire = kzalloc(sizeof(*retire), GFP_KERNEL);
+	dma_addr_t dma;
+	void *cpu;
+
+	if (!retire)
 		return -ENOMEM;
-	buf->size = size;
-	if ((buf->dma & (align - 1)) || buf->dma >= GPGPU_DMA_LIMIT ||
-	    size > GPGPU_DMA_LIMIT - buf->dma) {
-		gpgpu_dma_buf_free(dev, buf);
+	cpu = dma_alloc_coherent(&dev->pdev->dev, size, &dma, GFP_KERNEL);
+	if (!cpu) {
+		kfree(retire);
+		return -ENOMEM;
+	}
+	if ((dma & (align - 1)) || dma >= GPGPU_DMA_LIMIT || size > GPGPU_DMA_LIMIT - dma) {
+		dma_free_coherent(&dev->pdev->dev, size, cpu, dma);
+		kfree(retire);
 		return -ERANGE;
 	}
-	buf->addr = GPGPU_OUTBOUND_BASE + buf->dma;
-	memset(buf->cpu, 0, size);
+	memset(cpu, 0, size);
+	*buf = (struct gpgpu_dma_buf) {
+		.cpu = cpu,
+		.dma = dma,
+		.addr = GPGPU_OUTBOUND_BASE + dma,
+		.size = size,
+		.retire = retire,
+	};
 	return 0;
 }
 
+/*
+ * 归还存储并清空 buf。不能确认 dcache 已处置这段地址时，存储描述转入
+ * dev->retired，设备释放时再归还。调用者持 dev->lock，或设备尚未对外
+ * 发布、已不再被并发使用。
+ */
 void gpgpu_dma_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf)
 {
-	if (buf->cpu)
+	struct gpgpu_retired_buf *retire = buf->retire;
+
+	if (!buf->cpu)
+		return;
+	if (gpgpu_storage_release_ok(dev, buf->addr, buf->size)) {
 		dma_free_coherent(&dev->pdev->dev, buf->size, buf->cpu, buf->dma);
-	*buf = (struct gpgpu_dma_buf) { 0 };
-}
-
-/* ---- dcache ---- */
-
-/**
- * gpgpu_dcache_command() - 经 BAR0 发出一条 Host dcache 命令
- * @dev: 设备；调用者持 dev->lock，或设备尚未对外发布、已不再被并发使用。
- * @cmd: GPGPU_DCACHE_* 命令。
- * @addr: GPU 物理地址；@cmd 含 GPGPU_DCACHE_ALL 时忽略。
- * @size: 字节数，不超过 32 位。
- *
- * 设备在 CMD 写入时同步执行，随后读到的 STATUS 就是本次结果。
- *
- * Return: 0；区间表已满为 -ENOSPC；遇到脏行或有在途访问为 -EBUSY；参数
- * 被拒绝为 -EINVAL；回写失败为 -EIO。
- */
-int gpgpu_dcache_command(struct gpgpu_device *dev, u32 cmd, u64 addr, u64 size)
-{
-	if (size > U32_MAX)
-		return -EINVAL;
-	gpgpu_wreg64(dev, GPGPU_REG_DCACHE_ADDR_LO, addr);
-	gpgpu_wreg(dev, GPGPU_REG_DCACHE_LENGTH, size);
-	gpgpu_wreg(dev, GPGPU_REG_DCACHE_CMD, cmd);
-	switch (gpgpu_rreg(dev, GPGPU_REG_DCACHE_STATUS)) {
-	case GPGPU_DCACHE_OK:
-		return 0;
-	case GPGPU_DCACHE_FULL:
-		return -ENOSPC;
-	case GPGPU_DCACHE_DIRTY:
-	case GPGPU_DCACHE_BUSY:
-		return -EBUSY;
-	case GPGPU_DCACHE_INVALID:
-		return -EINVAL;
-	default:
-		return -EIO;
+		kfree(retire);
+	} else {
+		*retire = (struct gpgpu_retired_buf) {
+			.cpu = buf->cpu,
+			.dma = buf->dma,
+			.size = buf->size,
+		};
+		list_add_tail(&retire->node, &dev->retired);
 	}
-}
-
-/* 控制对象登记的长度：按缓存行取整，仍在按页分配的存储之内。 */
-static u64 ctrl_buf_span(const struct gpgpu_dma_buf *buf)
-{
-	return round_up(buf->size, GPGPU_DCACHE_LINE_SIZE);
-}
-
-/*
- * gpgpu_ctrl_buf_alloc() - 分配驱动自己的控制对象并登记为不可缓存
- *
- * 用于 MQD、管理 Ring 与结果区、IH Ring。CP 管理域与 IH 本来就绕过
- * dcache；登记后 GPUVM 关闭时，用户域经物理地址访问它们也不会缓存。
- * 登记失败时不保留分配。调用者持 dev->lock，或设备尚未对外发布。
- *
- * Return: 0、gpgpu_dma_buf_alloc() 的错误，或 gpgpu_dcache_command() 的错误。
- */
-int gpgpu_ctrl_buf_alloc(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf, size_t size,
-			 size_t align)
-{
-	int ret = gpgpu_dma_buf_alloc(dev, buf, size, align);
-
-	if (ret)
-		return ret;
-	ret = gpgpu_dcache_command(dev, GPGPU_DCACHE_UC_ADD, buf->addr, ctrl_buf_span(buf));
-	if (ret)
-		gpgpu_dma_buf_free(dev, buf);
-	return ret;
-}
-
-/*
- * 撤销登记再释放。设备已移除时不再发命令：区间登记时已清掉旧行，
- * 此后不会产生缓存行，复位也就不会回写这段存储。
- */
-void gpgpu_ctrl_buf_free(struct gpgpu_device *dev, struct gpgpu_dma_buf *buf)
-{
-	if (buf->cpu && READ_ONCE(dev->present))
-		gpgpu_dcache_command(dev, GPGPU_DCACHE_UC_REMOVE, buf->addr, ctrl_buf_span(buf));
-	gpgpu_dma_buf_free(dev, buf);
+	*buf = (struct gpgpu_dma_buf) { 0 };
 }
 
 /* ---- 引用计数 ---- */
 
-/* 最后一个引用：释放管理对象、IH、保留的 BO、VRAM 分配器与 PCI 引用。 */
+/* 设备释放时归还 dev->retired 中的存储；设备已停止访问，不必维护。 */
+static void gpgpu_release_retired(struct gpgpu_device *dev)
+{
+	struct gpgpu_retired_buf *retire, *next;
+
+	list_for_each_entry_safe(retire, next, &dev->retired, node) {
+		dma_free_coherent(&dev->pdev->dev, retire->size, retire->cpu, retire->dma);
+		list_del(&retire->node);
+		kfree(retire);
+	}
+}
+
+/*
+ * 最后一个引用：释放管理对象、IH、保留的存储、VRAM 分配器与 PCI 引用。
+ * 保留的 VRAM 块在 dev->reserved_blocks 中，随分配器一起归还。
+ */
 static void gpgpu_device_release(struct kref *refs)
 {
 	struct gpgpu_device *dev = container_of(refs, struct gpgpu_device, refs);
 
 	gpgpu_mgmt_fini(dev);
-	gpgpu_ctrl_buf_free(dev, &dev->ih);
-	gpgpu_bo_release_retained(dev);
+	gpgpu_dma_buf_free(dev, &dev->ih);
+	gpgpu_release_retired(dev);
 	gpgpu_vram_fini(dev);
 	if (dev->vram)
 		pci_iounmap(dev->pdev, dev->vram);
@@ -190,8 +227,8 @@ static bool gpgpu_device_supported(struct pci_dev *pdev, void __iomem *regs)
  *    Doorbell 第 0 页留给管理队列，管理请求序号从 1 开始；
  * 3. 建立 VRAM 分配器（预留首页），映射 BAR2 用于装载固件、清零对象
  *    和写页表；
- * 4. 分配 KIQ、HIQ 的 Ring 与 MQD，以及 IH Ring，并登记为不可缓存区间。
- *    probe 已整体复位设备，区间表此时为空。
+ * 4. 分配 KIQ、HIQ 的 Ring 与 MQD，以及 IH Ring。CP 管理域与 IH 都按
+ *    DEVICE 访问它们，不需要登记缓存属性。
  *
  * 失败时放下唯一的引用，gpgpu_device_release() 只回收已分配的部分。
  */
@@ -227,7 +264,7 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 
 	INIT_LIST_HEAD(&dev->fprivs);
 	INIT_LIST_HEAD(&dev->requests);
-	INIT_LIST_HEAD(&dev->retained);
+	INIT_LIST_HEAD(&dev->retired);
 	INIT_LIST_HEAD(&dev->reserved_blocks);
 	dev->next_sequence = 1;
 	dev->db_pages = BIT(0);
@@ -247,7 +284,7 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 	ret = gpgpu_mgmt_init(dev);
 	if (ret)
 		goto fail;
-	ret = gpgpu_ctrl_buf_alloc(dev, &dev->ih, GPGPU_IH_BYTES, GPGPU_IH_BYTES);
+	ret = gpgpu_dma_buf_alloc(dev, &dev->ih, GPGPU_IH_BYTES, GPGPU_IH_BYTES);
 	if (ret)
 		goto fail;
 

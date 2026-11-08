@@ -6,9 +6,8 @@
 #include "qemu/timer.h"
 #include "hw/gpgpu/gpgpu_state.h"
 #include "hw/gpgpu/irq/irq.h"
-#include "dcache.h"
+#include "access.h"
 #include "dma.h"
-#include "phys.h"
 #include "vram.h"
 
 /* 数据搬运结束到发布 COMPLETE 的虚拟时间延迟，单位毫秒。 */
@@ -39,63 +38,47 @@ static void dma_fail(GPGPUState *s)
  * 同步搬完，完成状态再延迟发布：
  *
  * 1. 锁存方向与中断使能位；没有 START 位时只更新这两位，不搬运；
- * 2. 检查描述符：设备已使能、长度非零、VRAM 端完整位于 VRAM 内，
- *    Host 端不低于 Outbound 起点且落在已使能的窗口里，空洞地址失败。
- *    不合法时置 ERROR 并锁存 DMA_FAULT，不搬运；
- * 3. 两端都直接读写后备存储，先维护 dcache：读端回写脏行，写端回写并
- *    失效，避免读到旧值或旧脏行之后覆盖新数据。回写失败时按第 2 步
- *    处理，不搬运；
- * 4. 置 BUSY，把 VRAM 端映射成一段 Host 指针，再经 gpgpu_phys_rw()
- *    与 Host 端直接互拷。Host 访问失败时置 ERROR，已写入的部分保留；
- * 5. 搬运成功后安排 1 ms 定时器，到期才发布 COMPLETE 和完成中断，
+ * 2. 检查描述符：设备已使能、长度非零，方向位指定的 VRAM 端完整位于
+ *    VRAM 内。不合法时置 ERROR 并锁存 DMA_FAULT，不搬运；
+ * 3. 置 BUSY，向访存入口提交一次 COPY。入口检查 Host 端落在已使能的
+ *    Outbound 窗口里，先处理两端重叠的 dcache 行，再整段搬运。任一步
+ *    失败时按第 2 步处理，已写入的部分保留；
+ * 4. 搬运成功后安排 1 ms 定时器，到期才发布 COMPLETE 和完成中断，
  *    模拟真实引擎的完成时延。BUSY 期间描述符不能改写。
- *
- * 搬运期间不释放主锁，其他客户端不会在第 3 步之后重新缓存这两段
- * 地址。
  */
 static void dma_start(GPGPUState *s, uint32_t ctrl)
 {
 	GPGPUDMAState *d = &s->dma;
 	bool to_host = ctrl & GPGPU_DMA_DIR_FROM_VRAM;
 	uint64_t vram_addr = to_host ? d->src_addr : d->dst_addr;
-	uint64_t host_addr = to_host ? d->dst_addr : d->src_addr;
-	const uint32_t flush = GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE;
-	MemTxResult result;
-	void *vram;
+	const GPGPUMemRequest req = {
+		.client = GPGPU_MEM_DMA,
+		.op = GPGPU_MEM_COPY,
+		.type = GPGPU_MEM_DEVICE,
+		.addr = d->src_addr,
+		.len = d->size,
+		.dst = d->dst_addr,
+	};
 
 	/* 1. START 不锁存，读回 DMA_CTRL 只有方向与中断使能位。 */
 	d->ctrl = ctrl & (GPGPU_DMA_DIR_FROM_VRAM | GPGPU_DMA_IRQ_ENABLE);
 	if (!(ctrl & GPGPU_DMA_START))
 		return;
 
-	/* 2. 两端范围检查，任一项不满足即失败。 */
-	if (!gpgpu_enabled(s) || !d->size || !gpgpu_vram_contains(s, vram_addr, d->size) ||
-	    host_addr < GPGPU_OUTBOUND_BASE || !gpgpu_phys_contains(s, host_addr, d->size)) {
+	/* 2. 方向位决定哪一端必须在 VRAM。 */
+	if (!gpgpu_enabled(s) || !d->size || !gpgpu_vram_contains(s, vram_addr, d->size)) {
 		dma_fail(s);
 		return;
 	}
 
-	/* 3. D2H 读 VRAM、写 Host；H2D 读 Host、写 VRAM。 */
-	if (!gpgpu_dcache_maintain(s, vram_addr, d->size, to_host ? GPGPU_DCACHE_CLEAN : flush) ||
-	    !gpgpu_dcache_maintain(s, host_addr, d->size, to_host ? flush : GPGPU_DCACHE_CLEAN)) {
-		dma_fail(s);
-		return;
-	}
-
-	/*
-	 * 4. VRAM 端映射：D2H 时只读，H2D 时只写；Host 端读写方向
-	 *    与之相反。
-	 */
+	/* 3. Host 端范围与两端缓存行都由访存入口处理。 */
 	d->status = GPGPU_DMA_BUSY;
-	vram = gpgpu_vram_map(s, vram_addr, d->size, !to_host);
-	result = gpgpu_phys_rw(s, host_addr, vram, d->size, to_host);
-	gpgpu_vram_unmap(s, vram, d->size, !to_host);
-	if (result != MEMTX_OK) {
+	if (!gpgpu_mem_access(s, &req)) {
 		dma_fail(s);
 		return;
 	}
 
-	/* 5. 状态保持 BUSY，直到定时器回调 dma_complete() 发布 COMPLETE。 */
+	/* 4. 状态保持 BUSY，直到定时器回调 dma_complete() 发布 COMPLETE。 */
 	timer_mod(d->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DMA_COMPLETION_DELAY_MS);
 }
 

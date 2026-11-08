@@ -5,6 +5,8 @@
  * 每个会话在第一次绑定对象时建立地址空间：
  *   gpuvm=on   建立四级页表（表页从 VRAM 分配），对象绑定到应用给出的
  *              GPUVA。Host 页的叶子项写 IOVA 并置 SYSTEM，VRAM 页写 VRAM 偏移；
+ *              不可缓存对象的叶子项另置 UNCACHED，设备访问这些页时不进入
+ *              dcache；
  *   gpuvm=off  不建页表，对象的 GPU 地址就是它的 GPU 物理地址。
  *
  * 通知页由用户态创建：BO_CREATE 带 GPGPU_BO_EVENT_PAGE 时登记为会话的
@@ -273,6 +275,7 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	struct gpgpu_device *dev = fpriv->dev;
 	struct gpgpu_vm *vm = &fpriv->vm;
 	struct gpgpu_bo *bo = gpgpu_bo_lookup(fpriv, args->handle);
+	u64 flags;
 	int ret;
 
 	/* 1. 先检查 VM 状态，再检查参数。 */
@@ -307,15 +310,15 @@ int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
 	/*
 	 * 5. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
 	 *    IOVA 并置 SYSTEM，VRAM 对象写 VRAM 偏移；bo->phys_addr 仍是
-	 *    GPU 物理地址。中间级已在第 3 步建好，vm_set_ptes() 不再分配
-	 *    表页，不会失败。
+	 *    GPU 物理地址。不可缓存对象另置 UNCACHED。中间级已在第 3 步
+	 *    建好，vm_set_ptes() 不再分配表页，不会失败。
 	 */
+	flags = args->permissions | (bo->uncached ? GPGPU_VM_UNCACHED : 0);
 	if (bo->kind == GPGPU_MEMORY_HOST)
 		vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
-			    GPGPU_VM_SYSTEM | args->permissions);
+			    GPGPU_VM_SYSTEM | flags);
 	else
-		vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
-			    args->permissions);
+		vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr, flags);
 	return vm_invalidate_range(dev, vm, bo->gpu_addr, bo->mapped_size);
 }
 

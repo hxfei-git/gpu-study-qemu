@@ -50,6 +50,7 @@
 | BO | Buffer Object | 持有固定存储的缓冲对象 |
 | GPUVM / GPUVA | GPU Virtual Memory / GPU Virtual Address | GPU 虚拟内存／GPU 虚拟地址 |
 | dcache | Data Cache | 数据缓存；本实验指翻译后的设备级数据缓存 |
+| WB | Write-Back | 写回；本实验指页属性允许进入 dcache 的访问类型 |
 | VM | Virtual Memory | 本文指一个文件持有的 GPU 地址空间 |
 | TLB | Translation Lookaside Buffer | 地址翻译缓存 |
 | VPN | Virtual Page Number | 虚拟页号，即 GPUVA 除以 4 KiB |
@@ -84,7 +85,7 @@ hw/gpgpu/ + firmware/       QEMU 设备模型与 RV64 CP 固件
 - `gpgpu.c` 负责 QOM/PCI 组装、全局寄存器和复位顺序；`bar0.c` 把 BAR0 每个 0x100 字节的寄存器组挂成独立子区域，统一检查访问宽度，并提供 CP 本地寄存器窗口。
 - `cp/`：`cp_ctrl` 管理原生 CP 的复位与启动，`cp_window` 是 CP 访问 GPU 地址的 64 KiB 窗口，另有 `hqd` 与 `doorbell`。
 - `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv64` 是解释器，`lane_mem` 负责取指与 4／8 字节访存。
-- `mem/`：`vram`、`phys`（GPU 物理地址到 VRAM 或 Outbound 的路由）、`gpuvm`（用户地址翻译与故障记录）、`dcache`（翻译后的数据读写缓存与维护命令，行为见 [dcache 规格](<../../docs/dcache 第一版规格.md>)）、`dma`。
+- `mem/`：`access`（设备内全部 GPU 业务访存的入口，按访问类型经过或绕过 dcache）、`vram`、`phys`（GPU 物理地址到 VRAM 或 Outbound 的路由）、`gpuvm`（用户地址翻译、页缓存属性与故障记录）、`dcache`（WB 数据读写的缓存与维护命令，行为见 [dcache 规格](<../../docs/dcache 第一版规格.md>)）、`dma`。直接读写后备存储的函数只在 `mem/backend.h` 中声明，其他模块经 `access.h` 访问。
 - `irq/`：`irq` 是中断锁存与 PCI 通知，`ih` 是通知记录 Ring。
 
 CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` 负责取包与回收，`mgmt.c` 处理管理命令，`aql.c` 处理派发包，`ih.c` 负责通知与错误，`mem.c` 经访存窗口读写 GPU 地址并恢复访存异常。
@@ -108,11 +109,12 @@ Host 指 ARM64 Linux 客体中的 CPU 与应用。应用通过 DRM render node �
   → 排空并卸载 Queue → 销毁事件 → 解绑并释放对象
 
 CP 用户访问 / RV64 取指与数据访问
-  ├─ gpuvm=on：GPUVA → 页表与权限检查 → GPU 物理地址
-  └─ gpuvm=off：输入就是 GPU 物理地址
+  ├─ gpuvm=on：GPUVA → 页表与权限检查 → GPU 物理地址 + 页属性
+  └─ gpuvm=off：输入就是 GPU 物理地址，属性为 DEVICE
                       ↓
-                按访问类型分流
-                  ├─ 数据读写 → dcache，未命中或不可缓存时向下访问
+                访存入口，按访问类型分流
+                  ├─ WB 数据读写 → dcache，未命中时向下回填
+                  ├─ DEVICE 数据读写 → 先处理重叠的缓存行，再向下访问
                   └─ 取指，直接向下访问
                       ↓
                 公共物理访问入口
@@ -120,7 +122,7 @@ CP 用户访问 / RV64 取指与数据访问
                   └─ Outbound → Host IOVA → PCIe DMA
 ```
 
-数据读写在权限检查之后经过设备共用的 dcache，VRAM 与 Host 数据都可以缓存；取指、页表遍历、CP 管理域、DMA 与 IH 直接使用公共物理入口。Ring、进度、Signal、通知页和驱动的控制对象登记为不可缓存；CPU 直接改写可缓存对象后，要先失效设备中的旧副本再发布任务。缓存行为与交接顺序见 [dcache 规格](<../../docs/dcache 第一版规格.md>)。
+GPUVM 开启时，叶子项没有标为不可缓存的页按 WB 访问，数据读写在权限检查之后经过设备共用的 dcache，VRAM 与 Host 数据都可以缓存；GPUVM 关闭时数据访问都不进入 dcache。取指不经过 dcache；页表遍历、CP 管理域、BAR2、DMA 与 IH 按 DEVICE 访问。Ring、进度、Signal 和通知页是不可缓存对象，驱动的控制对象只经管理域和 IH 访问；CPU 直接改写可缓存对象后，要先失效设备中的旧副本再发布任务。缓存行为与交接顺序见 [dcache 规格](<../../docs/dcache 第一版规格.md>)。
 
 **[DESIGN]** GPU 物理地址为 32 位，布局固定：`[0, vram_size)` 属于 VRAM，`[vram_size, 0x8000_0000)` 是不可路由的空洞，`[0x8000_0000, 0x1_0000_0000)` 属于 Outbound。窗口起点与 VRAM 容量无关，长度为 2 GiB。Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0xc100_0000`；IOVA 0 对应 `0x8000_0000`，允许正常使用。
 
@@ -132,7 +134,7 @@ Outbound 只决定访问路由。Host 存储或 IOMMU 映射不存在时访问�
 
 ## 2. GPUVM、对象绑定与资源回收
 
-GPUVM 开启时使用 48 位 GPUVA、四级 4 KiB 页表、两个用户 VMID 和 64 组 × 4 路的组相联 TLB。VMID 在建队列时取得、队列卸载后归还；驱动取得和归还 VMID 时失效整个 VMID，占有 VMID 期间绑定或解绑对象只失效该对象的 VPN 范围，设备同步完成并以 ACK 确认。PTE 保存地址域、SYSTEM 位和有效、读、写、执行权限：Host 页写 IOVA 并置 SYSTEM，设备换算为 `0x8000_0000 + IOVA`；VRAM 页写 VRAM 偏移。根目录使用 GPU 物理地址，驱动的中间表页都在 VRAM，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
+GPUVM 开启时使用 48 位 GPUVA、四级 4 KiB 页表、两个用户 VMID 和 64 组 × 4 路的组相联 TLB。VMID 在建队列时取得、队列卸载后归还；驱动取得和归还 VMID 时失效整个 VMID，占有 VMID 期间绑定或解绑对象只失效该对象的 VPN 范围，设备同步完成并以 ACK 确认。PTE 保存地址域、SYSTEM 位、缓存属性 UNCACHED 和有效、读、写、执行权限：Host 页写 IOVA 并置 SYSTEM，设备换算为 `0x8000_0000 + IOVA`；VRAM 页写 VRAM 偏移。根目录使用 GPU 物理地址，驱动的中间表页都在 VRAM，遍历通过公共物理入口读取，不再次进入 GPUVM 翻译。
 
 用户 GPUVA 的唯一可分配区间为 `[0x1000, 0x1_0000_0000_0000)`。用户库先用 `mmap(PROT_NONE)` 预留一段对齐的 CPU 地址，把对象经 render node 映射到这里，再以同一数值 MAP，所以对象的 GPUVA 就是它在本进程中的 CPU 地址。Host 对象的这段地址可读写，就是公开的 `cpu`；VRAM 对象的这段地址只占位，CPU 访问会触发段错误，`cpu` 为 NULL。释放时先 UNMAP，成功后才解除 CPU 映射。
 
@@ -176,7 +178,7 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 ## 4. 公共库与三个计算示例
 
-`GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。`flags` 为 `GPGPU_BO_UNCACHED` 时对象不进入 dcache，运行时用它创建 Ring、进度对象和 Signal；参数块、暂存区和计算数组使用可缓存对象。参数块每项 8 字节，`gpgpu_rt_dispatch()` 接收 `uint64_t` 数组，对象的 `gpu_address` 原样写入，不截断；写完参数后先用 `gpgpuKmtSyncMemory()` 失效参数块在设备中的旧副本，再发布包。
+`GpgpuKmtMemory` 由库分配，调用者只读其中的 CPU 映射 `cpu` 和唯一的设备地址 `gpu_address`，不需要区分 Host 地址、VRAM 偏移或 GPUVA。`gpgpuKmtAllocMemory()` 先创建整对象再绑定，权限由调用者指定：代码为读与执行，普通数据为读写。`flags` 为 `GPGPU_BO_UNCACHED` 时对象按不可缓存绑定，不进入 dcache，运行时用它创建 Ring、进度对象和 Signal；参数块、暂存区和计算数组使用可缓存对象。参数块每项 8 字节，`gpgpu_rt_dispatch()` 接收 `uint64_t` 数组，对象的 `gpu_address` 原样写入，不截断；写完参数后先用 `gpgpuKmtSyncMemory()` 失效参数块在设备中的旧副本，再发布包。
 
 KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` 和 `gpgpuKmtDrainQueue()` 分别负责槽位预留、Header 与 Doorbell 发布、Signal 与事件等待、排空。运行时 `gpgpu_rt_dispatch()` 按顺序调用它们完成一次派发。默认等待先主动检查约 200 μs，再进入事件等待，唤醒后复查 Signal。
 
@@ -244,22 +246,25 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-**dcache 第一版与协议版本 6 的验证。** 本轮在提交 `ae60174` 加未提交改动的代码上运行，命令与日志归档在 `build/gpgpu-validation/dcache-review/`，不会被下一次运行覆盖：
+**统一访存入口与页缓存属性的验证。** 本轮在提交 `18504d0` 加未提交改动的代码上运行，命令与日志归档在 `build/gpgpu-validation/unified-mem-access/`，不会被下一次运行覆盖：
 
-- `make -f Makefile.gpgpu build` 后运行 `test-gpgpu-qtest`：寄存器 QTest 7/7，CP QTest 12/12。dcache 相关用例各查一件事：
-  - `/gpgpu/regs/dcache-commands`：维护命令与不可缓存区间的登记规则；
+- `make -f Makefile.gpgpu build` 后运行 `test-gpgpu-qtest`：寄存器 QTest 7/7，CP QTest 12/12。GPUVM 开启的 CP 用例把 Ring、进度、参数和 Signal 映射为 UNCACHED 页，缓存专项用例走 WB 映射。与缓存属性相关的用例各查一件事：
+  - `/gpgpu/regs/dcache-commands`：维护命令的编码规则；
+  - `/gpgpu/cp/dispatch`：GPUVM 关闭时完成派发，dcache 的命中与未命中计数不变；
+  - `/gpgpu/cp/gpuvm-system`：中间项带 UNCACHED 报页表错误；
   - `/gpgpu/cp/gpuvm-cached-permission`：已缓存的行不能绕过只读权限；
-  - `/gpgpu/cp/dcache-shared-line`：CP 与执行器共用同一物理行，期望的未命中与回写次数由行大小推导；
-  - `/gpgpu/cp/dcache-partial-write`：Host 可缓存数据的部分写不改变同一行的其余字节；
-  - `/gpgpu/cp/dcache-invalidate`：CPU 改写参数并失效后，执行器读到新值；
-  - `/gpgpu/cp/dcache-bar-write`：BAR 写入使已缓存的描述对象行失效。
-- `make -C software/gpgpu all check` 构建用户库、示例和 Kernel，教学汇编器 7/7。驱动以宿主机交叉编译器、`W=1` 编译，无警告。Linux `checkpatch.pl` 对已跟踪文件的 C 代码差异与 `dcache.c` 报 0 errors、0 warnings，`dcache.h` 只有沿用 QEMU 设备写法的 typedef 警告；`kernel-doc -none` 通过。
-- Linux 全栈 GPUVM 开、关都输出 `GPGPU DRM ABI=6`，完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003；客体退出码为 0，内核日志检查通过。生命周期示例在第二次派发前改写 X 并重新上传，第二次结果按新输入比较。两种模式的组件 SHA-256 相同：固件 `33db7c502a168326de0313580169c8143a6bb944f855de6a80ef70bca4017472`，模块 `40151b1bcce59beea2da36d6c86ab103a48cec23a11cf8378a2369974b162450`，示例 `01d7b9e7ce7a55b094199a6e9fb015faada78ea7f02d94a0c3e693e1c9f8ffa8`。
-- 一次性变异核对：BAR2 写入只回写不失效、固件收尾不回写、用例中 CPU 改写参数后不失效、数据访问绕过缓存，分别使 `dcache-bar-write`、`dcache-partial-write`、`dcache-invalidate`、`dcache-shared-line` 失败；恢复源码重建后通过。
+  - `/gpgpu/cp/dcache-shared-line`：CP 与执行器经 WB 页共用同一物理行，期望的未命中与回写次数由行大小推导；
+  - `/gpgpu/cp/dcache-partial-write`：WB Host 页上的部分写不改变同一行的其余字节；
+  - `/gpgpu/cp/dcache-invalidate`：CPU 改写 WB 页上的参数并失效后，执行器读到新值；
+  - `/gpgpu/cp/dcache-bar-write`：BAR 写入按 DEVICE 处理，使已缓存的描述对象行失效。
+- `make -C software/gpgpu all check` 构建用户库、示例和 Kernel，教学汇编器 7/7。驱动以宿主机交叉编译器、`W=1` 编译，无警告。Linux `checkpatch.pl` 对已跟踪文件的 C 代码差异报 0 errors、0 warnings；新文件中 `access.c` 无告警，`access.h` 只有沿用 QEMU 设备写法的 typedef 警告，`backend.h` 有一条 `GPGPUState *s` 的空格误报，与现有 `hw/gpgpu/gpgpu.h` 第 46 行相同；`kernel-doc -none` 通过。
+- Linux 全栈 GPUVM 开、关都输出 `GPGPU DRM ABI=6`，完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003；客体退出码为 0，内核日志检查通过。两种模式的组件 SHA-256 相同：固件 `33db7c502a168326de0313580169c8143a6bb944f855de6a80ef70bca4017472`，模块 `a837205edde50002a14190eddaf5b3b4701c2a5ec83262af0ed3ca5ad7fb90e6`，示例 `02122d7a1f6ce806cdac60a0c151fce84bc3f1b48f6fbc3a95495542cfa56eb4`。
+- 一次性变异核对：GPUVM 关闭时的用户访问改用 WB、DEVICE 访问前不处理重叠行，分别使 `dispatch`、`dcache-bar-write` 失败；恢复源码重建后通过。
+- 一次性定向核对释放时的存储保留：在 GPUVM 关闭的全栈环境中，用临时驱动让下一次“回写并失效”命令按失败返回，VRAM 与 Host 各核对一页。正常释放后再分配，两类存储都拿回同一页（VRAM `0x1000`，Host `0xc3e5_c000`）；维护失败后这一页被保留，再分配分别得到 `0x3000` 与 `0xc3ba_1000`，内核日志各有一条保留记录。随后卸载驱动，设备释放时归还了保留的 Host 存储；客体内核的 `gpu_buddy_fini()` 遇到未归还的块会触发 `WARN_ON`，内核日志检查通过，说明保留的 VRAM 块也随分配器归还。临时驱动和测试程序只放在本轮记录的 `directed/` 下，不纳入仓库。
 
-> **[SOURCE]** 本地运行记录：[命令与边界](../../build/gpgpu-validation/dcache-review/commands.txt)、[QTest 输出](../../build/gpgpu-validation/dcache-review/qtest.log)、[用户态构建与汇编器](../../build/gpgpu-validation/dcache-review/userspace-build-check.log)、[驱动额外警告编译](../../build/gpgpu-validation/dcache-review/module-w1.log)、[风格检查](../../build/gpgpu-validation/dcache-review/style.log)、[全栈输出](../../build/gpgpu-validation/dcache-review/stack.log)、[两种模式汇总](../../build/gpgpu-validation/dcache-review/core/summary.json)、[变异核对](../../build/gpgpu-validation/dcache-review/mutations.log)。
+> **[SOURCE]** 本地运行记录：[命令、变异核对与边界](../../build/gpgpu-validation/unified-mem-access/commands.txt)、[QTest 输出](../../build/gpgpu-validation/unified-mem-access/qtest.log)、[用户态构建与汇编器](../../build/gpgpu-validation/unified-mem-access/userspace-build-check.log)、[驱动额外警告编译](../../build/gpgpu-validation/unified-mem-access/module-w1.log)、[风格检查](../../build/gpgpu-validation/unified-mem-access/style.log)、[全栈输出](../../build/gpgpu-validation/unified-mem-access/stack.log)、[两种模式汇总](../../build/gpgpu-validation/unified-mem-access/core/summary.json)、[定向核对输出](../../build/gpgpu-validation/unified-mem-access/directed/run.log)。上一轮 dcache 第一版的记录保留在 `build/gpgpu-validation/dcache-review/`。
 
-**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在沙箱外运行。本轮全栈使用 IOMMU=none，没有运行 SMMUv3、基础环境引导回归和下列失败路径核对。回写失败、只失效时遇到脏行和不可缓存区间表满没有专门用例，也没有注入后备存储故障，所以冷复位丢弃脏行、驱动记录 `DCACHE_FAULT` 两条路径没有运行验证；设备移除后释放对象时保留存储的路径也没有运行验证。
+**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在沙箱外运行。本轮全栈使用 IOMMU=none，没有运行 SMMUv3、基础环境引导回归和下列失败路径核对。回写失败和只失效时遇到脏行没有专门用例，也没有注入后备存储故障，所以冷复位丢弃脏行、驱动记录 `DCACHE_FAULT` 两条路径没有运行验证。释放存储时的保留由定向核对在驱动侧模拟维护失败验证，设备没有真正回写失败；设备移除后、确认停止前释放存储的保留路径也没有运行验证。
 
 以下两组记录在协议版本 5 时取得，本轮没有重跑，保留作对照。
 

@@ -152,7 +152,7 @@ Host 对象解绑后，CPU mmap 仍能保活其存储；VRAM 的 `PROT_NONE` mma
 > - 对象关系、引用与锁顺序：[gpgpu_drv.h](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drv.h:17:1) [第 17～29 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drv.h:17:1)、[第 108～124 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drv.h:108:1)、[第 206～214 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drv.h:206:1)；
 > - ioctl 的外层串行化与内层对象锁：[gpgpu_drm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drm.c:122:1) [第 122～147 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drm.c:122:1)、[第 213～225 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drm.c:213:1)；
 > - 句柄关闭时检查绑定和使用计数、创建句柄时取得临时引用：[gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:71:1) [第 71～82 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:71:1)、[第 236～258 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:236:1)；
-> - 通知页登记期间取得一个使用计数：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:522:1) [第 522～539 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:522:1)。
+> - 通知页登记期间取得一个使用计数：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:525:1) [第 525～542 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:525:1)。
 
 **AMDGPU。** AMDGPU 把存储和映射分开得更细。`amdgpu_bo` 内嵌 TTM 的 `ttm_buffer_object`，TTM 对象再内嵌 GEM 对象；GEM 管对象寿命与用户接口，TTM 管当前存储位置以及搬移。BO 记录首选域、允许域（VRAM、GTT 等）和 placement（放置约束），因此可以在允许的域之间迁移。
 
@@ -310,72 +310,73 @@ MAP(X, address = 0x0000_ffff_8a40_0000, perms = R | W)
 
 表页分配放在绑定登记之前，因此根表或中间表空间不足都属于确定失败：本次对象未绑定，也没有写入它的叶子 PTE，`vm->failed` 保持不变。首次根表分配失败时 `ready` 仍为 false，下次 MAP 可以重试；中间路径分配失败时，已建立的空表页留在 `vm->tables` 中复用，寿命见第 7 节。只有登记绑定、写入 PTE 之后无法确认失效结果，才保留绑定并把 VM 置为 failed。
 
-> **[SOURCE]** 本仓库 `ec9a9c0`：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:271:1) [第 271～320 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:271:1)，完整的 MAP 入口，包含准备表路径、登记引用、写 PTE 和失效的先后顺序。
+> **[SOURCE]** 本仓库当前源码（协议版本 6）：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:273:1) [第 273～323 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:273:1)，完整的 MAP 入口，包含准备表路径、登记引用、写 PTE 和失效的先后顺序。
 
 ```c
-271	int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
-272	{
-273		struct gpgpu_device *dev = fpriv->dev;
-274		struct gpgpu_vm *vm = &fpriv->vm;
-275		struct gpgpu_bo *bo = gpgpu_bo_lookup(fpriv, args->handle);
-276		int ret;
-277
-278		/* 1. 先检查 VM 状态，再检查参数。 */
-279		if (vm->failed)
-280			return -EBUSY;
-281		ret = map_args_valid(fpriv, bo, args);
-282		if (ret)
-283			return ret;
-284
-285		/* 2. 首次绑定时建立地址空间，gpuvm=on 时分配根表。 */
-286		ret = vm_init(dev, vm);
-287		if (ret)
-288			return ret;
-289
-290		/* 3. 绑定前分配全部表页，失败时不留下这个对象的任何叶子项。 */
-291		if (dev->gpuvm) {
-292			ret = vm_prepare_tables(dev, vm, args->address, bo->mapped_size);
-293			if (ret)
-294				return ret;
-295		}
-296
-297		/* 4. 绑定引用让对象在句柄关闭后继续存活。 */
-298		bo->gpu_addr = dev->gpuvm ? args->address : bo->phys_addr;
-299		bo->permissions = args->permissions;
-300		bo->bound = true;
-301		drm_gem_object_get(&bo->gem);
-302		args->address = bo->gpu_addr;
-303
-304		if (!dev->gpuvm)
-305			return 0;
+273	int gpgpu_vm_map(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_map *args)
+274	{
+275		struct gpgpu_device *dev = fpriv->dev;
+276		struct gpgpu_vm *vm = &fpriv->vm;
+277		struct gpgpu_bo *bo = gpgpu_bo_lookup(fpriv, args->handle);
+278		u64 flags;
+279		int ret;
+280
+281		/* 1. 先检查 VM 状态，再检查参数。 */
+282		if (vm->failed)
+283			return -EBUSY;
+284		ret = map_args_valid(fpriv, bo, args);
+285		if (ret)
+286			return ret;
+287
+288		/* 2. 首次绑定时建立地址空间，gpuvm=on 时分配根表。 */
+289		ret = vm_init(dev, vm);
+290		if (ret)
+291			return ret;
+292
+293		/* 3. 绑定前分配全部表页，失败时不留下这个对象的任何叶子项。 */
+294		if (dev->gpuvm) {
+295			ret = vm_prepare_tables(dev, vm, args->address, bo->mapped_size);
+296			if (ret)
+297				return ret;
+298		}
+299
+300		/* 4. 绑定引用让对象在句柄关闭后继续存活。 */
+301		bo->gpu_addr = dev->gpuvm ? args->address : bo->phys_addr;
+302		bo->permissions = args->permissions;
+303		bo->bound = true;
+304		drm_gem_object_get(&bo->gem);
+305		args->address = bo->gpu_addr;
 306
-307		/*
-308		 * 5. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
-309		 *    IOVA 并置 SYSTEM，VRAM 对象写 VRAM 偏移；bo->phys_addr 仍是
-310		 *    GPU 物理地址。中间级已在第 3 步建好，vm_set_ptes() 不再分配
-311		 *    表页，不会失败。
-312		 */
-313		if (bo->kind == GPGPU_MEMORY_HOST)
-314			vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
-315				    GPGPU_VM_SYSTEM | args->permissions);
-316		else
-317			vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr,
-318				    args->permissions);
-319		return vm_invalidate_range(dev, vm, bo->gpu_addr, bo->mapped_size);
-320	}
+307		if (!dev->gpuvm)
+308			return 0;
+309
+310		/*
+311		 * 5. 写叶子 PTE，再失效 TLB，设备才会看到新映射。Host 对象写
+312		 *    IOVA 并置 SYSTEM，VRAM 对象写 VRAM 偏移；bo->phys_addr 仍是
+313		 *    GPU 物理地址。不可缓存对象另置 UNCACHED。中间级已在第 3 步
+314		 *    建好，vm_set_ptes() 不再分配表页，不会失败。
+315		 */
+316		flags = args->permissions | (bo->uncached ? GPGPU_VM_UNCACHED : 0);
+317		if (bo->kind == GPGPU_MEMORY_HOST)
+318			vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->host.dma,
+319				    GPGPU_VM_SYSTEM | flags);
+320		else
+321			vm_set_ptes(dev, vm, bo->gpu_addr, bo->mapped_size, bo->phys_addr, flags);
+322		return vm_invalidate_range(dev, vm, bo->gpu_addr, bo->mapped_size);
+323	}
 ```
 
 这段代码处在持有 `vm_serial` 与 `dev->lock` 的 ioctl 中，主要证明分配失败发生在绑定登记之前：
 
-- [第 278～295 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:278:1)检查状态并准备根表和全部中间表；这里返回错误时尚未修改 X 的绑定状态。
-- [第 297～305 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:297:1)登记地址、权限和绑定引用。`gpuvm=off` 在此返回固定物理地址，仍保留绑定引用。
-- [第 307～319 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:307:1)沿已存在的表路径写叶子项，不再分配表页；Host 写 IOVA 并置 SYSTEM，VRAM 写显存偏移。最后根据是否占有 VMID 完成必要的失效。
+- [第 281～298 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:281:1)检查状态并准备根表和全部中间表；这里返回错误时尚未修改 X 的绑定状态。
+- [第 300～308 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:300:1)登记地址、权限和绑定引用。`gpuvm=off` 在此返回固定物理地址，仍保留绑定引用。
+- [第 310～322 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:310:1)沿已存在的表路径写叶子项，不再分配表页；Host 写 IOVA 并置 SYSTEM，VRAM 写显存偏移，不可缓存对象另置 UNCACHED。最后根据是否占有 VMID 完成必要的失效。
 
 > **[SOURCE]** 本仓库 `ec9a9c0`：
 >
-> - 根表初始化与按 2 MiB 区段预分配路径：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:166:1) [第 166～211 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:166:1)；
-> - 四级目录遍历、叶子写入、屏障与失效确认：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:68:1) [第 68～164 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:68:1)；GPUVA 布局与 PTE 权限位：[gpgpu_vm_abi.h](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:16:1) [第 16～61 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:16:1)；
-> - 驱动校验地址和重叠：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:213:1) [第 213～251 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:213:1)；库的 CPU 选址与同址绑定：[memory.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:42:1) [第 42～70 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:42:1)、[第 127～164 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:127:1)；
+> - 根表初始化与按 2 MiB 区段预分配路径：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:168:1) [第 168～213 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:168:1)；
+> - 四级目录遍历、叶子写入、屏障与失效确认：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:70:1) [第 70～166 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:70:1)；GPUVA 布局与 PTE 权限位：[gpgpu_vm_abi.h](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:16:1) [第 16～69 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_vm_abi.h:16:1)；
+> - 驱动校验地址和重叠：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:215:1) [第 215～253 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:215:1)；库的 CPU 选址与同址绑定：[memory.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:42:1) [第 42～70 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:42:1)、[第 127～164 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:127:1)；
 > - 库将 `ENOMEM`、`ENOSPC` 作为确定失败撤销，将 `EIO`、`ETIMEDOUT` 作为结果未知保留地址：[memory.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:80:1) [第 80～88 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:80:1)、[第 155～188 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:155:1)。
 
 **AMDGPU（KFD 路径）。** libhsakmt 先在用户态选好 GPUVA，调用 `AMDKFD_IOC_ALLOC_MEMORY_OF_GPU` 时把 VA 交给 KFD；之后用 `AMDKFD_IOC_MAP_MEMORY_TO_GPU` 建立设备映射。在 libhsakmt 的同址映射路径中，CPU 地址先由 `PROT_NONE` 预留，BO 再以 `MAP_FIXED` 映射到这里；没有 HostAccess 的 VRAM 对象也可以只占地址。下面区分驱动内部的映射登记、页表更新，以及 ioctl 返回前的等待与刷新：
@@ -442,7 +443,7 @@ UNMAP 清表时不分配新表页，所以不会因表页空间不足而中途�
 
 Ring 和进度对象要等所属队列确认卸载后才能解绑；通知页要等会话清理撤销登记。COPY 不依赖用户队列，另由 `users` 和 `dma_uncertain` 阻止过早解绑。对于普通数组和参数，`users == 0` 不能替代应用的任务完成判断。
 
-> **[SOURCE]** 本仓库 `ec9a9c0`：UNMAP 的检查、清表、失效和引用释放见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1) [第 331～364 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1)；句柄关闭与最后释放见 [gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:37:1) [第 37～82 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:37:1)；库在 UNMAP 成功后才 munmap、关闭句柄，见 [memory.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:247:1) [第 247～298 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:247:1)；队列卸载确认后消费旧 IH、放下使用计数并归还 VMID，见 [gpgpu_queue.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:447:1) [第 447～456 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:447:1)。
+> **[SOURCE]** 本仓库 `ec9a9c0`：UNMAP 的检查、清表、失效和引用释放见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1) [第 334～367 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1)；句柄关闭与最后释放见 [gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:37:1) [第 37～82 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:37:1)；库在 UNMAP 成功后才 munmap、关闭句柄，见 [memory.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:247:1) [第 247～298 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/lib/kmt/memory.c:247:1)；队列卸载确认后消费旧 IH、放下使用计数并归还 VMID，见 [gpgpu_queue.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:447:1) [第 447～456 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:447:1)。
 
 **AMDGPU。** KFD 解除映射时，`queue_refcount` 非零（队列自身正在使用的对象）就返回 `-EBUSY`；否则先把映射移到待清除列表，写入无效 PTE，等页表更新的 fence。MI300X 的 9.4.3 路径满足驱动“9.4.2 及以后”的条件：在页表更新完成后再按 PASID 做 heavyweight 刷新，最后才撤销 DMA 映射。BO 若仍有未完成的 fence，TTM 会延迟删除；删除工作先等 `dma_resv` 中相关 fence 都结束，再释放资源。
 
@@ -489,7 +490,7 @@ X 及同区段其他对象全部 UNMAP
 
 空表回收的范围与重新评估条件见[大纲的空表回收边界](<./QEMU GPGPU 实验大纲.md#page-table-reclaim-extension>)。
 
-> **[SOURCE]** 本仓库 `ec9a9c0`：表页登记及保留方式见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:31:1) [第 31～65 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:31:1)；`ready` 的建立与预分配失败行为见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:166:1) [第 166～211 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:166:1)；VMID 的取得和归还见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:399:1) [第 399～453 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:399:1)；会话清理时撤销通知页登记、绑定及全部表页见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:474:1) [第 474～519 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:474:1)。
+> **[SOURCE]** 本仓库 `ec9a9c0`：表页登记及保留方式见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:33:1) [第 33～67 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:33:1)；`ready` 的建立与预分配失败行为见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:168:1) [第 168～213 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:168:1)；VMID 的取得和归还见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:402:1) [第 402～456 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:402:1)；会话清理时撤销通知页登记、绑定及全部表页见 [gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:477:1) [第 477～522 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:477:1)。
 
 **AMDGPU。** 页表 BO 按需分配。一次更新如果完整覆盖了某棵子树，例如换成大页或撤销了整段区间，这棵子树就被移入待释放列表；页表 BO 的 reservation 上挂有 TLB fence，保证存储不会在刷新完成前被释放。没有被完整覆盖的页表可能仍在使用，继续保留；整个 VM 销毁时，再释放根目录及其下的全部页表。页表 BO 本身也可以被驱逐，之后再验证并恢复。VMID 的动态绑定见[地址空间身份与队列绑定](<./第三阶段规格评审.md#review-identity>)。
 
@@ -523,9 +524,9 @@ X 及同区段其他对象全部 UNMAP
 
 > **[SOURCE]** 本仓库 `ec9a9c0`：
 >
-> - VM 失效或上下文控制未确认时保留：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:110:1) [第 110～118 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:110:1)、[第 399～453 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:399:1)；
+> - VM 失效或上下文控制未确认时保留：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:112:1) [第 112～120 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:112:1)、[第 402～456 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:402:1)；
 > - 卸载命令的未知结果、合法拒绝和已卸载结果分别处理：[gpgpu_queue.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:346:1) [第 346～460 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_queue.c:346:1)；
-> - COPY 超时及后续拒绝：[gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:371:1) [第 371～397 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:371:1)；全局未知 DMA 阻止 UNMAP 和会话清理：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1) [第 331～338 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:331:1)、[第 474～493 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:474:1)；
+> - COPY 超时及后续拒绝：[gpgpu_bo.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:371:1) [第 371～397 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_bo.c:371:1)；全局未知 DMA 阻止 UNMAP 和会话清理：[gpgpu_vm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1) [第 334～341 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:334:1)、[第 477～496 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vm.c:477:1)；
 > - 文件关闭时转为 orphan：[gpgpu_drm.c](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drm.c:91:1) [第 91～112 行](vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_drm.c:91:1)。
 
 当前 orphan 会话要等设备确认停止，才能统一回收。驱动移除路径先保持 CP 复位、等待 Outbound 无在途访问，再尝试整体复位并核对状态；如果仍不能确认停止，就继续保留设备引用和相关存储。仅仅发出复位命令或进入驱动移除路径，还不足以释放这些资源。

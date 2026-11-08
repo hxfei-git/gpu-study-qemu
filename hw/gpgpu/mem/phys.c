@@ -6,7 +6,8 @@
 #include "qemu/bitops.h"
 #include "hw/remote/vfio-user-obj.h"
 #include "hw/gpgpu/gpgpu_state.h"
-#include "dcache.h"
+#include "access.h"
+#include "backend.h"
 #include "phys.h"
 #include "vram.h"
 
@@ -25,47 +26,51 @@ bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len)
 /*
  * gpgpu_phys_rw() - 按 GPU 物理地址读写 VRAM 或 Host 内存
  *
- * CP 管理域访问、页表遍历、取指、IH 写记录、DMA 的 Host 端，以及 dcache
- * 的回填与回写都经过这里；本函数不查 dcache。GPU 物理空间低端是 VRAM，
- * 0x8000_0000 起是 Outbound 窗口，窗口内的地址对应 Host 内存；两者之间的
- * 空洞不可路由：
+ * 访存入口的旁路访问、取指、COPY 的 Host 端，以及 dcache 的回填与回写
+ * 都经过这里；本函数不查 dcache。GPU 物理空间低端是 VRAM，0x8000_0000
+ * 起是 Outbound 窗口，窗口内的地址对应 Host 内存；两者之间的空洞不可
+ * 路由：
  *
  * 1. 检查 [addr, addr + len) 完整落在 VRAM 或已使能的 Outbound 窗口内，
  *    不允许触及空洞或跨越边界；
- * 2. 增加在途访问计数。vfio-user DMA 同步等待回复，期间不释放主锁，
- *    Host 寄存器写入暂存到访问结束后才处理；计数让设备复位和 Outbound
- *    重配在访问期间被拒绝，作为这一前提的防御检查；
- * 3. VRAM 直接读写设备内部的后备 RAM；Outbound 把地址减去窗口起点、
+ * 2. VRAM 直接读写设备内部的后备 RAM；Outbound 把地址减去窗口起点、
  *    加上 Host 基址换算成 Host IOVA，再经 vfio-user DMA 读写。
- *    例：0xc100_2000 减去 0x8000_0000 得到 IOVA 0x4100_2000；
- * 4. 成功或失败都撤销计数，失败前已写入的部分保留。
+ *    例：0xc100_2000 减去 0x8000_0000 得到 IOVA 0x4100_2000。
  *
- * 使能时 host_base 为 0 且窗口为 2 GiB，换算后的 IOVA 不会溢出。
+ * 在途计数由调用者用 gpgpu_phys_begin() 覆盖整次事务，本函数不再计数。
+ * 失败前已写入的部分保留。使能时 host_base 为 0 且窗口为 2 GiB，换算
+ * 后的 IOVA 不会溢出。
  */
 MemTxResult gpgpu_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, bool is_write)
 {
 	GPGPUPhysState *p = &s->phys;
-	MemTxResult result;
+	uint64_t iova;
 
-	/* 1. 范围不可路由时直接失败，不计数。 */
+	/* 1. 范围不可路由时直接失败。 */
 	if (!gpgpu_phys_contains(s, addr, len))
 		return MEMTX_ERROR;
 
-	/* 2. 计数非零期间 gpgpu_phys_busy() 为真，直到第 4 步撤销。 */
-	p->accesses++;
+	/* 2. 按地址落在 VRAM 还是 Outbound 窗口分两条路径。 */
+	if (addr < s->vram_size)
+		return gpgpu_vram_rw(s, addr, buf, len, is_write);
+	iova = p->host_base + (addr - p->gpu_base);
+	return vfu_object_dma_rw(PCI_DEVICE(s), iova, buf, len, is_write);
+}
 
-	/* 3. 按地址落在 VRAM 还是 Outbound 窗口分两条路径。 */
-	if (addr < s->vram_size) {
-		result = gpgpu_vram_rw(s, addr, buf, len, is_write);
-	} else {
-		uint64_t iova = p->host_base + (addr - p->gpu_base);
+/*
+ * vfio-user DMA 同步等待回复，期间不释放主锁，Host 寄存器写入暂存到
+ * 事务结束后才处理。计数作为这一前提的防御检查：非零期间设备复位、
+ * Outbound 重配和维护命令都被拒绝。
+ */
+void gpgpu_phys_begin(GPGPUState *s)
+{
+	s->phys.accesses++;
+}
 
-		result = vfu_object_dma_rw(PCI_DEVICE(s), iova, buf, len, is_write);
-	}
-
-	/* 4. 只撤销计数，不回退已经写入的数据。 */
-	p->accesses--;
-	return result;
+void gpgpu_phys_end(GPGPUState *s)
+{
+	assert(s->phys.accesses);
+	s->phys.accesses--;
 }
 
 bool gpgpu_phys_busy(GPGPUState *s)
@@ -111,8 +116,8 @@ void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 	    p->accesses || !gpgpu_engines_idle(s))
 		goto invalid;
 	if (p->enabled && !value &&
-	    !gpgpu_dcache_maintain(s, p->gpu_base, p->size,
-				   GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
+	    !gpgpu_mem_sync(s, p->gpu_base, p->size,
+			    GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE, NULL))
 		goto invalid;
 	p->enabled = value;
 	p->status = GPGPU_OUTBOUND_ACK;

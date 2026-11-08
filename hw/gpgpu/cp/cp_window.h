@@ -8,8 +8,9 @@
  *
  *   CP 访问 0x8000_0000 + off
  *     → 目标地址 = 窗口基址 + off
- *     → 管理域：gpgpu_phys_rw()（GPU 物理地址）
- *       用户域：gpgpu_user_rw()（按 gpuvm 翻译或直通，故障记到配置的槽）
+ *     → 管理域：gpgpu_mem_access()（GPU 物理地址，按 DEVICE 访问）
+ *       用户域：gpgpu_user_rw()（按 gpuvm 翻译或直通，属性取自页表，
+ *               故障记到配置的槽）
  *
  * 访问失败返回 MEMTX_ERROR，CP 上表现为 access fault，由固件的陷阱处理恢复。
  */

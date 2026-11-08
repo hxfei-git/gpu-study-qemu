@@ -7,8 +7,8 @@
 #include "qemu/host-utils.h"
 #include "hw/gpgpu/gpgpu_state.h"
 #include "hw/gpgpu/cp/hqd.h"
+#include "access.h"
 #include "gpuvm.h"
-#include "dcache.h"
 #include "phys.h"
 
 /* 每个页表项的字节数。 */
@@ -132,17 +132,17 @@ static uint32_t vm_entry_page(GPGPUState *s, uint64_t entry, uint64_t *phys)
  *    再按 GPU 物理地址读出 table + 索引 × 8 处的表项。表页本身不经过
  *    用户翻译，否则会递归查表。读不到记 TABLE 故障；
  * 3. VALID 为 0 说明这段地址没有映射，记 UNMAPPED 故障；
- * 4. 表项带有本级不允许的位（中间项带权限位，或任一级带保留位）
- *    说明页表内容损坏，记 TABLE 故障；
+ * 4. 表项带有本级不允许的位（中间项带权限位或 UNCACHED，或任一级带
+ *    保留位）说明页表内容损坏，记 TABLE 故障；
  * 5. 按 SYSTEM 把地址域换算成 GPU 物理页，作为下一级表页；到 L3 时它是
- *    数据页，换算后连同权限交给调用者。地址域与 SYSTEM 不符记 TABLE
- *    故障。
+ *    数据页，换算后连同权限和缓存属性交给调用者。地址域与 SYSTEM 不符
+ *    记 TABLE 故障。
  *
  * 函数只读页表，不检查本次访问的 R/W/X 权限，也不写 TLB，这两件事由
  * vm_translated_rw() 和 vm_lookup() 完成。
  *
- * *pte 写入解析后的叶子：GPU 物理页 | VALID | 权限，地址位已是 GPU
- * 物理地址，不再带 SYSTEM。
+ * *pte 写入解析后的叶子：GPU 物理页 | VALID | UNCACHED | 权限，地址位
+ * 已是 GPU 物理地址，不再带 SYSTEM。
  *
  * Return: 0 表示成功并写入 *pte，否则为 GPGPU_VM_FAULT_TABLE 或
  * GPGPU_VM_FAULT_UNMAPPED。
@@ -156,16 +156,26 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte
 		bool leaf = level == GPGPU_VM_LEVELS - 1;
 		/* 1. 依次取 va[47:39]、va[38:30]、va[29:21]、va[20:12]。 */
 		uint32_t index = (va >> GPGPU_VM_LEVEL_SHIFT(level)) & GPGPU_VM_INDEX_MASK;
-		/* 本级允许的位：中间项为地址、VALID、SYSTEM，叶子加 R/W/X。 */
+		/*
+		 * 本级允许的位：中间项为地址、VALID、SYSTEM，
+		 * 叶子另加 UNCACHED 与 R/W/X。
+		 */
 		uint64_t allowed = GPGPU_VM_ADDR_MASK |
 				   (leaf ? GPGPU_VM_FLAGS : GPGPU_VM_DIR_FLAGS);
 		uint8_t raw[VM_PTE_SIZE];
+		const GPGPUMemRequest req = {
+			.client = GPGPU_MEM_PTW,
+			.op = GPGPU_MEM_READ,
+			.type = GPGPU_MEM_DEVICE,
+			.addr = table + index * VM_PTE_SIZE,
+			.len = sizeof(raw),
+			.buf = raw,
+		};
 		uint64_t entry;
 		uint32_t reason;
 
-		/* 2. 表页必须是用户可见的物理页，读出本级第 index 项。 */
-		if (!vm_page_valid(s, table) ||
-		    gpgpu_phys_rw(s, table + index * VM_PTE_SIZE, raw, sizeof(raw), false) != MEMTX_OK)
+		/* 2. 表页必须是用户可见的物理页，按 DEVICE 读出第 index 项。 */
+		if (!vm_page_valid(s, table) || !gpgpu_mem_access(s, &req))
 			return GPGPU_VM_FAULT_TABLE;
 		entry = ldq_le_p(raw);
 
@@ -177,8 +187,8 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte
 			return GPGPU_VM_FAULT_UNMAPPED;
 
 		/*
-		 * 4. 表项带有本级不允许的位：中间项带了 R/W/X，
-		 *    或任一级带了地址以外的高位、保留位（含 bit 2）。
+		 * 4. 表项带有本级不允许的位：中间项带了 R/W/X 或 UNCACHED，
+		 *    或任一级带了地址以外的高位、保留位。
 		 *    驱动不会写出这样的项，视为页表损坏。
 		 */
 		if (entry & ~allowed)
@@ -186,13 +196,14 @@ static uint32_t vm_walk(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte
 
 		/*
 		 * 5. 中间级：换算出下一级表页，下一轮循环读取它。
-		 *    叶子级：换算出目标数据页，连同权限返回。
+		 *    叶子级：换算出目标数据页，连同权限和缓存属性返回。
 		 */
 		reason = vm_entry_page(s, entry, &table);
 		if (reason)
 			return reason;
 		if (leaf)
-			*pte = table | GPGPU_VM_VALID | (entry & GPGPU_VM_PERMS);
+			*pte = table | GPGPU_VM_VALID |
+			       (entry & (GPGPU_VM_UNCACHED | GPGPU_VM_PERMS));
 	}
 	return 0;
 }
@@ -211,7 +222,7 @@ static void tlb_touch(GPGPUVMTlbSet *set, uint8_t way)
 /*
  * 把一次成功遍历的结果填入本组：优先用编号最小的无效路，
  * 四路都有效时替换 order[3] 记录的 LRU 路并计一次 EVICTIONS。
- * 新项成为 MRU。
+ * 缓存属性与权限分开保存，新项成为 MRU。
  */
 static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint64_t vpn,
 		     uint64_t pte)
@@ -231,6 +242,7 @@ static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint64
 		.vpn = vpn,
 		.vmid = vmid,
 		.perms = pte & GPGPU_VM_PERMS,
+		.uncached = pte & GPGPU_VM_UNCACHED,
 		.valid = true,
 	};
 	tlb_touch(set, way);
@@ -250,15 +262,15 @@ static void tlb_fill(GPGPUVMState *vm, GPGPUVMTlbSet *set, uint32_t vmid, uint64
  * va = 0x0040_2000 的 VPN 为 0x402，也落在第 2 组，两者占用同组的不同路。
  *
  * 1. 在本组各路中找 VMID 与 VPN 都相同的有效项；命中时 HITS 加 1，该路
- *    成为 MRU，返回保存的物理页与权限；
+ *    成为 MRU，返回保存的物理页、权限与缓存属性；
  * 2. 未命中时 MISSES 加 1，遍历页表；
  * 3. 只缓存成功的翻译：故障不进 TLB，下次访问会重新遍历。
  *
  * Host 修改页表后必须经 VM_INV_REQ 失效受影响的项，否则设备会继续使用
  * 旧翻译。
  *
- * Return: 0 并写入 *pte（GPU 物理页 | VALID | 权限），或 vm_walk() 返回的
- * 故障原因。
+ * Return: 0 并写入 *pte（GPU 物理页 | VALID | UNCACHED | 权限），或
+ * vm_walk() 返回的故障原因。
  */
 static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *pte)
 {
@@ -273,7 +285,8 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *p
 		if (e->valid && e->vmid == vmid && e->vpn == vpn) {
 			s->vm.hits++;
 			tlb_touch(set, way);
-			*pte = e->phys | GPGPU_VM_VALID | e->perms;
+			*pte = e->phys | GPGPU_VM_VALID | e->perms |
+			       (e->uncached ? GPGPU_VM_UNCACHED : 0);
 			return 0;
 		}
 	}
@@ -289,15 +302,23 @@ static uint32_t vm_lookup(GPGPUState *s, uint32_t vmid, uint64_t va, uint64_t *p
 }
 
 /*
- * 检查通过后的物理访问：读写数据经 dcache，取指直接读后备存储，
- * 不分配数据行，留给以后独立的指令缓存。
+ * 检查通过后，按访问类型和页属性生成一次物理请求；是否经过 dcache
+ * 由访存入口决定。
  */
-static MemTxResult user_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len,
-				uint32_t access)
+static bool user_phys_rw(GPGPUState *s, enum GPGPUMemClient client, uint64_t addr, void *buf,
+			 size_t len, uint32_t access, enum GPGPUMemType type)
 {
-	if (access == GPGPU_VM_EXEC)
-		return gpgpu_phys_rw(s, addr, buf, len, false);
-	return gpgpu_dcache_rw(s, addr, buf, len, access == GPGPU_VM_WRITE);
+	const GPGPUMemRequest req = {
+		.client = client,
+		.op = access == GPGPU_VM_EXEC ? GPGPU_MEM_FETCH :
+		      access == GPGPU_VM_WRITE ? GPGPU_MEM_WRITE : GPGPU_MEM_READ,
+		.type = type,
+		.addr = addr,
+		.len = len,
+		.buf = buf,
+	};
+
+	return gpgpu_mem_access(s, &req);
 }
 
 /*
@@ -313,14 +334,16 @@ static MemTxResult user_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t 
  *    vfio-user DMA 同步等待回复，期间不释放主锁，收到的 Host 寄存器写入
  *    暂存到访问结束后才处理。计数让上下文修改在访问期间被拒绝，也让
  *    vm_invalidate() 断言这一前提；
- * 3. 逐页查 TLB 或遍历页表，检查叶子项的权限位，再经 user_phys_rw()
- *    读写物理页。权限检查在前，dcache 命中也不能绕过它；
+ * 3. 逐页查 TLB 或遍历页表，检查叶子项的权限位，再按叶子项的缓存属性
+ *    经 user_phys_rw() 读写物理页：带 UNCACHED 为 DEVICE，否则为 WB。
+ *    权限检查在前，dcache 命中也不能绕过它；
  * 4. 撤销计数。失败时按 HQD 槽位记录首个故障，已完成的页不回退。
  *
  * 参数按值保存，跨进程 DMA 期间的寄存器写入不影响本次访问。
  */
-static bool vm_translated_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addr,
-			     uint8_t *buf, size_t len, uint32_t access, uint32_t phase)
+static bool vm_translated_rw(GPGPUState *s, enum GPGPUMemClient client, uint32_t vmid,
+			     uint32_t slot, uint64_t addr, uint8_t *buf, size_t len,
+			     uint32_t access, uint32_t phase)
 {
 	GPGPUVMContext *ctx;
 	uint32_t reason;
@@ -345,20 +368,22 @@ static bool vm_translated_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64
 
 	/*
 	 * 3. 每轮最多处理到当前页末尾：查得叶子 PTE，检查它是否含
-	 *    本次访问的 R/W/X 位，再按“物理页基址 + 页内偏移”访问。
-	 *    任一步失败就停在该页。
+	 *    本次访问的 R/W/X 位，再按“物理页基址 + 页内偏移”和这一页的
+	 *    缓存属性访问。任一步失败就停在该页。
 	 */
 	reason = 0;
 	while (len && !reason) {
 		uint32_t offset = addr & (GPGPU_VM_PAGE_SIZE - 1);
 		size_t chunk = MIN(len, GPGPU_VM_PAGE_SIZE - offset);
 		uint64_t pte;
+		enum GPGPUMemType type;
 
 		reason = vm_lookup(s, vmid, addr, &pte);
 		if (!reason && !(pte & access))
 			reason = GPGPU_VM_FAULT_PERMISSION;
-		if (!reason && user_phys_rw(s, (pte & GPGPU_VM_ADDR_MASK) + offset, buf, chunk,
-					    access) != MEMTX_OK)
+		type = pte & GPGPU_VM_UNCACHED ? GPGPU_MEM_DEVICE : GPGPU_MEM_WB;
+		if (!reason && !user_phys_rw(s, client, (pte & GPGPU_VM_ADDR_MASK) + offset, buf,
+					     chunk, access, type))
 			reason = GPGPU_VM_FAULT_STORAGE;
 		if (!reason) {
 			addr += chunk;
@@ -380,15 +405,19 @@ fail:
 	return false;
 }
 
-/* gpuvm=off 时的用户访问：地址即 GPU 物理地址，只检查保护区。 */
-static bool vm_direct_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addr, void *buf,
-			 size_t len, uint32_t access, uint32_t phase)
+/*
+ * gpuvm=off 时的用户访问：地址即 GPU 物理地址，只检查保护区。没有页表
+ * 给出缓存属性，数据访问一律按 DEVICE 处理，不进入 dcache。
+ */
+static bool vm_direct_rw(GPGPUState *s, enum GPGPUMemClient client, uint32_t vmid,
+			 uint32_t slot, uint64_t addr, void *buf, size_t len, uint32_t access,
+			 uint32_t phase)
 {
 	uint32_t reason = 0;
 
 	if (!user_request_valid(addr, len, access) || !user_phys_valid(s, addr, len))
 		reason = GPGPU_VM_FAULT_RANGE;
-	else if (user_phys_rw(s, addr, buf, len, access) != MEMTX_OK)
+	else if (!user_phys_rw(s, client, addr, buf, len, access, GPGPU_MEM_DEVICE))
 		reason = GPGPU_VM_FAULT_STORAGE;
 	if (!reason)
 		return true;
@@ -396,12 +425,12 @@ static bool vm_direct_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t a
 	return false;
 }
 
-bool gpgpu_user_rw(GPGPUState *s, uint32_t vmid, uint32_t slot, uint64_t addr, void *buf,
-		   size_t len, uint32_t access, uint32_t phase)
+bool gpgpu_user_rw(GPGPUState *s, enum GPGPUMemClient client, uint32_t vmid, uint32_t slot,
+		   uint64_t addr, void *buf, size_t len, uint32_t access, uint32_t phase)
 {
 	if (s->gpuvm)
-		return vm_translated_rw(s, vmid, slot, addr, buf, len, access, phase);
-	return vm_direct_rw(s, vmid, slot, addr, buf, len, access, phase);
+		return vm_translated_rw(s, client, vmid, slot, addr, buf, len, access, phase);
+	return vm_direct_rw(s, client, vmid, slot, addr, buf, len, access, phase);
 }
 
 bool gpgpu_vm_context_enabled(GPGPUState *s, unsigned int vmid)

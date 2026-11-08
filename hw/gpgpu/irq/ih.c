@@ -6,7 +6,7 @@
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
 #include "hw/gpgpu/gpgpu_state.h"
-#include "hw/gpgpu/mem/phys.h"
+#include "hw/gpgpu/mem/access.h"
 #include "hw/gpgpu/mem/vram.h"
 #include "ih.h"
 #include "irq.h"
@@ -80,9 +80,10 @@ static bool ih_record_valid(const GpgpuIhRecord *r)
  * 记录，且记录内容先于 W 对 Host 可见：
  *
  * 1. 检查通道：未锁存故障、Host 已使能、Ring 基址与容量合法；
- * 2. 检查记录位于固件私有 VRAM 且 8 字节对齐，读出后按类型核对字段；
+ * 2. 检查记录位于固件私有 VRAM 且 8 字节对齐，按 DEVICE 读出后按类型
+ *    核对字段；读不到也按记录错误处理；
  * 3. 检查 Ring 有空槽：W - R 达到容量说明 Host 还没消费，返回 FULL；
- * 4. 置 BUSY，把记录写入 Host Ring 的 W 号槽。写 Host 内存经
+ * 4. 置 BUSY，按 DEVICE 把记录写入 Host Ring 的 W 号槽。写 Host 内存经
  *    vfio-user DMA 同步等待回复，期间不释放主锁，Host 寄存器写入暂存到
  *    写完后才处理；BUSY 期间拒绝 Host 改配置或复位 IH，作为这一前提的
  *    防御检查。BUSY 由调用者在本函数返回后清除；
@@ -97,7 +98,14 @@ static uint32_t ih_submit(GPGPUState *s, uint32_t addr)
 	GPGPUIHState *ih = &s->ih;
 	GpgpuIhRecord record;
 	uint32_t capacity = ih->size / sizeof(record);
-	uint64_t slot_addr;
+	GPGPUMemRequest req = {
+		.client = GPGPU_MEM_IH,
+		.op = GPGPU_MEM_READ,
+		.type = GPGPU_MEM_DEVICE,
+		.addr = addr,
+		.len = sizeof(record),
+		.buf = &record,
+	};
 
 	/* 1. 通道已故障、未使能或配置非法。 */
 	if (ih->status & GPGPU_IH_FAULT)
@@ -108,10 +116,8 @@ static uint32_t ih_submit(GPGPUState *s, uint32_t addr)
 		return GPGPU_IH_ERR_CONFIG;
 
 	/* 2. 记录位置合法后才读取，再检查内容。 */
-	if (!ih_record_location_valid(s, addr))
-		return GPGPU_IH_ERR_RECORD;
-	gpgpu_vram_rw(s, addr, &record, sizeof(record), false);
-	if (!ih_record_valid(&record))
+	if (!ih_record_location_valid(s, addr) || !gpgpu_mem_access(s, &req) ||
+	    !ih_record_valid(&record))
 		return GPGPU_IH_ERR_RECORD;
 
 	/* 3. W、R 都是 32 位记录编号，相减回绕后仍是在途记录数。 */
@@ -119,9 +125,10 @@ static uint32_t ih_submit(GPGPUState *s, uint32_t addr)
 		return GPGPU_IH_ERR_FULL;
 
 	/* 4. W 号记录落在第 (W mod 容量) 个槽。 */
-	slot_addr = ih->base + (uint64_t)(ih->wptr % capacity) * sizeof(record);
+	req.op = GPGPU_MEM_WRITE;
+	req.addr = ih->base + (uint64_t)(ih->wptr % capacity) * sizeof(record);
 	ih->status |= GPGPU_IH_BUSY;
-	if (gpgpu_phys_rw(s, slot_addr, &record, sizeof(record), true) != MEMTX_OK)
+	if (!gpgpu_mem_access(s, &req))
 		return GPGPU_IH_ERR_DMA;
 
 	/* 5. 先发布 W，再置中断，顺序不能交换。 */

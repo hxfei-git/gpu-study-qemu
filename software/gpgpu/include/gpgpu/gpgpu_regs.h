@@ -441,27 +441,27 @@ enum GpgpuDispatchError {
 /*
  * ---- 0xc00 dcache：CP 用户数据窗口与 RV64 load/store 共用的数据缓存 ----
  *
- * 缓存按 GPU 物理地址组相联查找，写回加写分配；不可缓存区间内的访问
- * 直接读写后备存储。地址位按下面的几何参数拆分（物理地址 32 位）：
+ * 缓存按 GPU 物理地址组相联查找，写回加写分配。只有页属性为 WB 的
+ * 用户数据访问进入缓存：叶子页表项的 GPGPU_VM_UNCACHED 置位、GPUVM
+ * 关闭，或访问不经过 GPUVM 时，都按 DEVICE 直接读写后备存储。
+ * 地址位按下面的几何参数拆分（物理地址 32 位）：
  *
  *   位      31..13   12..6    5..0
  *   用途    Tag      组号     行内偏移
  *
  * 维护命令先写 ADDR、LENGTH，再写 CMD，设备同步执行后把结果写入 STATUS。
  * Host 经 BAR0、CP 经本地寄存器窗口访问同一组偏移，两方各有一份 ADDR、
- * LENGTH 与 STATUS；登记和撤销不可缓存区间只接受 Host。
+ * LENGTH 与 STATUS。
  */
 
 /* 数据容量，单位字节，不含 Tag 与替换状态。 */
 #define GPGPU_DCACHE_SIZE 32768u
-/* 缓存行字节数；不可缓存区间与维护范围都以行为单位。 */
+/* 缓存行字节数；维护范围以行为单位。 */
 #define GPGPU_DCACHE_LINE_SIZE 64u
 /* 每组路数，组内按最近最少使用替换。 */
 #define GPGPU_DCACHE_WAYS 4u
 /* 组数，组号 = (GPU 物理地址 / 行大小) % 组数。 */
 #define GPGPU_DCACHE_SETS (GPGPU_DCACHE_SIZE / GPGPU_DCACHE_LINE_SIZE / GPGPU_DCACHE_WAYS)
-/* 可同时登记的不可缓存区间数。 */
-#define GPGPU_DCACHE_UC_RANGES 64u
 
 /* 只读：可缓存请求按行查找的命中次数，32 位回绕，全设备共用。 */
 #define GPGPU_REG_DCACHE_HITS 0x0c00
@@ -488,20 +488,14 @@ enum GpgpuDispatchError {
 #define GPGPU_DCACHE_INVALIDATE (1u << 1)
 /* DCACHE_CMD：作用于整个缓存，忽略地址与长度，须同带 CLEAN 或 INVALIDATE。 */
 #define GPGPU_DCACHE_ALL (1u << 2)
-/* DCACHE_CMD：把行对齐的 [ADDR, ADDR + LENGTH) 登记为不可缓存，单独使用。 */
-#define GPGPU_DCACHE_UC_ADD (1u << 3)
-/* DCACHE_CMD：撤销与 [ADDR, ADDR + LENGTH) 完全相同的已登记区间，单独使用。 */
-#define GPGPU_DCACHE_UC_REMOVE (1u << 4)
 
 /**
- * enum GpgpuDcacheStatus - DCACHE_STATUS 的取值，依次为 0 到 5
+ * enum GpgpuDcacheStatus - DCACHE_STATUS 的取值，依次为 0 到 4
  * @GPGPU_DCACHE_OK: 复位值；最近一次命令已完成。
- * @GPGPU_DCACHE_INVALID: 命令编码、地址或长度非法，区间重叠或不存在，
- *                        或 CP 请求登记、撤销区间；没有改动任何状态。
+ * @GPGPU_DCACHE_INVALID: 命令编码、地址或长度非法；没有改动任何状态。
  * @GPGPU_DCACHE_DIRTY: 只失效时遇到脏行；之前的行已失效，该行及之后的行
  *                      保持不变。
  * @GPGPU_DCACHE_STORAGE: 回写失败；该行保持有效且脏，并锁存 DCACHE_FAULT。
- * @GPGPU_DCACHE_FULL: 不可缓存区间表已满。
  * @GPGPU_DCACHE_BUSY: 仍有在途物理访问，命令未执行。
  */
 enum GpgpuDcacheStatus {
@@ -509,7 +503,6 @@ enum GpgpuDcacheStatus {
 	GPGPU_DCACHE_INVALID,
 	GPGPU_DCACHE_DIRTY,
 	GPGPU_DCACHE_STORAGE,
-	GPGPU_DCACHE_FULL,
 	GPGPU_DCACHE_BUSY,
 };
 

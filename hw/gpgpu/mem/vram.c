@@ -5,44 +5,61 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "hw/gpgpu/gpgpu_state.h"
-#include "dcache.h"
+#include "access.h"
+#include "backend.h"
 #include "vram.h"
 
 /*
- * BAR2 读：越界锁存 VRAM_FAULT 并返回零。先回写重叠的 dcache 脏行，
- * 再读后备存储；回写失败时 dcache 已锁存 DCACHE_FAULT，同样返回零。
+ * BAR2 读：越界锁存 VRAM_FAULT 并返回零。访问按 DEVICE 处理，先回写并
+ * 失效重叠的 dcache 行，再读后备存储；回写失败时 dcache 已锁存
+ * DCACHE_FAULT，同样返回零。
  */
 static uint64_t vram_bar_read(void *opaque, hwaddr addr, unsigned int size)
 {
 	GPGPUState *s = opaque;
+	uint8_t buf[8];
+	const GPGPUMemRequest req = {
+		.client = GPGPU_MEM_BAR,
+		.op = GPGPU_MEM_READ,
+		.type = GPGPU_MEM_DEVICE,
+		.addr = addr,
+		.len = size,
+		.buf = buf,
+	};
 
 	if (!gpgpu_vram_contains(s, addr, size)) {
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return 0;
 	}
-	if (!gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN))
+	if (!gpgpu_mem_access(s, &req))
 		return 0;
-	return ldn_le_p(s->vram.ptr + addr, size);
+	return ldn_le_p(buf, size);
 }
 
 /*
- * BAR2 写：越界锁存 VRAM_FAULT。先回写并失效重叠的 dcache 行，避免旧
- * 脏行之后覆盖本次写入；回写失败时不写入。合法写入经内部地址空间，
- * 使原生 CP 已翻译的代码失效。
+ * BAR2 写：越界锁存 VRAM_FAULT。访问按 DEVICE 处理，先回写并失效重叠的
+ * dcache 行，避免旧脏行之后覆盖本次写入；回写失败时不写入。写入经内部
+ * 地址空间，使原生 CP 已翻译的代码失效。
  */
 static void vram_bar_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
 	GPGPUState *s = opaque;
 	uint8_t buf[8];
+	const GPGPUMemRequest req = {
+		.client = GPGPU_MEM_BAR,
+		.op = GPGPU_MEM_WRITE,
+		.type = GPGPU_MEM_DEVICE,
+		.addr = addr,
+		.len = size,
+		.buf = buf,
+	};
 
 	if (!gpgpu_vram_contains(s, addr, size)) {
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return;
 	}
-	if (!gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
-		return;
 	stn_le_p(buf, size, val);
-	gpgpu_vram_rw(s, addr, buf, size, true);
+	gpgpu_mem_access(s, &req);
 }
 
 static const MemoryRegionOps vram_bar_ops = {
@@ -62,7 +79,6 @@ bool gpgpu_vram_init(GPGPUState *s, Error **errp)
 	if (!memory_region_init_ram_nomigrate(&v->ram, OBJECT(s), "gpgpu-vram-ram", s->vram_size,
 					      errp))
 		return false;
-	v->ptr = memory_region_get_ram_ptr(&v->ram);
 	address_space_init(&v->as, &v->ram, "gpgpu-vram");
 
 	memory_region_init_io(&v->bar, OBJECT(s), &vram_bar_ops, s, "gpgpu-vram", s->vram_size);

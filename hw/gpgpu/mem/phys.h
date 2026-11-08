@@ -9,9 +9,10 @@
  *   [0x8000_0000, 0x1_0000_0000)  Outbound：减去 0x8000_0000 得到 Host IOVA，
  *                                 再经 PCIe DMA 访问
  *
- * CP 管理域访问、页表遍历、IH 写记录和 DMA 的 Host 端都走 gpgpu_phys_rw()；
- * 用户地址先经 mem/gpuvm.c 翻译（或直通），取指直接进入这里，数据读写
- * 经 mem/dcache.c，未命中或不可缓存时再进入这里。
+ * 业务访存都经 mem/access.c 的 gpgpu_mem_access()，按页属性经过或绕过
+ * dcache 后，再由 gpgpu_phys_rw() 按本布局路由；该函数只对 mem/ 可见，
+ * 声明在 mem/backend.h。本头文件提供路由检查、在途事务计数和窗口
+ * 寄存器。
  */
 #ifndef HW_GPGPU_MEM_PHYS_H
 #define HW_GPGPU_MEM_PHYS_H
@@ -26,8 +27,8 @@
  * @size: 窗口字节数，固定为 GPGPU_OUTBOUND_SIZE。
  * @host_base: 窗口起点对应的 Host IOVA，固定为 0。
  * @status: 最近一次配置写入的 ACK 或 ERROR。
- * @accesses: 在途物理访问数。DMA 同步等待期间不释放主锁，计数非零时
- *            仍拒绝设备复位和 Outbound 重配，作为防御检查。
+ * @accesses: 在途物理事务数。DMA 同步等待期间不释放主锁，计数非零时
+ *            仍拒绝设备复位、Outbound 重配和维护命令，作为防御检查。
  * @enabled: 窗口已使能。
  */
 typedef struct GPGPUPhysState {
@@ -52,21 +53,7 @@ typedef struct GPGPUPhysState {
  */
 bool gpgpu_phys_contains(GPGPUState *s, uint64_t addr, uint64_t len);
 
-/**
- * gpgpu_phys_rw() - 访问一段 GPU 物理地址
- * @s: 设备实例，调用者持有主锁。
- * @addr: GPU 物理地址。
- * @buf: 数据缓冲区。
- * @len: 字节数。
- * @is_write: 为 true 时写入。
- *
- * 范围不可路由或 Host 访问失败时返回错误；失败前已写入的部分保留。
- *
- * Return: 访问结果。
- */
-MemTxResult gpgpu_phys_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len, bool is_write);
-
-/* 是否仍有在途物理访问；为 true 时不能复位或重配地址空间。 */
+/* 有在途物理事务时为 true，此时不能复位、重配或维护缓存。 */
 bool gpgpu_phys_busy(GPGPUState *s);
 
 /* Outbound 寄存器组（BAR0 0xb00）。 */

@@ -19,6 +19,7 @@
 | MQD | Memory Queue Descriptor | 内存队列描述符 |
 | RV64 | 64-bit RISC-V | 64 位 RISC-V |
 | VRAM | Video RAM | 设备本地显存 |
+| WB | Write-Back | 写回；本文指页属性允许进入 dcache 的访问类型 |
 
 本文列出协议从版本 5 到版本 6 的全部差异，供核对 [dcache 规格](<../../docs/dcache 第一版规格.md>)与[硬件手册](<../../docs/GPGPU_硬件手册.html>)时使用。缓存的行为、交接顺序和设计理由只在 dcache 规格中维护，本文只列接口变化。版本 4 到版本 5 的差异见 [PROTOCOL_V5.md](./PROTOCOL_V5.md)。
 
@@ -37,7 +38,7 @@ GPGPU_PROTOCOL_VERSION = 6
 
 ## 1. 新增 dcache 寄存器组
 
-CP 用户数据窗口与 RV64 计算执行器的 load/store 经过一份设备级数据缓存：写回加写分配，普通 VRAM 和 Host 数据都可以缓存。BAR0 新增 `0x0c00` 组：
+CP 用户数据窗口与 RV64 计算执行器的 load/store 在页属性为 WB 时经过一份设备级数据缓存：写回加写分配，VRAM 页和 Host 页都可以缓存。属性来自页表叶子项，GPUVM 关闭时数据访问都不进入缓存，见第 2 节。BAR0 新增 `0x0c00` 组：
 
 ```text
 0x0c00 DCACHE_HITS         只读，命中次数
@@ -51,25 +52,27 @@ CP 用户数据窗口与 RV64 计算执行器的 load/store 经过一份设备�
 0x0c20 DCACHE_STATUS       只读，本方最近一次命令的结果
 ```
 
-`DCACHE_CMD` 的位为 `GPGPU_DCACHE_CLEAN`、`INVALIDATE`、`ALL`、`UC_ADD`、`UC_REMOVE`，结果为 `enum GpgpuDcacheStatus` 的 `OK`、`INVALID`、`DIRTY`、`STORAGE`、`FULL`、`BUSY`。几何参数 `GPGPU_DCACHE_SIZE`、`LINE_SIZE`、`WAYS`、`SETS` 与区间表容量 `GPGPU_DCACHE_UC_RANGES` 也定义在 `gpgpu_regs.h`。
+`DCACHE_CMD` 的位为 `GPGPU_DCACHE_CLEAN`、`INVALIDATE`、`ALL`，结果为 `enum GpgpuDcacheStatus` 的 `OK`、`INVALID`、`DIRTY`、`STORAGE`、`BUSY`。几何参数 `GPGPU_DCACHE_SIZE`、`LINE_SIZE`、`WAYS`、`SETS` 也定义在 `gpgpu_regs.h`。
 
-CP 的本地寄存器窗口（`gpgpu_cp_map.h` 中的 `0xfffd_0000`）新增同一组偏移。Host 和 CP 各有一份 ADDR、LENGTH 与 STATUS，统计共用；`UC_ADD`、`UC_REMOVE` 只接受 Host，CP 发出时返回 `INVALID`。
+CP 的本地寄存器窗口（`gpgpu_cp_map.h` 中的 `0xfffd_0000`）新增同一组偏移。Host 和 CP 各有一份 ADDR、LENGTH 与 STATUS，统计共用，两方可用的命令相同。
 
 `ERROR_STATUS` 新增位 5 `GPGPU_ERR_DCACHE_FAULT`：回写脏行失败时锁存，该行保持有效且脏。驱动在错误中断中记录日志并写 1 清除这一位。`GLOBAL_CTRL.RESET` 在复位各模块之前回写全部脏行，回写失败时复位失败；设备冷复位回写失败时丢弃剩余的行，继续复位。
 
-## 2. 对象的缓存属性
+## 2. 页表缓存属性与对象标志
+
+`gpgpu_vm_abi.h` 新增叶子项位 2 `GPGPU_VM_UNCACHED`。置位的页按 DEVICE 访问，不进入 dcache；清零的页按 WB 缓存。它只能出现在叶子项，目录项带它报页表错误；`MAP.permissions` 仍只接受 R/W/X。GPUVM 关闭时没有页表，数据访问都按 DEVICE 处理。
 
 `struct gpgpu_bo_create` 的 `flags` 新增 `GPGPU_BO_UNCACHED`（位 1）。带这个标志的对象整体不可缓存，属性在创建后不变：
 
 ```text
 BO_CREATE(flags = GPGPU_BO_UNCACHED)
-  → 驱动分配存储，以对象的 GPU 物理区间发 UC_ADD
-  → 登记失败时释放存储，BO_CREATE 返回错误
+  → 驱动记下对象的缓存属性
+  → MAP（GPUVM 开启时）：对象的每个叶子项都置 GPGPU_VM_UNCACHED
 ```
 
 带 `GPGPU_BO_EVENT_PAGE` 的通知页总是不可缓存，不必再加 `GPGPU_BO_UNCACHED`。`QUEUE_CREATE` 新增一项检查：Ring 与进度对象都必须不可缓存，否则返回 `-EINVAL`。Signal 由用户库放进不可缓存对象，驱动不检查。
 
-驱动内部的 KIQ、HIQ Ring 与进度页、各队列 MQD、管理结果区和 IH Ring 也都登记为不可缓存。
+驱动内部的 KIQ、HIQ Ring 与进度页、各队列 MQD、管理结果区和 IH Ring 由 CP 管理域和 IH 访问，这两条路径总按 DEVICE 处理，不需要设置属性。
 
 ## 3. CACHE_SYNC 与用户库接口
 
@@ -84,7 +87,7 @@ BO_CREATE(flags = GPGPU_BO_UNCACHED)
 0x1c u32 reserved    必须为 0
 ```
 
-驱动把对象内的范围换算成 GPU 物理地址发给设备，用户态不能维护任意物理范围。不可缓存对象直接返回成功；只失效时遇到脏行返回 `-EBUSY`，回写失败返回 `-EIO`。
+驱动把对象内的范围换算成 GPU 物理地址发给设备，用户态不能维护任意物理范围。不可缓存对象同样按范围处理，范围内没有缓存行时直接成功；只失效时遇到脏行返回 `-EBUSY`，回写失败返回 `-EIO`。
 
 用户库的接口随之变化：
 
@@ -103,15 +106,15 @@ BO_CREATE(flags = GPGPU_BO_UNCACHED)
 
 以下行为不改变接口，但改变了 Host 能观察到的时序：
 
-- BAR2 读之前回写重叠的脏行；写之前回写并失效重叠的行。维护失败时读返回 0，写被丢弃。
-- DMA 开始搬运前维护两端，失败时 `DMA_STATUS` 置 ERROR，不搬运。
+- BAR2 读写之前回写并失效重叠的行。维护失败时读返回 0，写被丢弃。
+- DMA 开始搬运前两端都回写并失效重叠的行，失败时 `DMA_STATUS` 置 ERROR，不搬运。
 - 关闭 Outbound 前回写并失效窗口内的全部行，失败时 `OUTBOUND_STATUS` 为 ERROR，窗口保持打开。
-- 驱动释放可缓存对象前对整个对象回写并失效，释放不可缓存对象前撤销登记。维护失败时存储留到设备释放时才归还。
+- 驱动归还 Host DMA 内存或 VRAM 块之前，回写并失效整段范围。维护失败，或设备已移除但还没确认停止时，存储留到设备释放时才归还。
 
 ## 6. 未改变的部分
 
 - MQD、管理命令与结果区、AQL 包、Signal、IH 记录、Kernel 描述对象的布局与字段偏移。
 - `0x0c00` 组以外的 BAR0 寄存器偏移，BAR2 与 BAR4；CP 私有地址空间中各窗口的位置。
 - 除新增 `CACHE_SYNC` 外，DRM ioctl 编号与参数结构体布局。
-- GPUVA 位宽、四级页表、页表项格式、TLB 组织与失效寄存器。
+- GPUVA 位宽、四级页表、TLB 组织与失效寄存器；页表项除叶子项位 2 外编码不变。
 - VRAM 默认 64 MiB、Outbound 固定为 `0x8000_0000` 起的 2 GiB、31 位 DMA mask。

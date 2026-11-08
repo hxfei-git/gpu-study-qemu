@@ -10,9 +10,9 @@
  *   GPU 绑定引用 ── gpgpu_vm_map() 取得，gpgpu_vm_unmap() 放下
  *   CPU mmap 引用 ── GEM 核心随 VMA 管理
  *
- * 最后一个引用放下时 bo_free() 释放存储并放下设备引用。存储释放前
- * 先处理 dcache：不可缓存对象撤销登记，其余对象回写并失效全部缓存行，
- * 这段物理地址分给新对象时不会残留旧数据。
+ * 最后一个引用放下时 bo_free() 释放存储并放下设备引用。存储由 Host DMA
+ * 内存或 VRAM 块的释放函数先回写并失效 dcache 中的旧行，不能确认时由
+ * 它们保留存储，这段物理地址分给新对象时不会残留旧数据。
  */
 #include <linux/log2.h>
 #include <linux/mm.h>
@@ -27,7 +27,7 @@ static struct gpgpu_bo *to_bo(struct drm_gem_object *obj)
 	return container_of(obj, struct gpgpu_bo, gem);
 }
 
-/* 释放存储；调用者持 dev->lock。 */
+/* 释放存储；不能确认 dcache 已处置时由存储层保留。调用者持 dev->lock。 */
 static void bo_storage_free(struct gpgpu_bo *bo)
 {
 	if (bo->kind == GPGPU_MEMORY_HOST)
@@ -36,65 +36,20 @@ static void bo_storage_free(struct gpgpu_bo *bo)
 		gpgpu_vram_free(bo->dev, &bo->vram_blocks);
 }
 
-/*
- * 释放存储前清理 dcache：不可缓存对象撤销登记，其余对象回写并失效
- * 全部行。设备移除时先清 present、后整体复位，复位会回写残留的脏行，
- * 所以移除后不再发命令，存储留到设备释放、复位确认之后再归还。
- * 调用者持 dev->lock。
- *
- * Return: 可以释放存储时为 true；设备已移除或维护失败时为 false，存储
- * 必须保留。
- */
-static bool bo_cache_release(struct gpgpu_bo *bo)
-{
-	struct gpgpu_device *dev = bo->dev;
-	u32 cmd = bo->uncached ? GPGPU_DCACHE_UC_REMOVE :
-				 GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE;
-
-	if (!dev->present)
-		return false;
-	return !gpgpu_dcache_command(dev, cmd, bo->phys_addr, bo->mapped_size);
-}
-
-/*
- * GEM 最后一个引用：释放存储，再放下 DRM 与设备引用。设备已移除或 dcache
- * 维护失败时，设备可能仍缓存这段物理地址，存储转入 dev->retained，不再
- * 分给新对象。
- */
+/* GEM 最后一个引用：交还存储，再放下 DRM 与设备引用。 */
 static void bo_free(struct drm_gem_object *obj)
 {
 	struct gpgpu_bo *bo = to_bo(obj);
 	struct gpgpu_device *dev = bo->dev;
 	struct drm_device *drm = obj->dev;
-	bool retain;
 
 	mutex_lock(&dev->lock);
 	drm_gem_object_release(obj);
-	retain = !bo_cache_release(bo);
-	if (retain) {
-		list_add_tail(&bo->node, &dev->retained);
-		if (dev->present)
-			dev_err(&dev->pdev->dev, "dcache 维护失败，保留对象存储\n");
-	} else {
-		bo_storage_free(bo);
-	}
+	bo_storage_free(bo);
 	mutex_unlock(&dev->lock);
-	if (!retain)
-		kfree(bo);
+	kfree(bo);
 	drm_dev_put(drm);
 	gpgpu_device_put(dev);
-}
-
-/* 设备释放时归还 dev->retained 中的存储；设备已停止访问，不必维护。 */
-void gpgpu_bo_release_retained(struct gpgpu_device *dev)
-{
-	struct gpgpu_bo *bo, *next;
-
-	list_for_each_entry_safe(bo, next, &dev->retained, node) {
-		bo_storage_free(bo);
-		list_del(&bo->node);
-		kfree(bo);
-	}
 }
 
 /**
@@ -223,10 +178,9 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  *    不改变任何队列能访问的地址，队列存活时也可以创建。带
  *    GPGPU_BO_EVENT_PAGE 而会话已有通知页时返回 -EEXIST；
  * 2. 分配并清零存储。带 GPGPU_BO_UNCACHED 或 GPGPU_BO_EVENT_PAGE 的对象
- *    随即把整页范围登记为不可缓存区间，登记失败时释放存储并返回
- *    错误，对象不会发布。然后初始化 GEM。对象另取 DRM 与设备引用，
- *    句柄和会话都关闭后对象仍能安全释放存储；挂入会话链表即持有列表
- *    引用。
+ *    记为不可缓存，绑定时写进叶子项。然后初始化 GEM。对象另取 DRM 与
+ *    设备引用，句柄和会话都关闭后对象仍能安全释放存储；挂入会话链表
+ *    即持有列表引用。
  *    通知页在第 4 步解锁之前登记，并发的第二个通知页请求会在第 1 步
  *    失败；
  * 3. 建立 mmap 偏移，对象之后可经 render node 映射到用户态：Host 对象
@@ -266,12 +220,6 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	INIT_LIST_HEAD(&bo->vram_blocks);
 
 	ret = bo_storage_alloc(bo, args->alignment);
-	if (!ret && bo->uncached) {
-		ret = gpgpu_dcache_command(dev, GPGPU_DCACHE_UC_ADD, bo->phys_addr,
-					   bo->mapped_size);
-		if (ret)
-			bo_storage_free(bo);
-	}
 	if (ret) {
 		kfree(bo);
 		return ret;
@@ -462,8 +410,9 @@ unlock:
  *
  * CPU 改写可缓存对象后、发布任务前失效旧副本；GPU 写出的数据在任务
  * 完成时已由 CP 回写，需要提前取得时用回写。对象存储按页对齐，不与
- * 其他对象共用缓存行，设备把范围扩展到整行也不会触及别的对象。不可
- * 缓存对象没有缓存行，直接返回 0。
+ * 其他对象共用缓存行，设备把范围扩展到整行也不会触及别的对象。缓存
+ * 属性由页表决定，驱动不据对象标志推断它没有缓存行，不可缓存对象
+ * 同样发出命令；范围内没有缓存行时设备只做查找。
  *
  * Return: 0、-EINVAL，或 gpgpu_dcache_command() 的错误；只失效时遇到脏行
  * 为 -EBUSY，说明设备仍持有未交还的数据。
@@ -476,8 +425,6 @@ int gpgpu_bo_cache_sync(struct gpgpu_fpriv *fpriv, struct gpgpu_cache_sync *args
 	if (!gpgpu_bo_range_ok(bo, args->offset, args->size) || args->reserved || !args->op ||
 	    (args->op & ~(GPGPU_CACHE_CLEAN | GPGPU_CACHE_INVALIDATE)))
 		return -EINVAL;
-	if (bo->uncached)
-		return 0;
 	if (args->op & GPGPU_CACHE_CLEAN)
 		cmd |= GPGPU_DCACHE_CLEAN;
 	if (args->op & GPGPU_CACHE_INVALIDATE)

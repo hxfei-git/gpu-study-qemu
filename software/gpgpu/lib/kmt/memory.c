@@ -95,7 +95,7 @@ static bool map_error_uncertain(int error)
  * 1. kmt_reserve_va() 申请一段对齐的 CPU 地址 va，先以 PROT_NONE 占住；
  * 2. GPGPU_DRM_BO_CREATE 创建 GEM 对象，驱动返回句柄、页对齐后的
  *    mapped_size 和 mmap 偏移；flags 带 GPGPU_BO_EVENT_PAGE 时驱动同时把它
- *    登记为会话的通知页，带它或 GPGPU_BO_UNCACHED 时对象不进入 dcache；
+ *    登记为会话的通知页，带它或 GPGPU_BO_UNCACHED 时对象按不可缓存绑定；
  * 3. 用 MAP_FIXED 把对象映射到 va，替换占位：Host 对象可读写；VRAM 对象
  *    只能是 PROT_NONE，CPU 访问这段地址会触发段错误；
  * 4. GPGPU_DRM_MAP 绑定 GPU：GPUVM 开启时 address 就是 va，GPUVA 与 CPU

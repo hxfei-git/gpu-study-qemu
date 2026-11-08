@@ -44,9 +44,9 @@
  * @doorbell: BAR4。
  * @dispatch: 执行器配置、任务与结果。
  * @vram: VRAM 存储与 BAR2。
- * @phys: Outbound 配置与在途物理访问计数。
+ * @phys: Outbound 配置与在途物理事务计数。
  * @vm: GPUVM 上下文、TLB 与故障。
- * @dcache: 数据缓存、不可缓存区间与维护命令。
+ * @dcache: 数据缓存与维护命令。
  * @dma: DMA 描述符与完成定时器。
  * @ih: IH Ring。
  * @irq: 中断使能与锁存。

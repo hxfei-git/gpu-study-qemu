@@ -36,8 +36,9 @@ typedef uint64_t gpgpu_u64;
 /* BO_CREATE 标志：对象是会话的通知页，须为一页 Host 对象，总不可缓存。 */
 #define GPGPU_BO_EVENT_PAGE (1U << 0)
 /*
- * BO_CREATE 标志：设备访问对象时绕过 dcache，供 Ring、进度、Signal 等与
- * CPU 持续共享的对象使用；创建后不能改变。
+ * BO_CREATE 标志：GPUVM 开启时，绑定写出的叶子项带不可缓存属性，设备访问
+ * 对象时绕过 dcache；供 Ring、进度、Signal 等与 CPU 持续共享的对象使用，
+ * 创建后不能改变。GPUVM 关闭时设备的数据访问都不进入 dcache。
  */
 #define GPGPU_BO_UNCACHED (1U << 1)
 /* CACHE_SYNC：回写范围内的 dcache 脏行，GPU 写出的数据随后对 CPU 可见。 */
@@ -192,7 +193,7 @@ struct gpgpu_vm_info {
  * @handle: 输出的本文件 GEM handle，不暴露设备物理地址。
  * @flags: 输入 GPGPU_BO_EVENT_PAGE 与 GPGPU_BO_UNCACHED 的组合。带前者时
  *         驱动把对象登记为会话的通知页，每个会话只能有一个，登记后
- *         不能解绑；带任一位时对象不进入 dcache。
+ *         不能解绑；带任一位时对象按不可缓存绑定，不进入 dcache。
  * @mapped_size: 输出的整页映射大小，包含已清零的尾部。
  * @mmap_offset: CPU 映射偏移。Host 对象可读写映射；VRAM 对象只能以
  *               PROT_NONE 映射，用来占住与 GPUVA 相同的 CPU 地址，内容经
@@ -256,7 +257,7 @@ struct gpgpu_vm_fault {
  * @reserved: 保留，输入必须为零。
  *
  * 设备按整条缓存行处理，对象存储按页对齐，不会触及其他对象。
- * 不可缓存对象没有缓存行，直接返回成功。
+ * 不可缓存对象同样按范围处理，范围内没有缓存行时直接成功。
  */
 struct gpgpu_cache_sync {
 	gpgpu_u32 version;
