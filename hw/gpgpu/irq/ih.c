@@ -83,8 +83,9 @@ static bool ih_record_valid(const GpgpuIhRecord *r)
  * 2. 检查记录位于固件私有 VRAM 且 8 字节对齐，读出后按类型核对字段；
  * 3. 检查 Ring 有空槽：W - R 达到容量说明 Host 还没消费，返回 FULL；
  * 4. 置 BUSY，把记录写入 Host Ring 的 W 号槽。写 Host 内存经
- *    vfio-user DMA，可能暂时释放主锁，BUSY 期间 Host 不能改配置或复位
- *    IH；BUSY 由调用者在本函数返回后清除；
+ *    vfio-user DMA 同步等待回复，期间不释放主锁，Host 寄存器写入暂存到
+ *    写完后才处理；BUSY 期间拒绝 Host 改配置或复位 IH，作为这一前提的
+ *    防御检查。BUSY 由调用者在本函数返回后清除；
  * 5. 记录写完才把 W 加 1，再锁存 IH 中断通知 Host，驱动读到新 W 时
  *    记录已经完整。设备错误记录同时锁存全局 FIRMWARE 错误。
  *

@@ -146,7 +146,9 @@ void gpgpu_ih_work(struct work_struct *work)
 /*
  * 处理 IRQ_ERROR，调用者持 irq_lock，处在中断上下文。DMA 故障只记下失败
  * 并唤醒正在等待的 COPY；IH 或固件故障标记设备故障，队列失败需要
- * dev->lock，交给 IH 工作项处理。
+ * dev->lock，交给 IH 工作项处理。dcache 回写失败已由触发它的操作各自
+ * 上报（队列 EXECUTOR 错误、DMA 失败或 ioctl 返回 -EIO），这里只记日志
+ * 并清除该位，下次失败才会再次记录。
  */
 static void irq_handle_error(struct gpgpu_device *dev)
 {
@@ -155,6 +157,11 @@ static void irq_handle_error(struct gpgpu_device *dev)
 	if (error & GPGPU_ERR_DMA_FAULT) {
 		WRITE_ONCE(dev->dma_failed, true);
 		complete(&dev->dma_done);
+	}
+	if (error & GPGPU_ERR_DCACHE_FAULT) {
+		gpgpu_wreg(dev, GPGPU_REG_ERROR_STATUS, GPGPU_ERR_DCACHE_FAULT);
+		dev_err_ratelimited(&dev->pdev->dev,
+				    "dcache 回写失败，脏行仍在设备缓存中\n");
 	}
 	if (error & (GPGPU_ERR_IH_FAULT | GPGPU_ERR_FIRMWARE)) {
 		WRITE_ONCE(dev->fatal, true);

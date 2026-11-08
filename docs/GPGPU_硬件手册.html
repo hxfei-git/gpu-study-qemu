@@ -321,7 +321,7 @@
 <li class="lesson" data-nav-item data-search-text="19.1 寄存器映射（0x0c00） DCACHE_HITS DCACHE_MISSES DCACHE_EVICTIONS DCACHE_WRITEBACKS DCACHE_ADDR_LO DCACHE_ADDR_HI DCACHE_LENGTH DCACHE_CMD DCACHE_STATUS"><a href="#dcache-register-map">19.1 寄存器映射（0x0c00）</a></li>
 <li class="lesson" data-nav-item data-search-text="19.2 维护命令与结果 CLEAN INVALIDATE ALL UC_ADD UC_REMOVE OK INVALID DIRTY STORAGE FULL BUSY"><a href="#dcache-commands">19.2 维护命令与结果</a></li>
 <li class="lesson" data-nav-item data-search-text="19.3 不可缓存区间 GPGPU_DCACHE_UC_RANGES"><a href="#dcache-uncached">19.3 不可缓存区间</a></li>
-<li class="lesson" data-nav-item data-search-text="19.4 旁路访问与复位 BAR2 DMA Outbound 整体复位 DCACHE_FAULT"><a href="#dcache-bypass">19.4 旁路访问与复位</a></li>
+<li class="lesson" data-nav-item data-search-text="19.4 旁路访问与复位 BAR2 DMA Outbound 整体复位 冷复位 DCACHE_FAULT"><a href="#dcache-bypass">19.4 旁路访问与复位</a></li>
 </ul><p class="nav-tip">正文搜索：Ctrl + F<br><a href="./%E8%AF%BE%E7%A8%8B%E8%B5%84%E6%96%99/QEMU_2026_%E5%AE%9E%E9%AA%8C.html#page-stage2--gpu">返回实验资料</a><br><a href="#source-and-license">来源与许可</a></p></aside><main class="main"><article class="lesson" id="page-stage2--gpu--gpu-datasheet" data-page-id="page-stage2--gpu--gpu-datasheet" data-page-title="GPGPU 虚拟加速器硬件手册" data-portable-saved-at="0"><div class="source-content md-typeset" spellcheck="false"><h1 id="gpgpu-虚拟加速器硬件手册">GPGPU 虚拟加速器硬件手册</h1>
 <details class="local-toc"><summary>缩写表</summary><div class="table-scroll"><table><thead><tr><th>缩写</th><th>英文全称</th><th>中文含义</th></tr></thead><tbody><tr><td>GPGPU</td><td>General-Purpose Computing on Graphics Processing Units</td><td>利用 GPU 进行通用计算</td></tr><tr class="even">
 <td>GPU</td>
@@ -1756,7 +1756,7 @@ Host IOVA 0x4100_0000 → GPU 物理地址 0xc100_0000
 <tr><td>5</td><td><code>BUSY</code></td><td>仍有物理在途访问，命令未执行。</td></tr>
 </tbody></table></div>
 <h4 id="dcache-uncached">19.3 不可缓存区间</h4>
-<p>设备保存一张不可缓存的 GPU 物理区间表，表外地址默认可以缓存。数据访问完成翻译和权限检查后按行起点查表，表内的行直接读写后备存储，GPUVM 开启和关闭时规则相同。表项数为 <code>GPGPU_DCACHE_UC_RANGES</code>。</p>
+<p>设备保存一张不可缓存的 GPU 物理区间表，表外地址默认可以缓存。数据访问完成翻译和权限检查后先在组内查找，命中就读写缓存行；未命中时才按行起点查表，表内的行直接读写后备存储，不分配缓存行，也不计命中与未命中。登记区间时设备已清掉区间内的行，所以命中的行不会落在表内。GPUVM 开启和关闭时规则相同。表项数为 <code>GPGPU_DCACHE_UC_RANGES</code>。</p>
 <p>UC_ADD 要求 ADDR 与 LENGTH 按 64 字节对齐、LENGTH 非零、区间完整落在 VRAM 或 Outbound 窗口的固定布局内，且不与已登记区间重叠。登记前设备先回写并失效区间内已缓存的行，回写失败时不登记并返回 STORAGE。UC_REMOVE 只接受与登记时完全相同的区间，区间内没有缓存行，撤销时不需要维护。整体复位清空区间表。</p>
 <h4 id="dcache-bypass">19.4 旁路访问与复位</h4>
 <p>直接读写后备存储的一方先维护重叠的缓存行：读之前回写脏行，写之前回写并失效。维护失败时不开始这次访问。</p>
@@ -1764,7 +1764,8 @@ Host IOVA 0x4100_0000 → GPU 物理地址 0xc100_0000
 <li><strong>BAR2</strong>：读失败返回 0；写失败时丢弃本次写入。成功的写入只改变请求的字节。</li>
 <li><strong>DMA</strong>：源范围回写，目的范围回写并失效；失败时 <code>DMA_STATUS</code> 置 ERROR，不拷贝。见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--94">9.4 节</a>。</li>
 <li><strong>Outbound 关闭</strong>：先回写并失效窗口内的行，见 <a href="#outbound-lifetime">18.2 节</a>。</li>
-<li><strong>整体复位</strong>：停止 CP 与执行器后回写并失效全部行，再复位各模块；回写失败时复位停止，见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--65">6.5 节</a>。</li>
+<li><strong>整体复位</strong>：停止 CP 与执行器后回写并失效全部行，再复位各模块。<code>GLOBAL_CTRL.RESET</code> 回写失败时复位停止，见 <a href="#fragment-page-stage2--gpu--gpu-datasheet--65">6.5 节</a>。</li>
+<li><strong>设备冷复位</strong>（QEMU 系统复位或 vfio-user 设备复位）：同样先回写；回写失败时丢弃剩余的行并继续复位，随后清零 VRAM。写不回去的 Host 脏行随之丢失。</li>
 </ul>
 <p>CP 单独复位、分发确认（ACK）和 TLB 失效都不清缓存、区间表或统计。CP 固件在每个任务的执行器终态之后回写全部脏行，再发布完成或错误，见<a href="#fragment-page-stage2--gpu--gpu-datasheet--11-0x2000">第 13 章</a>。</p>
 

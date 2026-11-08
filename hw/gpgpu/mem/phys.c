@@ -111,8 +111,8 @@ void gpgpu_outbound_write(GPGPUState *s, hwaddr reg, uint32_t value)
 	    p->accesses || !gpgpu_engines_idle(s))
 		goto invalid;
 	if (p->enabled && !value &&
-	    gpgpu_dcache_maintain(s, p->gpu_base, p->size,
-				  GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
+	    !gpgpu_dcache_maintain(s, p->gpu_base, p->size,
+				   GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
 		goto invalid;
 	p->enabled = value;
 	p->status = GPGPU_OUTBOUND_ACK;

@@ -20,7 +20,7 @@ static uint64_t vram_bar_read(void *opaque, hwaddr addr, unsigned int size)
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return 0;
 	}
-	if (gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN))
+	if (!gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN))
 		return 0;
 	return ldn_le_p(s->vram.ptr + addr, size);
 }
@@ -39,7 +39,7 @@ static void vram_bar_write(void *opaque, hwaddr addr, uint64_t val, unsigned int
 		gpgpu_set_error(s, GPGPU_ERR_VRAM_FAULT);
 		return;
 	}
-	if (gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
+	if (!gpgpu_dcache_maintain(s, addr, size, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE))
 		return;
 	stn_le_p(buf, size, val);
 	gpgpu_vram_rw(s, addr, buf, size, true);

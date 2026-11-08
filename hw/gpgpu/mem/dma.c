@@ -76,8 +76,8 @@ static void dma_start(GPGPUState *s, uint32_t ctrl)
 	}
 
 	/* 3. D2H 读 VRAM、写 Host；H2D 读 Host、写 VRAM。 */
-	if (gpgpu_dcache_maintain(s, vram_addr, d->size, to_host ? GPGPU_DCACHE_CLEAN : flush) ||
-	    gpgpu_dcache_maintain(s, host_addr, d->size, to_host ? flush : GPGPU_DCACHE_CLEAN)) {
+	if (!gpgpu_dcache_maintain(s, vram_addr, d->size, to_host ? GPGPU_DCACHE_CLEAN : flush) ||
+	    !gpgpu_dcache_maintain(s, host_addr, d->size, to_host ? flush : GPGPU_DCACHE_CLEAN)) {
 		dma_fail(s);
 		return;
 	}

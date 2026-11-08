@@ -71,14 +71,16 @@ bool gpgpu_gpuvm_enabled(GPGPUState *s);
 /**
  * gpgpu_reset_registers() - 停止执行并复位全部寄存器，保留 VRAM
  * @s: 设备实例。
+ * @discard: dcache 脏行回写失败时的处理。GLOBAL_CTRL.RESET 传 false，停在
+ *           CP 与执行器已停止的状态，保留未写回的数据；QOM 复位传 true，
+ *           丢弃剩余的行并继续复位。
  *
  * 由 GLOBAL_CTRL.RESET 与 QOM 复位调用。仍有跨进程物理访问在途时拒绝
- * 复位并锁存 INVALID_CMD；dcache 脏行回写失败时停在 CP 与执行器已停止
- * 的状态，保留未写回的数据。
+ * 复位并锁存 INVALID_CMD。
  *
  * Return: 已复位为 true，拒绝或中途停止为 false。
  */
-bool gpgpu_reset_registers(GPGPUState *s);
+bool gpgpu_reset_registers(GPGPUState *s, bool discard);
 
 /**
  * gpgpu_engines_idle() - 查询全部设备引擎是否停止

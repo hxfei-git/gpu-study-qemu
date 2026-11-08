@@ -100,9 +100,10 @@ MemTxResult gpgpu_dcache_rw(GPGPUState *s, uint64_t addr, void *buf, size_t len,
  * 不改变替换顺序，也不计命中与未命中。遇到第一个失败的行即停止，
  * 之前的行保持已维护的状态；回写失败时锁存 GPGPU_ERR_DCACHE_FAULT。
  *
- * Return: GPGPU_DCACHE_OK、GPGPU_DCACHE_DIRTY 或 GPGPU_DCACHE_STORAGE。
+ * Return: 范围内的行全部维护完成时为 true；只失效时遇到脏行，或回写
+ * 失败时为 false。
  */
-uint32_t gpgpu_dcache_maintain(GPGPUState *s, uint64_t addr, uint64_t len, uint32_t op);
+bool gpgpu_dcache_maintain(GPGPUState *s, uint64_t addr, uint64_t len, uint32_t op);
 
 /* dcache 寄存器组（BAR0 0xc00）的 Host 视图；只有 Host 能登记区间。 */
 uint32_t gpgpu_dcache_read(GPGPUState *s, hwaddr reg);

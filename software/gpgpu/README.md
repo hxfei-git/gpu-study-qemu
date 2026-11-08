@@ -244,16 +244,22 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
-**dcache 第一版与协议版本 6 的验证。** 本轮在提交 `ae60174` 加未提交改动的工作区上运行，命令与日志归档在 `build/gpgpu-validation/dcache-v1/`，不会被下一次运行覆盖：
+**dcache 第一版与协议版本 6 的验证。** 本轮在提交 `ae60174` 加未提交改动的代码上运行，命令与日志归档在 `build/gpgpu-validation/dcache-review/`，不会被下一次运行覆盖：
 
-- `make -f Makefile.gpgpu build` 后运行 `test-gpgpu-qtest`：寄存器 QTest 7/7，CP QTest 9/9。`/gpgpu/regs/dcache-commands` 核对维护命令与不可缓存区间的登记规则；`/gpgpu/cp/gpuvm-cached-permission` 核对已缓存的行不能绕过只读权限；`/gpgpu/cp/dcache` 核对 CP 与执行器共用同一物理行、Host 可缓存数据的部分写、CPU 改写参数后经失效读到新值，以及 BAR 写入使已缓存的描述对象行失效。
-- `make -C software/gpgpu all check` 构建用户库、示例和 Kernel，教学汇编器 7/7。驱动以宿主机交叉编译器、`W=1` 编译，无警告。Linux `checkpatch.pl` 对本轮 C 代码差异与 `dcache.c` 报 0 errors、0 warnings，`dcache.h` 只有沿用 QEMU 设备写法的 typedef 警告；`kernel-doc -none` 通过。
-- Linux 全栈 GPUVM 开、关都输出 `GPGPU DRM ABI=6`，完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003；客体退出码为 0，内核日志检查通过。生命周期示例在第二次派发前改写 X 并重新上传，第二次结果按新输入比较。两种模式的组件 SHA-256 相同：固件 `33db7c502a168326de0313580169c8143a6bb944f855de6a80ef70bca4017472`，模块 `206861363a7cc411d2ed4980c5eea372fbebd76480b25f6f3d4190f7c73631c1`，示例 `01d7b9e7ce7a55b094199a6e9fb015faada78ea7f02d94a0c3e693e1c9f8ffa8`。
-- 一次性变异核对：分别去掉 BAR2 写入前的失效、固件收尾回写、用例中 CPU 改写参数后的失效，或让数据访问绕过缓存，`/gpgpu/cp/dcache` 都失败；恢复源码重建后通过。
+- `make -f Makefile.gpgpu build` 后运行 `test-gpgpu-qtest`：寄存器 QTest 7/7，CP QTest 12/12。dcache 相关用例各查一件事：
+  - `/gpgpu/regs/dcache-commands`：维护命令与不可缓存区间的登记规则；
+  - `/gpgpu/cp/gpuvm-cached-permission`：已缓存的行不能绕过只读权限；
+  - `/gpgpu/cp/dcache-shared-line`：CP 与执行器共用同一物理行，期望的未命中与回写次数由行大小推导；
+  - `/gpgpu/cp/dcache-partial-write`：Host 可缓存数据的部分写不改变同一行的其余字节；
+  - `/gpgpu/cp/dcache-invalidate`：CPU 改写参数并失效后，执行器读到新值；
+  - `/gpgpu/cp/dcache-bar-write`：BAR 写入使已缓存的描述对象行失效。
+- `make -C software/gpgpu all check` 构建用户库、示例和 Kernel，教学汇编器 7/7。驱动以宿主机交叉编译器、`W=1` 编译，无警告。Linux `checkpatch.pl` 对已跟踪文件的 C 代码差异与 `dcache.c` 报 0 errors、0 warnings，`dcache.h` 只有沿用 QEMU 设备写法的 typedef 警告；`kernel-doc -none` 通过。
+- Linux 全栈 GPUVM 开、关都输出 `GPGPU DRM ABI=6`，完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，生命周期示例两次派发各 17,003/17,003；客体退出码为 0，内核日志检查通过。生命周期示例在第二次派发前改写 X 并重新上传，第二次结果按新输入比较。两种模式的组件 SHA-256 相同：固件 `33db7c502a168326de0313580169c8143a6bb944f855de6a80ef70bca4017472`，模块 `40151b1bcce59beea2da36d6c86ab103a48cec23a11cf8378a2369974b162450`，示例 `01d7b9e7ce7a55b094199a6e9fb015faada78ea7f02d94a0c3e693e1c9f8ffa8`。
+- 一次性变异核对：BAR2 写入只回写不失效、固件收尾不回写、用例中 CPU 改写参数后不失效、数据访问绕过缓存，分别使 `dcache-bar-write`、`dcache-partial-write`、`dcache-invalidate`、`dcache-shared-line` 失败；恢复源码重建后通过。
 
-> **[SOURCE]** 本地运行记录：[命令与边界](../../build/gpgpu-validation/dcache-v1/commands.txt)、[QTest 输出](../../build/gpgpu-validation/dcache-v1/qtest.log)、[用户态构建与汇编器](../../build/gpgpu-validation/dcache-v1/userspace-build-check.log)、[驱动额外警告编译](../../build/gpgpu-validation/dcache-v1/module-w1.log)、[全栈输出](../../build/gpgpu-validation/dcache-v1/stack.log)、[两种模式汇总](../../build/gpgpu-validation/dcache-v1/core/summary.json)。
+> **[SOURCE]** 本地运行记录：[命令与边界](../../build/gpgpu-validation/dcache-review/commands.txt)、[QTest 输出](../../build/gpgpu-validation/dcache-review/qtest.log)、[用户态构建与汇编器](../../build/gpgpu-validation/dcache-review/userspace-build-check.log)、[驱动额外警告编译](../../build/gpgpu-validation/dcache-review/module-w1.log)、[风格检查](../../build/gpgpu-validation/dcache-review/style.log)、[全栈输出](../../build/gpgpu-validation/dcache-review/stack.log)、[两种模式汇总](../../build/gpgpu-validation/dcache-review/core/summary.json)、[变异核对](../../build/gpgpu-validation/dcache-review/mutations.log)。
 
-**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在沙箱外运行。本轮全栈使用 IOMMU=none，没有运行 SMMUv3、基础环境引导回归和下列失败路径核对。回写失败、只失效时遇到脏行和不可缓存区间表满没有专门用例，也没有注入后备存储故障；设备移除后释放对象时保留存储的路径也没有运行验证。
+**[BOUNDARY]** QTest 与全栈需要创建 Unix socket，在沙箱外运行。本轮全栈使用 IOMMU=none，没有运行 SMMUv3、基础环境引导回归和下列失败路径核对。回写失败、只失效时遇到脏行和不可缓存区间表满没有专门用例，也没有注入后备存储故障，所以冷复位丢弃脏行、驱动记录 `DCACHE_FAULT` 两条路径没有运行验证；设备移除后释放对象时保留存储的路径也没有运行验证。
 
 以下两组记录在协议版本 5 时取得，本轮没有重跑，保留作对照。
 

@@ -55,7 +55,7 @@ CP 用户数据窗口与 RV64 计算执行器的 load/store 经过一份设备�
 
 CP 的本地寄存器窗口（`gpgpu_cp_map.h` 中的 `0xfffd_0000`）新增同一组偏移。Host 和 CP 各有一份 ADDR、LENGTH 与 STATUS，统计共用；`UC_ADD`、`UC_REMOVE` 只接受 Host，CP 发出时返回 `INVALID`。
 
-`ERROR_STATUS` 新增位 5 `GPGPU_ERR_DCACHE_FAULT`：回写脏行失败时锁存，该行保持有效且脏。整体复位在复位各模块之前回写全部脏行，回写失败时复位失败。
+`ERROR_STATUS` 新增位 5 `GPGPU_ERR_DCACHE_FAULT`：回写脏行失败时锁存，该行保持有效且脏。驱动在错误中断中记录日志并写 1 清除这一位。`GLOBAL_CTRL.RESET` 在复位各模块之前回写全部脏行，回写失败时复位失败；设备冷复位回写失败时丢弃剩余的行，继续复位。
 
 ## 2. 对象的缓存属性
 

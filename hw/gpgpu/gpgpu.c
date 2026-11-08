@@ -56,21 +56,26 @@ bool gpgpu_engines_idle(GPGPUState *s)
  * 关系：CP、执行器会读写 GPUVM、HQD、IH 的状态，所以先停发起方，
  * 再清被访问的状态，避免复位中途还有访问用到半清空的配置：
  *
- * 1. 有跨进程物理访问在途时拒绝复位并锁存 INVALID_CMD。这类访问
- *    经 vfio-user DMA 时可能暂时释放了主锁，返回后仍会使用当前的
- *    地址配置，此时清空会让它访问到错误位置；
+ * 1. 有跨进程物理访问在途时拒绝复位并锁存 INVALID_CMD。vfio-user DMA
+ *    同步等待回复期间不释放主锁，期间到达的 Host 请求由 libvfio-user
+ *    暂存到 DMA 返回后再处理，所以复位不会插进一次物理访问的中途。
+ *    这项检查只作防御：一旦这个前提被打破，正在使用的地址配置不会被
+ *    清空；
  * 2. 先让 CP 保持复位、停止执行器，此后不再产生新访问；
  * 3. 趁 Outbound 与后备存储仍然有效，回写并失效全部 dcache 行，
- *    已完成的写入不因复位丢失。回写失败时停止复位：未写回的数据
- *    留在缓存中，DCACHE_FAULT 保持锁存，已停止的 CP 与执行器
- *    不自动恢复；
+ *    已完成的写入不因复位丢失。回写失败时按 @discard 处理：
+ *    - false（GLOBAL_CTRL.RESET）：停止复位。未写回的数据留在缓存中，
+ *      DCACHE_FAULT 保持锁存，已停止的 CP 与执行器不自动恢复；
+ *    - true（QOM 复位）：继续复位，由第 5 步丢弃剩余的行。冷复位
+ *      不保留设备缓存，否则一条始终写不回去的脏行会让设备再也无法
+ *      复位；
  * 4. 再复位被访问的状态：GPUVM 上下文与 TLB、HQD、IH；
  * 5. 最后复位全局寄存器、中断、DMA、Outbound 窗口与 dcache。
  *
  * Return: true 表示已复位；false 表示第 1 步拒绝（除锁存的 INVALID_CMD
- * 外各模块状态不变）或第 3 步回写失败。
+ * 外各模块状态不变），或 @discard 为 false 时第 3 步回写失败。
  */
-bool gpgpu_reset_registers(GPGPUState *s)
+bool gpgpu_reset_registers(GPGPUState *s, bool discard)
 {
 	/* 1. 在途物理访问未结束时整体拒绝，不做部分复位。 */
 	if (gpgpu_phys_busy(s)) {
@@ -82,9 +87,9 @@ bool gpgpu_reset_registers(GPGPUState *s)
 	gpgpu_cp_reset(s);
 	gpgpu_dispatch_reset(s);
 
-	/* 3. 发起方已停，先把缓存中的数据写回后备存储。 */
-	if (gpgpu_dcache_maintain(s, 0, 0, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE |
-					       GPGPU_DCACHE_ALL))
+	/* 3. 发起方已停，把缓存数据写回后备存储；冷复位失败也继续。 */
+	if (!gpgpu_dcache_maintain(s, 0, 0, GPGPU_DCACHE_CLEAN | GPGPU_DCACHE_INVALIDATE |
+						GPGPU_DCACHE_ALL) && !discard)
 		return false;
 
 	/* 4. 可以安全清空发起方会访问的状态。 */
@@ -143,7 +148,7 @@ void gpgpu_global_write(GPGPUState *s, hwaddr reg, uint32_t value)
 	switch (reg) {
 	case GPGPU_REG_GLOBAL_CTRL:
 		if (value & GPGPU_CTRL_RESET)
-			gpgpu_reset_registers(s);
+			gpgpu_reset_registers(s, false);
 		else
 			s->global_ctrl = value & GPGPU_CTRL_ENABLE;
 		break;
@@ -233,15 +238,15 @@ static void gpgpu_exit(PCIDevice *pdev)
 }
 
 /*
- * QOM 复位：先复位寄存器，再清空 VRAM 和 PCI 中断能力。寄存器复位被
- * 拒绝（仍有在途物理访问或 dcache 回写失败）时，VRAM 和中断能力也保留，
- * 不会先清零 VRAM 再被旧脏行写回。
+ * QOM 复位：先复位寄存器，再清空 VRAM 和 PCI 中断能力。仍有在途物理访问
+ * 时寄存器复位被拒绝，VRAM 和中断能力也保留。dcache 回写失败时丢弃剩余
+ * 的行并继续复位；丢弃发生在清零 VRAM 之前，之后不会再有旧脏行写回。
  */
 static void gpgpu_reset(DeviceState *dev)
 {
 	GPGPUState *s = GPGPU(dev);
 
-	if (!gpgpu_reset_registers(s))
+	if (!gpgpu_reset_registers(s, true))
 		return;
 	gpgpu_vram_clear(s);
 	gpgpu_irq_reset_pci(s);
