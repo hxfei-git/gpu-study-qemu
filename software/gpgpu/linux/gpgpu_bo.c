@@ -415,8 +415,9 @@ int gpgpu_dma_copy(struct gpgpu_device *dev, bool to_host, u64 host, u64 vram, u
  *    的是 DMA 写入的数据；
  * 4. 重新取 dev->lock，按本次结果撤销 users：没有启动（-EIO）、正常完成
  *    或设备报告 DMA 错误（-EIO，搬运已停止）时撤销；只有本次超时
- *    （-ETIMEDOUT）的两端对象一直保留。dma_uncertain 可能来自之前另一次
- *    COPY，不能用它判断本次是否还在访问。
+ *    （-ETIMEDOUT）的两端对象继续保留，并记到 dev->copy_host 与
+ *    dev->copy_vram，设备恢复确认停止后才撤销。dma_uncertain 可能来自之前
+ *    另一次 COPY，不能用它判断本次是否还在访问。
  */
 int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 {
@@ -443,11 +444,14 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 			     vram->phys_addr + args->vram_offset, args->size);
 	mutex_unlock(&dev->dma_lock);
 
-	/* 4. 回到 dev->lock；只有本次 DMA 结果未知时保留使用计数。 */
+	/* 4. 回到 dev->lock；只有本次结果未知时保留计数并记下两端对象。 */
 	mutex_lock(&dev->lock);
 	if (ret != -ETIMEDOUT) {
 		host->users--;
 		vram->users--;
+	} else {
+		dev->copy_host = host;
+		dev->copy_vram = vram;
 	}
 	return ret;
 }

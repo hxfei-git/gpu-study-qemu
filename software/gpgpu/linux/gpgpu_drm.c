@@ -8,8 +8,12 @@
  *   ioctl ─▶ 检查版本与进程 ─▶ 取 vm_serial（EVENT_WAIT 除外）与 dev->lock
  *         ─▶ 具体处理函数 ─▶ 释放锁
  *
+ * 设备恢复后，此前打开的会话失效：查询、等待、销毁队列与事件、UNMAP
+ * 照常处理，建立新工作的 ioctl 返回 -ECANCELED，应用关闭旧连接后重新
+ * 打开。
+ *
  * 文件关闭时，若会话的队列、VM 或 DMA 仍可能被设备访问，会话保留为 orphan，
- * 等设备停止后由 gpgpu_device_stop() 回收。
+ * 等设备停止或恢复后由 gpgpu_device_stop() 或 gpgpu_device_recover() 回收。
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -26,12 +30,14 @@
 
 /*
  * 打开 render node：创建会话，只接受 render client。设备已移除或故障时
- * 拒绝。会话挂到设备链表并持有一个设备引用。
+ * 返回 -ENODEV，恢复进行中返回 -EBUSY。会话挂到设备链表并持有一个设备
+ * 引用。
  */
 static int gpgpu_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct gpgpu_device *dev = drm->dev_private;
 	struct gpgpu_fpriv *fpriv;
+	int ret;
 
 	if (!drm_is_render_client(file))
 		return -EOPNOTSUPP;
@@ -52,10 +58,13 @@ static int gpgpu_open(struct drm_device *drm, struct drm_file *file)
 	atomic_set(&fpriv->db_maps, 0);
 
 	mutex_lock(&dev->lock);
-	if (!dev->present || dev->fatal) {
+	ret = !dev->present || dev->fatal ? -ENODEV : 0;
+	if (dev->recovering)
+		ret = -EBUSY;
+	if (ret) {
 		mutex_unlock(&dev->lock);
 		kfree(fpriv);
-		return -ENODEV;
+		return ret;
 	}
 	list_add_tail(&fpriv->node, &dev->fprivs);
 	gpgpu_device_get(dev);
@@ -90,7 +99,9 @@ void gpgpu_fpriv_destroy(struct gpgpu_fpriv *fpriv)
 
 /*
  * 文件关闭：仍有未卸载队列、DMA 结果未知或 VM 无法安全拆除时，设备可能
- * 仍在访问会话对象，保留为 orphan；否则立即回收。
+ * 仍在访问会话对象，保留为 orphan；否则立即回收。先取 vm_serial：设备
+ * 恢复期间关闭的文件等恢复结束后再处理，回收时不会访问正在复位的
+ * 设备。
  */
 static void gpgpu_postclose(struct drm_device *drm, struct drm_file *file)
 {
@@ -98,16 +109,19 @@ static void gpgpu_postclose(struct drm_device *drm, struct drm_file *file)
 	struct gpgpu_device *dev = fpriv->dev;
 	bool retain;
 
+	mutex_lock(&dev->vm_serial);
 	mutex_lock(&dev->lock);
 	fpriv->file = NULL;
 	retain = dev->dma_uncertain || gpgpu_queue_any_live(fpriv) || gpgpu_vm_cleanup(fpriv);
 	if (retain && !dev->stopped) {
 		fpriv->orphan = true;
 		mutex_unlock(&dev->lock);
+		mutex_unlock(&dev->vm_serial);
 		return;
 	}
 	gpgpu_fpriv_destroy(fpriv);
 	mutex_unlock(&dev->lock);
+	mutex_unlock(&dev->vm_serial);
 	gpgpu_device_put(dev);
 }
 
@@ -176,6 +190,7 @@ static int gpgpu_info(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_info *args)
 		return -EINVAL;
 	*args = (struct gpgpu_vm_info) {
 		.version = GPGPU_DRM_VERSION,
+		.flags = fpriv->reset_done ? GPGPU_INFO_SESSION_RESET : 0,
 		.address_bits = dev->gpuvm ? GPGPU_VM_VA_BITS : GPGPU_PHYS_ADDRESS_BITS,
 		.page_size = PAGE_SIZE,
 		.user_vmids = GPGPU_VM_USERS,
@@ -188,12 +203,25 @@ static int gpgpu_info(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_info *args)
 	return 0;
 }
 
+/*
+ * 设备恢复前打开的会话只能查询、等待和回收。建立对象、映射、COPY、
+ * 队列与事件的 ioctl 先经这里检查，失效会话返回 -ECANCELED。
+ */
+static int gpgpu_session_live(struct gpgpu_fpriv *fpriv)
+{
+	return fpriv->stale ? -ECANCELED : 0;
+}
+
 /* QUEUE_CREATE：先清除空闲槽上的旧故障，新队列才不会读到别人的故障。 */
 static int gpgpu_queue_create_ioctl_body(struct gpgpu_fpriv *fpriv,
 					 struct gpgpu_queue_create *args)
 {
+	int ret;
+
 	gpgpu_vm_clear_free_faults(fpriv->dev);
-	return gpgpu_queue_create(fpriv, args);
+	ret = gpgpu_queue_create(fpriv, args);
+	/* 先按原始结果保留资源，再向用户报告恢复主动取消。 */
+	return fpriv->stale ? -ECANCELED : ret;
 }
 
 /* FAULT：返回队列首次 GPUVM 故障；队列对象被回收前都可查询。 */
@@ -212,19 +240,20 @@ static int gpgpu_fault(struct gpgpu_fpriv *fpriv, struct gpgpu_vm_fault *args)
 
 GPGPU_IOCTL_HANDLER(gpgpu_info_ioctl, struct gpgpu_vm_info, true, gpgpu_info(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_bo_create_ioctl, struct gpgpu_bo_create, true,
-		    gpgpu_bo_create(fpriv, args))
-GPGPU_IOCTL_HANDLER(gpgpu_map_ioctl, struct gpgpu_vm_map, true, gpgpu_vm_map(fpriv, args))
+		    gpgpu_session_live(fpriv) ?: gpgpu_bo_create(fpriv, args))
+GPGPU_IOCTL_HANDLER(gpgpu_map_ioctl, struct gpgpu_vm_map, true,
+		    gpgpu_session_live(fpriv) ?: gpgpu_vm_map(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_unmap_ioctl, struct gpgpu_vm_map, true, gpgpu_vm_unmap(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_copy_ioctl, struct gpgpu_memory_copy, true,
-		    gpgpu_bo_copy(fpriv, args))
+		    gpgpu_session_live(fpriv) ?: gpgpu_bo_copy(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_queue_create_ioctl, struct gpgpu_queue_create, true,
-		    gpgpu_queue_create_ioctl_body(fpriv, args))
+		    gpgpu_session_live(fpriv) ?: gpgpu_queue_create_ioctl_body(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_queue_query_ioctl, struct gpgpu_queue_state, true,
 		    gpgpu_queue_query(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_queue_destroy_ioctl, struct gpgpu_queue_state, true,
 		    gpgpu_queue_destroy(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_event_create_ioctl, struct gpgpu_event_request, true,
-		    gpgpu_event_create(fpriv, args))
+		    gpgpu_session_live(fpriv) ?: gpgpu_event_create(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_event_query_ioctl, struct gpgpu_event_request, true,
 		    gpgpu_event_query(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_event_wait_ioctl, struct gpgpu_event_request, false,
@@ -233,7 +262,7 @@ GPGPU_IOCTL_HANDLER(gpgpu_event_destroy_ioctl, struct gpgpu_event_request, true,
 		    gpgpu_event_destroy(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_fault_ioctl, struct gpgpu_vm_fault, true, gpgpu_fault(fpriv, args))
 GPGPU_IOCTL_HANDLER(gpgpu_cache_sync_ioctl, struct gpgpu_cache_sync, true,
-		    gpgpu_bo_cache_sync(fpriv, args))
+		    gpgpu_session_live(fpriv) ?: gpgpu_bo_cache_sync(fpriv, args))
 
 #define GPGPU_IOCTL(ioctl, handler) \
 	{ .cmd = ioctl, .func = handler, .flags = DRM_RENDER_ALLOW, .name = #ioctl }

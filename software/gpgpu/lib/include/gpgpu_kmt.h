@@ -97,6 +97,24 @@ typedef struct GpgpuKmtEvent {
  * 只增加引用；最后一次 Close 按队列、事件、内存的顺序回收剩余对象。
  */
 GpgpuKmtStatus gpgpuKmtOpen(const char *path, GpgpuKmtContext **context);
+/**
+ * gpgpuKmtClose() - 放下一次 Open 的引用
+ *
+ * @context: 当前进程打开的共享连接。
+ *
+ * 不是最后一次引用时只减引用。最后一次：
+ * 1. 其他线程仍有库调用时返回 UNAVAILABLE。结果未知的连接先查 INFO，
+ *    只有驱动确认旧会话已复位，才解除本地 uncertain 并继续清理；
+ * 2. 标记 closing 并记下当前线程，然后解锁回收剩余对象。回收函数会再次
+ *    kmt_enter() 本连接，只有记下的线程能通过，其他线程的新调用被拒绝。
+ *    回收失败时清除 closing 并返回错误；
+ * 3. 全部回收后解除通知页的 CPU 映射，关闭 fd、清空连接，之后可以重新
+ *    Open。通知页仍登记在驱动中，不经 FreeMemory 释放，由驱动在文件关闭时
+ *    撤销登记并回收。
+ *
+ * Return: SUCCESS 表示本次引用已放下；UNAVAILABLE 表示尚有并发调用或
+ * 未确认的访问，其他值为参数或清理错误。
+ */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context);
 /* 查询 GPUVM 能力：range_count 为 1 表示 GPUVM 开启，0 表示关闭。 */
 GpgpuKmtStatus gpgpuKmtGetVmInfo(GpgpuKmtContext *context, struct gpgpu_vm_info *info);

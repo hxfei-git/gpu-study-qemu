@@ -123,7 +123,8 @@ void gpgpu_ih_drain(struct gpgpu_device *dev)
  * 这里先消费记录；设备已故障（含上半部发现的 IH 或固件错误）
  * 时让全部队列失败；最后确认 IH 中断并恢复全部使能。确认放在
  * 消费之后，设备若还有未消费的记录会再次置位 IH 中断。
- * 设备已移除时不再访问 BAR。
+ * 设备已移除时不再访问 BAR。设备恢复期间 IH 正被复位，这里也不访问
+ * 设备；IH 使能保持屏蔽，恢复结束时再调度一次本工作项。
  */
 void gpgpu_ih_work(struct work_struct *work)
 {
@@ -131,7 +132,7 @@ void gpgpu_ih_work(struct work_struct *work)
 	unsigned long flags;
 
 	mutex_lock(&dev->lock);
-	if (dev->present) {
+	if (dev->present && !dev->recovering) {
 		gpgpu_ih_drain(dev);
 		if (dev->fatal)
 			gpgpu_fail_queues(dev, NULL, GPGPU_ERR_IH_FAULT);

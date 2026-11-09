@@ -42,6 +42,7 @@ GpgpuKmtStatus kmt_status(int error)
 		return GPGPU_KMT_WAIT_TIMEOUT;
 	case EIO:
 	case ENODEV:
+	case ECANCELED:
 		return GPGPU_KMT_WAIT_FAILURE;
 	default:
 		return GPGPU_KMT_ERROR;
@@ -260,22 +261,10 @@ static bool kmt_has_objects(GpgpuKmtContext *c)
 	return c->memory || c->queues || c->events;
 }
 
-/*
- * gpgpuKmtClose() - 放下一次 Open 的引用
- *
- * 不是最后一次引用时只减引用。最后一次：
- * 1. 其他线程仍有库调用进行中，或存在结果未知、驱动仍在保留的
- *    资源时，返回 UNAVAILABLE，连接保持打开；
- * 2. 标记 closing 并记下当前线程，然后解锁回收剩余对象。回收函数会再次
- *    kmt_enter() 本连接，只有记下的线程能通过，其他线程的新调用被拒绝。
- *    回收失败时清除 closing 并返回错误；
- * 3. 全部回收后解除通知页的 CPU 映射，关闭 fd、清空连接，之后可以重新
- *    Open。通知页仍登记在驱动中，不经 FreeMemory 释放，由驱动在文件关闭时
- *    撤销登记并回收。
- */
 GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 {
 	GpgpuKmtContext *c = &kmt_connection;
+	struct gpgpu_vm_info info = { .version = GPGPU_DRM_VERSION };
 	GpgpuKmtStatus status;
 
 	if (context != c)
@@ -291,10 +280,18 @@ GpgpuKmtStatus gpgpuKmtClose(GpgpuKmtContext *context)
 		goto out;
 	}
 
-	/* 1. 有并发调用或结果未知的资源时不能关闭。 */
-	if (c->calls || c->uncertain) {
+	/* 1. 先排除并发调用，再确认未知结果是否已随设备复位结束。 */
+	if (c->calls) {
 		status = GPGPU_KMT_UNAVAILABLE;
 		goto out;
+	}
+	if (c->uncertain) {
+		if (ioctl(c->fd, GPGPU_DRM_INFO, &info) < 0 ||
+		    !(info.flags & GPGPU_INFO_SESSION_RESET)) {
+			status = GPGPU_KMT_UNAVAILABLE;
+			goto out;
+		}
+		c->uncertain = false;
 	}
 
 	/* 2. 回收函数会重新进入本连接并加锁，所以先解锁。 */
