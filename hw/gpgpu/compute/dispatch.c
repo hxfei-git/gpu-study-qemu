@@ -124,6 +124,30 @@ static void dispatch_schedule(GPGPUState *s)
 		  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DISPATCH_SEGMENT_INTERVAL_NS);
 }
 
+/* 仅剖析时序列化计数；普通计时不分配这段日志。 */
+static char *dispatch_profile(const GPGPUExecProfile *p)
+{
+	if (!p)
+		return NULL;
+	return g_strdup_printf(
+		",\"profile\":{\"lane_steps\":%" PRIu64 ",\"fetches\":%" PRIu64
+		",\"decodes\":%" PRIu64 ",\"pc_groups\":%" PRIu64
+		",\"rounds\":%" PRIu64 ",\"warps\":%" PRIu64
+		",\"data_reads\":%" PRIu64 ",\"data_writes\":%" PRIu64
+		",\"read_bytes\":%" PRIu64 ",\"write_bytes\":%" PRIu64
+		",\"tlb_hits\":%" PRIu64 ",\"tlb_misses\":%" PRIu64
+		",\"dcache_hits\":%" PRIu64 ",\"dcache_misses\":%" PRIu64
+		",\"dcache_writebacks\":%" PRIu64
+		",\"tensor_instructions\":%" PRIu64 ",\"tensor_macs\":%" PRIu64
+		",\"tensor_native_tiles\":%" PRIu64 ",\"tensor_soft_tiles\":%" PRIu64
+		",\"tensor_layout_elements\":%" PRIu64 "}",
+		p->lane_steps, p->fetches, p->decodes, p->pc_groups, p->rounds, p->warps,
+		p->data_reads, p->data_writes, p->read_bytes, p->write_bytes,
+		p->tlb_hits, p->tlb_misses, p->dcache_hits, p->dcache_misses,
+		p->dcache_writebacks, p->tensor_instructions, p->tensor_macs,
+		p->tensor_native_tiles, p->tensor_soft_tiles, p->tensor_layout_elements);
+}
+
 /*
  * 以终态结束：先释放任务、清除忙标志、写错误码，最后才写 status。
  * CP 轮询 DISPATCH_STATUS，读到 DONE/FAILED 时任务已不再访问内存，
@@ -133,6 +157,20 @@ static void dispatch_finish(GPGPUState *s, uint32_t status, uint32_t error)
 {
 	GPGPUDispatchState *d = &s->dispatch;
 
+	if (d->trace_start_ns) {
+		uint64_t end = (uint64_t)g_get_monotonic_time() * 1000;
+		char *profile;
+
+		profile = dispatch_profile(gpgpu_task_profile(d->task));
+		fprintf(stderr, "GPGPU_DISPATCH {\"start_ns\":%" PRIu64
+			",\"end_ns\":%" PRIu64 ",\"service_ns\":%" PRIu64
+			",\"segments\":%" PRIu64 ",\"kernel_args\":%" PRIu64
+			",\"vmid\":%u,\"slot\":%u,\"status\":%u,\"error\":%u%s}\n",
+			d->trace_start_ns, end, d->trace_service_ns, d->trace_segments,
+			d->config.kernel_args, d->config.vmid, d->config.source_slot, status, error,
+			profile ? profile : "");
+		g_free(profile);
+	}
 	g_clear_pointer(&d->task, gpgpu_task_destroy);
 	gpgpu_set_busy(s, false);
 	d->error = error;
@@ -146,7 +184,17 @@ static void dispatch_finish(GPGPUState *s, uint32_t status, uint32_t error)
 static void dispatch_step(void *opaque)
 {
 	GPGPUState *s = opaque;
-	GPGPUExecResult result = gpgpu_task_step(s->dispatch.task);
+	GPGPUDispatchState *d = &s->dispatch;
+	GPGPUExecResult result;
+	uint64_t begin = 0;
+
+	if (d->trace_start_ns)
+		begin = (uint64_t)g_get_monotonic_time() * 1000;
+	result = gpgpu_task_step(d->task);
+	if (d->trace_start_ns) {
+		d->trace_service_ns += (uint64_t)g_get_monotonic_time() * 1000 - begin;
+		d->trace_segments++;
+	}
 
 	switch (result.status) {
 	case GPGPU_EXEC_CONTINUE:
@@ -192,6 +240,9 @@ static void dispatch_submit(GPGPUState *s)
 	/* 4. 进入 BUSY 后配置寄存器拒绝写入，任务使用自己的配置副本。 */
 	d->error = GPGPU_EXEC_ERR_NONE;
 	d->status = GPGPU_DISPATCH_BUSY;
+	d->trace_start_ns = gpgpu_trace_enabled(s) ? (uint64_t)g_get_monotonic_time() * 1000 : 0;
+	d->trace_service_ns = 0;
+	d->trace_segments = 0;
 	gpgpu_set_busy(s, true);
 	dispatch_schedule(s);
 	return;

@@ -20,10 +20,15 @@
 /* 占位映射的标志：私有匿名、不占交换空间，与 PROT_NONE 一起使用。 */
 #define KMT_RESERVE_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE)
 
-/* 把 value 向上取整到 alignment 的倍数；alignment 为 2 的幂。 */
-static uint64_t align_up(uint64_t value, uint64_t alignment)
+/* alignment 必须是 2 的幂；加法不溢出时输出向上取整的结果。 */
+static bool align_up_ok(uint64_t value, uint64_t alignment, uint64_t *aligned)
 {
-	return (value + alignment - 1) & ~(alignment - 1);
+	if (!alignment || (alignment & (alignment - 1)) ||
+	    value > UINT64_MAX - (alignment - 1))
+		return false;
+
+	*aligned = (value + alignment - 1) & ~(alignment - 1);
+	return true;
 }
 
 /*
@@ -37,14 +42,34 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
  * 裁掉头尾得到对齐的 [va, va + size)；非零时用 MAP_FIXED_NOREPLACE，
  * 这段地址已有映射则失败，不覆盖已有内容。
  *
+ * 例：size = 0x3000、alignment = 0x1_0000，预留 0x1_2000 字节：
+ *
+ *   原区间    [0x4000_3000, 0x4001_5000)
+ *   对齐区间  [0x4001_0000, 0x4001_3000)
+ *   裁去头部  0xd000 字节；裁去尾部 0x2000 字节。
+ *
+ * 1. 检查长度、对齐与地址宽度，防止 mmap 参数被截断；
+ * 2. 固定地址时检查完整范围，再用 MAP_FIXED_NOREPLACE 占位；
+ * 3. 自动选址时检查预留余量与起点取整，裁掉头尾多余的页。
+ *
  * Return: 起始地址；失败返回 NULL，errno 为原因。
  */
 static uint8_t *kmt_reserve_va(uint64_t size, uint64_t alignment, uint64_t fixed_va)
 {
-	uint64_t padded = size + alignment - KMT_PAGE_SIZE;
+	uint64_t padded, aligned;
+	size_t head, tail;
 	uint8_t *base, *va;
 
+	/* 1. size 与 alignment 最终都要作为 size_t 或 uintptr_t 使用。 */
+	if (!size || (size & (KMT_PAGE_SIZE - 1)) || size > SIZE_MAX ||
+	    alignment < KMT_PAGE_SIZE || alignment > SIZE_MAX || (alignment & (alignment - 1)))
+		goto invalid;
+
+	/* 2. 固定地址不需要对齐余量，且不能覆盖已有映射。 */
 	if (fixed_va) {
+		if (fixed_va > UINTPTR_MAX || (fixed_va & (alignment - 1)) ||
+		    size > UINTPTR_MAX - fixed_va)
+			goto invalid;
 		base = mmap((void *)(uintptr_t)fixed_va, size, PROT_NONE,
 			    KMT_RESERVE_FLAGS | MAP_FIXED_NOREPLACE, -1, 0);
 		if (base == MAP_FAILED)
@@ -58,15 +83,30 @@ static uint8_t *kmt_reserve_va(uint64_t size, uint64_t alignment, uint64_t fixed
 		return base;
 	}
 
+	/* 3. 预留长度与对齐后的地址都先用减法检查，再进行加法。 */
+	if (size > SIZE_MAX - (alignment - KMT_PAGE_SIZE))
+		goto invalid;
+	padded = size + (alignment - KMT_PAGE_SIZE);
 	base = mmap(NULL, padded, PROT_NONE, KMT_RESERVE_FLAGS, -1, 0);
 	if (base == MAP_FAILED)
 		return NULL;
-	va = (uint8_t *)(uintptr_t)align_up((uintptr_t)base, alignment);
-	if (va > base)
-		munmap(base, va - base);
-	if (base + padded > va + size)
-		munmap(va + size, base + padded - (va + size));
+	if (!align_up_ok((uintptr_t)base, alignment, &aligned) || aligned > UINTPTR_MAX ||
+	    size > UINTPTR_MAX - aligned) {
+		munmap(base, padded);
+		goto invalid;
+	}
+	va = (uint8_t *)(uintptr_t)aligned;
+	head = aligned - (uintptr_t)base;
+	tail = padded - head - size;
+	if (head)
+		munmap(base, head);
+	if (tail)
+		munmap(va + size, tail);
 	return va;
+
+invalid:
+	errno = EINVAL;
+	return NULL;
 }
 
 /* 关闭 GEM 句柄；调用者持 lock。 */
@@ -119,12 +159,16 @@ GpgpuKmtStatus kmt_memory_create(GpgpuKmtContext *c, uint32_t kind, uint32_t fla
 	};
 	struct gpgpu_vm_map map = { .version = GPGPU_DRM_VERSION, .permissions = permissions };
 	int prot = kind == GPGPU_MEMORY_HOST ? PROT_READ | PROT_WRITE : PROT_NONE;
-	uint64_t length = align_up(size, KMT_PAGE_SIZE);
+	uint64_t length;
 	GpgpuKmtStatus status;
 	bool keep_va = false;
 	uint8_t *va;
 
-	/* 1. 先占住 CPU 地址，GPUVA 取同一数值。 */
+	/* 1. 页取整不能回绕或截断；先占住 CPU 地址，GPUVA 取同一数值。 */
+	if ((kind != GPGPU_MEMORY_HOST && kind != GPGPU_MEMORY_VRAM) || !size || !alignment ||
+	    (alignment & (alignment - 1)) || !align_up_ok(size, KMT_PAGE_SIZE, &length) ||
+	    length > SIZE_MAX)
+		return GPGPU_KMT_INVALID_PARAMETER;
 	va = kmt_reserve_va(length, alignment > KMT_PAGE_SIZE ? alignment : KMT_PAGE_SIZE,
 			    fixed_va);
 	if (!va)

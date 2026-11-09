@@ -19,8 +19,10 @@ import time
 class RemoteDevice:
     """管理一个远端设备进程及其 unix socket。"""
 
-    def __init__(self, binary, log_directory, startup_timeout=15, gpuvm=True):
+    def __init__(self, binary, log_directory, startup_timeout=15, gpuvm=True,
+                 extra_args=()):
         self.gpuvm = gpuvm
+        self.extra_args = list(extra_args)
         self.binary = Path(binary)
         self.log_directory = Path(log_directory)
         self.startup_timeout = startup_timeout
@@ -44,6 +46,7 @@ class RemoteDevice:
             "-serial", "none", "-object", json.dumps(server),
         ]
         command += ["-global", "gpgpu.gpuvm=" + ("on" if self.gpuvm else "off")]
+        command += self.extra_args
         (self.log_directory / "device-command.json").write_text(
             json.dumps(command, ensure_ascii=False, indent=2) + "\n")
         try:

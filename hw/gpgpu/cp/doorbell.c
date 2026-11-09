@@ -17,8 +17,15 @@ static void doorbell_write(void *opaque, hwaddr addr, uint64_t value, unsigned i
 {
 	GPGPUState *s = opaque;
 
-	if (size != 8 || (addr & 7) || value >> 32)
+	if (size != 8 || (addr & 7) || value >> 32) {
 		gpgpu_set_error(s, GPGPU_ERR_INVALID_CMD);
+		return;
+	}
+	/* 仅记录提醒的到达时刻；CP 可能已通过轮询开始处理这个包。 */
+	if (gpgpu_trace_enabled(s))
+		fprintf(stderr, "GPGPU_DOORBELL {\"host_ns\":%" PRIu64
+			",\"offset\":%" PRIu64 ",\"packet\":%u}\n",
+			(uint64_t)g_get_monotonic_time() * 1000, (uint64_t)addr, (uint32_t)value);
 }
 
 static const MemoryRegionOps doorbell_ops = {

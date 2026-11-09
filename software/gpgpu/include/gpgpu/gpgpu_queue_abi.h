@@ -18,6 +18,15 @@
 
 #include "gpgpu_abi_types.h"
 
+/* 每个 Warp 的 Lane 数。 */
+#define GPGPU_WARP_SIZE 32
+/* 单次派发的工作组数上限。 */
+#define GPGPU_MAX_BLOCKS 4096
+/* 每工作组的线程数上限。 */
+#define GPGPU_MAX_BLOCK_THREADS 1024
+/* 单次派发的总线程数上限。 */
+#define GPGPU_MAX_TOTAL_THREADS 65536
+
 /* 管理 Ring 与 AQL Ring 的最小字节容量。 */
 #define GPGPU_QUEUE_RING_MIN 64u
 /* 管理 Ring 与 AQL Ring 的最大字节容量，须为 2 的幂。 */

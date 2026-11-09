@@ -53,7 +53,7 @@ typedef struct GpgpuRtDim3 {
 /**
  * gpgpu_rt_create() - 建立运行时
  * @context: 已打开的 KMT 连接。
- * @staging_size: Host 暂存区字节数，须不小于任何一次上传或下载的长度。
+ * @staging_size: 非零 Host 暂存区字节数；上传、下载按此容量分块。
  * @rt: 输出。
  */
 GpgpuKmtStatus gpgpu_rt_create(GpgpuKmtContext *context, size_t staging_size, GpgpuRt **rt);
@@ -75,10 +75,50 @@ GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **
  * 返回 INVALID_PARAMETER。不排空队列，调用者须确认已没有任务使用 buffer。
  */
 GpgpuKmtStatus gpgpu_rt_buffer_free(GpgpuRt *rt, GpgpuKmtMemory *buffer);
-/* 经暂存区把 Host 数据上传到 VRAM。 */
+/**
+ * gpgpu_rt_upload_range() - 经固定大小的暂存区分块上传到 VRAM
+ * @rt: 运行时；调用者串行使用，暂存区大小由 create 指定。
+ * @buffer: 与运行时属于同一 KMT 连接的 VRAM 对象。
+ * @offset: 对象内的起始字节偏移。
+ * @data: 至少 size 字节的 Host 源数据。
+ * @size: 非零字节数，完整范围不得超过 buffer 的请求长度。
+ *
+ * 1. 写暂存区前校验完整范围；派发或 COPY 结果未确认时拒绝继续上传；
+ * 2. 每块先写暂存区，再同步 COPY 到 offset 加上已完成长度的位置，成功后
+ *    才复用暂存区。调用者须保证没有其他任务访问目标范围。
+ *
+ * 任一块失败立即返回，已完成的块不回退，失败块可能只完成一部分。
+ * COPY 超时或设备错误后禁止复用本运行时，只能尝试 destroy 回收。
+ *
+ * Return: SUCCESS、参数非法时的 INVALID_PARAMETER、运行时不可用时的
+ * UNAVAILABLE，或 COPY 返回的错误。
+ */
+GpgpuKmtStatus gpgpu_rt_upload_range(GpgpuRt *rt, GpgpuKmtMemory *buffer, uint64_t offset,
+				     const void *data, size_t size);
+/**
+ * gpgpu_rt_download_range() - 经固定大小的暂存区分块下载到 Host
+ * @rt: 运行时；调用者串行使用，暂存区大小由 create 指定。
+ * @buffer: 与运行时属于同一 KMT 连接的 VRAM 对象。
+ * @offset: 对象内的起始字节偏移。
+ * @data: 至少 size 字节的 Host 目标缓冲区。
+ * @size: 非零字节数，完整范围不得超过 buffer 的请求长度。
+ *
+ * 1. 校验完整范围，避免部分下载；派发或 COPY 结果未确认时拒绝操作；
+ * 2. 从 offset 加上已完成长度的位置同步 COPY，每块确认成功后才写入 Host
+ *    目标。调用者须保证没有其他任务改写源范围。
+ *
+ * 任一块失败立即返回。Host 保留已完成的块，失败块及后续内容不变。
+ * COPY 超时或设备错误后禁止复用本运行时，只能尝试 destroy 回收。
+ *
+ * Return: SUCCESS、参数非法时的 INVALID_PARAMETER、运行时不可用时的
+ * UNAVAILABLE，或 COPY 返回的错误。
+ */
+GpgpuKmtStatus gpgpu_rt_download_range(GpgpuRt *rt, GpgpuKmtMemory *buffer, uint64_t offset,
+				       void *data, size_t size);
+/* 从对象偏移 0 上传，等同于 upload_range。 */
 GpgpuKmtStatus gpgpu_rt_upload(GpgpuRt *rt, GpgpuKmtMemory *buffer, const void *data,
 			       size_t size);
-/* 经暂存区把 VRAM 数据下载到 Host。 */
+/* 从对象偏移 0 下载，等同于 download_range。 */
 GpgpuKmtStatus gpgpu_rt_download(GpgpuRt *rt, GpgpuKmtMemory *buffer, void *data, size_t size);
 
 /**

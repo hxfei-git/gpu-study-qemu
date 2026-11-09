@@ -2,8 +2,8 @@
 /*
  * GPGPU 驱动：VRAM 分配器
  *
- * gpu_buddy 只管理固件区之前的 60 MiB（GPGPU_VRAM_USABLE_SIZE），VRAM 首页
- * 预先分配出去，保证 GPU 物理地址 0 永远不会分给用户或页表。
+ * gpu_buddy 只管理固件区之前的 VRAM（GPGPU_VRAM_USABLE_SIZE）。首页预先
+ * 分配出去，保证 GPU 物理地址 0 永远不会分给用户或页表。
  */
 #include <linux/log2.h>
 #include <linux/sched.h>
@@ -34,32 +34,82 @@ void gpgpu_vram_fini(struct gpgpu_device *dev)
 	dev->buddy_ready = false;
 }
 
-/**
- * gpgpu_vram_alloc() - 分配一段连续 VRAM 并清零
- * @dev: 设备；调用者持 dev->lock，处在可睡眠的上下文。
- * @size: 非零页对齐字节数；起点按不小于 size 的最小 2 的幂对齐。
- * @blocks: 输出：持有的 buddy 块，用 gpgpu_vram_free() 归还。
- * @offset: 输出：VRAM 字节偏移，也是 GPU 物理地址。
+/*
+ * vram_zero_dma() - 用设备只读零源清零尚未发布的 BO
  *
- * 清零经 BAR2 逐次写入。设备在另一进程、经 vfio-user 连接时每次写都要
- * 往返一次 socket，4 MiB 要几十秒，一次写完会触发 soft lockup，所以按
- * VRAM_CLEAR_CHUNK 分段，段间 cond_resched()。清零期间仍持 dev->lock，
- * 其他 ioctl 与 IH 处理要等它结束。
+ * buddy 块已从空闲池移除，但尚未挂入会话、生成句柄或写进页表。
+ * 调用者持 vm_serial 和设备引用，零源在设备寿命内保持不变：
  *
- * Return: 0 或 gpu_buddy 的错误码。
+ *   固定 zero.addr --chunk 字节--> offset + done
+ *
+ * 例：零源 64 KiB、目的 132 KiB，三次长度为 64、64、4 KiB，
+ * 源地址不变，目的偏移依次增加 0、64、128 KiB。
+ *
+ * 1. 释放 dev->lock，避免持主锁取 dma_lock 或等待设备；
+ * 2. 持 dma_lock 分块调用共享提交/等待函数，成功后才推进目的偏移；
+ * 3. 先放 dma_lock 再取回 dev->lock，所有返回路径恢复调用者主锁。
+ *
+ * 本函数不发布对象，不释放源或目的，失败后的块保留由分配函数处理。
+ *
+ * Return: 0，或共享 DMA 函数的 -EIO / -ETIMEDOUT。
  */
-int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *blocks, u64 *offset)
+static int vram_zero_dma(struct gpgpu_device *dev, u64 offset, u64 size)
+{
+	const struct gpgpu_dma_buf *zero = &dev->vram_zero;
+	int ret = 0;
+
+	/* 1. 表页不走此路径；BO 未公开，私有块不会被并发释放。 */
+	mutex_unlock(&dev->lock);
+
+	/* 2. 整段清零与用户 COPY 共用 DMA 通道，长度取零源的唯一定义。 */
+	mutex_lock(&dev->dma_lock);
+	for (u64 done = 0; done < size;) {
+		u32 chunk = min_t(u64, size - done, zero->size);
+
+		ret = gpgpu_dma_copy(dev, false, zero->addr, offset + done, chunk);
+		if (ret)
+			break;
+		done += chunk;
+	}
+	mutex_unlock(&dev->dma_lock);
+
+	/* 3. stop 可在失锁期间改变设备状态，调用者发布前仍须复核。 */
+	mutex_lock(&dev->lock);
+	return ret;
+}
+
+int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *blocks, u64 *offset,
+		      bool for_bo)
 {
 	struct gpu_buddy_block *block;
-	u64 alignment = roundup_pow_of_two(size);
+	u64 alignment;
 	int ret;
 
+	/* 1. roundup_pow_of_two() 使用 unsigned long，取整结果不能越过其最高位。 */
+	if (!size || !IS_ALIGNED(size, PAGE_SIZE) || size > GPGPU_VRAM_USABLE_SIZE ||
+	    size > (1UL << (BITS_PER_LONG - 1)))
+		return -EINVAL;
+
+	alignment = roundup_pow_of_two(size);
+
+	/* 2. 保持连续 buddy 分配，容量与碎片不足仍由分配器返回。 */
 	ret = gpu_buddy_alloc_blocks(&dev->buddy, PAGE_SIZE, GPGPU_VRAM_USABLE_SIZE, size,
 				     alignment, blocks, GPU_BUDDY_CONTIGUOUS_ALLOCATION);
 	if (ret)
 		return ret;
 	block = list_first_entry(blocks, struct gpu_buddy_block, link);
 	*offset = gpu_buddy_block_offset(block);
+
+	/* 3. 只有未发布 BO 可失锁；表页和默认路径保持锁内 BAR2。 */
+	if (for_bo && dev->vram_zero.cpu) {
+		ret = vram_zero_dma(dev, *offset, size);
+		/* 超时整组隔离，不用 dcache 维护成功冒充 DMA 已经停止。 */
+		if (ret == -ETIMEDOUT)
+			list_splice_tail_init(blocks, &dev->reserved_blocks);
+		else if (ret)
+			gpgpu_vram_free(dev, blocks);
+		return ret;
+	}
 	for (u64 done = 0; done < size; done += VRAM_CLEAR_CHUNK) {
 		memset_io(dev->vram + *offset + done, 0, min_t(u64, size - done, VRAM_CLEAR_CHUNK));
 		cond_resched();

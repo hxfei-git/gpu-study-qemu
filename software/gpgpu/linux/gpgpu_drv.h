@@ -315,7 +315,7 @@ struct gpgpu_mgmt_request {
  * @lock: 保护对象链表、对象状态、IH 消费与 VM 修改。
  * @vm_serial: 串行化会跨越等待的 ioctl（队列与映射变更），事件等待除外。
  * @management_lock: 串行化管理命令的发布，不覆盖等待阶段。
- * @dma_lock: 串行化整个 COPY 请求，包括等待完成。
+ * @dma_lock: 串行化 COPY 与 BO 清零的 DMA 请求，包括等待完成。
  * @irq_lock: 保护中断使能、确认与 DMA 完成状态。
  * @ih_work: 在可睡眠上下文中消费 IH 记录。
  * @dma_done: DMA 完成或失败时唤醒。
@@ -323,7 +323,7 @@ struct gpgpu_mgmt_request {
  * @stopped: 设备已确认停止访问，可以回收 orphan 会话。
  * @fatal: KIQ、IH 或固件发生设备级故障。
  * @dma_failed: 本次 DMA 报告了错误。
- * @dma_uncertain: DMA 等待超时，无法证明访问已结束；之后禁止 COPY 与回收。
+ * @dma_uncertain: DMA 等待超时，无法证明访问已结束；禁止新 DMA 与回收。
  * @gpuvm: 设备以 gpuvm=on 启动。
  * @vram_size: VRAM 字节数；VRAM 占 GPU 物理地址 [0, vram_size)。
  * @vmids: 用户 VMID 1、2 的占用位图；队列驻留期间占用。
@@ -332,13 +332,15 @@ struct gpgpu_mgmt_request {
  * @requests: 未回收的管理请求结果区。
  * @retired: 释放时不能确认 dcache 已处置的 Host DMA 内存，保留到设备释放。
  * @buddy: 管理固件区之前 VRAM 的分配器。
- * @reserved_blocks: 分配器中预留的 VRAM 首页，以及释放时不能确认 dcache
- *                   已处置的 VRAM 块，都在设备释放时归还。
+ * @reserved_blocks: VRAM 首页、不能确认 dcache 已处置的块，以及清零 DMA
+ *                   超时的整组目的块，都在设备释放时归还。
  * @buddy_ready: 分配器已初始化。
  * @db_pages: Doorbell 页占用位图；第 0 页给管理队列。
  * @next_sequence: 下一个管理请求序号，从 1 开始，回绕后不再发布。
  * @mgmt: KIQ（下标 0）与 HIQ（下标 1）。
  * @ih: IH Ring。
+ * @vram_zero: 可选的只读 coherent 零源；启用参数后分配，失败时 cpu 为 NULL。
+ *             DMA 超时不归还，随设备的最终安全释放一并回收。
  * @ih_rptr: 下一条待消费的 IH 记录编号。
  */
 struct gpgpu_device {
@@ -373,6 +375,7 @@ struct gpgpu_device {
 	u64 next_sequence;
 	struct gpgpu_mgmt_ring mgmt[2];
 	struct gpgpu_dma_buf ih;
+	struct gpgpu_dma_buf vram_zero;
 	u32 ih_rptr;
 };
 
@@ -446,7 +449,27 @@ void gpgpu_fpriv_destroy(struct gpgpu_fpriv *fpriv);
 
 int gpgpu_vram_init(struct gpgpu_device *dev);
 void gpgpu_vram_fini(struct gpgpu_device *dev);
-int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *blocks, u64 *offset);
+/**
+ * gpgpu_vram_alloc() - 分配并清零一段连续 VRAM
+ * @dev: 设备；调用者持 dev->lock，处在可睡眠上下文并保护设备寿命。
+ * @size: 非零页对齐字节数，起点按不小于 size 的最小 2 的幂对齐。
+ * @blocks: 输出：持有的 buddy 块，成功后用 gpgpu_vram_free() 归还。
+ * @offset: 输出：VRAM 字节偏移，也是 GPU 物理地址。
+ * @for_bo: 仅未公开、未挂链的 BO 为 true，调用者还持 vm_serial；表页为 false。
+ *
+ * 1. 检查页对齐、容量与 roundup_pow_of_two() 的可表示范围；
+ * 2. 从 buddy 分配连续块，分配不足仍返回原错误；
+ * 3. 默认或表页经 BAR2 分段清零，保持 dev->lock。启用可选零源的 BO
+ *    释放 dev->lock 后取 dma_lock 分块搬运，放 dma_lock 后再取回 dev->lock。
+ *
+ * 返回时始终持 dev->lock。DMA 超时的整组目的块转入 reserved_blocks，
+ * 其他失败按已有释放规则归还或保留，失败前已完成的部分不回退。
+ * 调用者仍须在发布 BO 前复核设备与会话状态，本函数不发布 GEM 或页表。
+ *
+ * Return: 0、-EINVAL、buddy 错误或 DMA 的 -EIO / -ETIMEDOUT。
+ */
+int gpgpu_vram_alloc(struct gpgpu_device *dev, u64 size, struct list_head *blocks, u64 *offset,
+		      bool for_bo);
 void gpgpu_vram_free(struct gpgpu_device *dev, struct list_head *blocks);
 
 /* ---- gpgpu_bo.c ---- */
@@ -456,6 +479,24 @@ struct gpgpu_bo *gpgpu_bo_lookup(struct gpgpu_fpriv *fpriv, u32 handle);
 bool gpgpu_bo_range_ok(struct gpgpu_bo *bo, u64 offset, u64 size);
 void gpgpu_bo_drop(struct gpgpu_bo *bo);
 void gpgpu_bo_release_all(struct gpgpu_fpriv *fpriv);
+/**
+ * gpgpu_dma_copy() - 提交并等待一次内核物理 DMA 搬运
+ * @dev: 设备；调用者持 dma_lock，不持 dev->lock，并保持设备引用。
+ * @to_host: true 为 VRAM 到 Host；false 为 Host 到 VRAM。
+ * @host: Outbound GPU 物理地址，不是 CPU 地址或原始 DMA/IOVA。
+ * @vram: VRAM 字节偏移；两端存储与范围由调用者校验并保活。
+ * @size: 非零字节数，不超过两端存储范围。
+ *
+ * 1. 检查设备在位、无致命故障且没有旧 DMA 结果未知；
+ * 2. 复用同一份 IRQ/completion 发布逻辑，写源、目的、长度并启动；
+ * 3. 等待中断并核对 DMA 状态，超时设置 dma_uncertain，完成后执行读屏障。
+ *
+ * 不取得或释放调用者的锁，不管理 BO users 或 buddy 链表。超时时调用者
+ * 必须保留本次源和目的；不能用全局 dma_uncertain 判断本次是否已启动。
+ *
+ * Return: 0、未启动或已停止的 DMA 错误 -EIO，或本次结果未知 -ETIMEDOUT。
+ */
+int gpgpu_dma_copy(struct gpgpu_device *dev, bool to_host, u64 host, u64 vram, u32 size);
 int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args);
 int gpgpu_bo_cache_sync(struct gpgpu_fpriv *fpriv, struct gpgpu_cache_sync *args);
 

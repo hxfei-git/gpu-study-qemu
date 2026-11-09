@@ -13,10 +13,6 @@
 #include "bar0.h"
 #include "mem/access.h"
 
-/* vram_size 属性的下限与上限（不含），单位字节；上限即 Outbound 起点。 */
-#define VRAM_SIZE_MIN 4096
-#define VRAM_SIZE_LIMIT GPGPU_OUTBOUND_BASE
-
 /* ---- 跨模块入口 ---- */
 
 void gpgpu_set_error(GPGPUState *s, uint32_t error)
@@ -24,6 +20,21 @@ void gpgpu_set_error(GPGPUState *s, uint32_t error)
 	s->error_status |= error;
 	s->global_status |= GPGPU_STATUS_ERROR;
 	gpgpu_raise_irq(s, GPGPU_IRQ_ERROR);
+}
+
+bool gpgpu_trace_enabled(GPGPUState *s)
+{
+	return s->trace_dispatch || s->profile_dispatch;
+}
+
+bool gpgpu_profile_enabled(GPGPUState *s)
+{
+	return s->profile_dispatch;
+}
+
+bool gpgpu_shared_fetch_enabled(GPGPUState *s)
+{
+	return s->shared_fetch;
 }
 
 bool gpgpu_enabled(GPGPUState *s)
@@ -42,6 +53,11 @@ void gpgpu_set_busy(GPGPUState *s, bool busy)
 bool gpgpu_gpuvm_enabled(GPGPUState *s)
 {
 	return s->gpuvm;
+}
+
+bool gpgpu_tensor_native_enabled(GPGPUState *s)
+{
+	return s->tensor_native;
 }
 
 bool gpgpu_engines_idle(GPGPUState *s)
@@ -166,9 +182,8 @@ void gpgpu_global_write(GPGPUState *s, hwaddr reg, uint32_t value)
 
 static bool gpgpu_check_properties(GPGPUState *s, Error **errp)
 {
-	if (s->vram_size < VRAM_SIZE_MIN || s->vram_size >= VRAM_SIZE_LIMIT ||
-	    !is_power_of_2(s->vram_size)) {
-		error_setg(errp, "gpgpu: vram_size must be a power of two in [4 KiB, 2 GiB)");
+	if (s->vram_size != GPGPU_VRAM_SIZE) {
+		error_setg(errp, "gpgpu: vram_size must be 2 GiB");
 		return false;
 	}
 	return true;
@@ -253,6 +268,10 @@ static void gpgpu_reset(DeviceState *dev)
 
 static const Property gpgpu_properties[] = {
 	DEFINE_PROP_BOOL("gpuvm", GPGPUState, gpuvm, true),
+	DEFINE_PROP_BOOL("trace_dispatch", GPGPUState, trace_dispatch, false),
+	DEFINE_PROP_BOOL("profile_dispatch", GPGPUState, profile_dispatch, false),
+	DEFINE_PROP_BOOL("shared_fetch", GPGPUState, shared_fetch, false),
+	DEFINE_PROP_BOOL("tensor_native", GPGPUState, tensor_native, false),
 	DEFINE_PROP_UINT32("num_cus", GPGPUState, num_cus, GPGPU_DEFAULT_NUM_CUS),
 	DEFINE_PROP_UINT32("warps_per_cu", GPGPUState, warps_per_cu, GPGPU_DEFAULT_WARPS_PER_CU),
 	DEFINE_PROP_UINT64("vram_size", GPGPUState, vram_size, GPGPU_DEFAULT_VRAM_SIZE),

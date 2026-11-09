@@ -22,6 +22,16 @@
 | SIMT | Single Instruction, Multiple Threads | 单指令多线程 |
 | FP32 / FP16 / FP8 / FP4 | Floating Point 32 / 16 / 8 / 4-bit | 对应位宽的浮点格式 |
 | BF16 | Brain Floating Point 16-bit | 16 位浮点格式 |
+| INT8 / W8 | 8-bit Integer / 8-bit Weight Storage | 8 位有符号整数／8 位权重存储 |
+| RMSNorm | Root Mean Square Normalization | 均方根归一化 |
+| KV | Key / Value | 注意力的键和值 |
+| DFL | Distribution Focal Loss | 分布焦点损失；本文指检测头的分布投影 |
+| RSS / PSS | Resident Set Size / Proportional Set Size | 常驻内存量／按比例分摊共享映射的常驻内存量 |
+| SIMD | Single Instruction, Multiple Data | 单指令多数据 |
+| FMA / MAC | Fused Multiply-Add / Multiply-Accumulate | 融合乘加／乘累加 |
+| FLOP / GFLOP/s | Floating-Point Operation / Giga Floating-Point Operations per Second | 浮点运算次数／每秒十亿次浮点运算 |
+| INT64 | 64-bit Integer | 64 位整数 |
+| NMS | Non-Maximum Suppression | 非极大值抑制 |
 | ReLU | Rectified Linear Unit | 线性整流函数 |
 | CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
 | ACK | Acknowledgment | 确认；本版用于确认已经读取执行结果 |
@@ -38,6 +48,8 @@
 | ROCr | ROCm Runtime | ROCm 的异构计算运行时 |
 | HSAKMT | HSA Kernel Mode Thunk | HSA 内核接口封装层；此处仅借鉴接口风格 |
 | KMT | Kernel Mode Thunk | 本仓库 `lib/kmt/` 薄层的简称 |
+| RT | Runtime | 本仓库 `lib/rt/` 小运行时 |
+| PC / PID | Program Counter / Process Identifier | 程序计数器／进程编号 |
 | QOM | QEMU Object Model | QEMU 对象模型 |
 | AQL | Architected Queuing Language | HSA 队列包格式 |
 | MQD / HQD | Memory Queue Descriptor / Hardware Queue Descriptor | 内存／硬件队列描述符 |
@@ -65,7 +77,8 @@
 一次计算从应用一路走到 RV64 线程，依次经过五层代码。每一层只调用下一层公开的接口，所有层共用 `include/gpgpu/` 中的协议头：
 
 ```text
-demos/gpgpu-demo.c          准备数据、调用运行时、比较结果
+demos/gpgpu-demo.c          小型计算示例
+或 gpgpu-model-eval.c       真实算子输入、派发与完整结果比较
   │ gpgpu_rt_*()
 lib/rt/                     装载 Kernel、组 AQL 包、准备 Signal、等待完成
   │ gpgpuKmt*()
@@ -78,13 +91,13 @@ hw/gpgpu/ + firmware/       QEMU 设备模型与 RV64 CP 固件
 
 协议头位于 `software/gpgpu/include/gpgpu/`，不是 QEMU 顶层的 `include/`。各组件都以 `gpgpu/...` 的形式包含这些头文件：QEMU 由顶层 `meson.build` 用 `-iquote` 把 `software/gpgpu/include` 加入搜索路径；固件、驱动和用户库的 Makefile 用 `-I` 指向同一位置。
 
-协议头按内容拆分：`gpgpu_regs.h` 是 BAR0 寄存器，`gpgpu_cp_map.h` 是 CP 私有地址空间，`gpgpu_queue_abi.h` 是 MQD、管理命令、AQL 包、Kernel 描述对象与 Signal，`gpgpu_ih_abi.h` 是 IH 记录，`gpgpu_vm_abi.h` 是页表项与 GPUVA 布局，`gpgpu_version.h` 是协议版本，`uapi/gpgpu_drm.h` 只描述 ioctl。用户态只包含后三者中的 `uapi/gpgpu_drm.h`、`gpgpu_queue_abi.h` 与 `gpgpu_vm_abi.h`，看不到寄存器。
+协议头按内容拆分：`gpgpu_regs.h` 是 BAR0 寄存器，`gpgpu_cp_map.h` 是 CP 私有地址空间，`gpgpu_queue_abi.h` 是 MQD、管理命令、AQL 包、Kernel 描述对象与 Signal，`gpgpu_ih_abi.h` 是 IH 记录，`gpgpu_vm_abi.h` 是页表项与 GPUVA 布局，`gpgpu_version.h` 是协议版本，`uapi/gpgpu_drm.h` 只描述 ioctl。KMT/RT 只包含用户 ABI：`uapi/gpgpu_drm.h`、`gpgpu_queue_abi.h` 与 `gpgpu_vm_abi.h`，看不到寄存器。`gpgpu_tensor_abi.h` 定义有界矩阵／布局指令的通用参数前缀；算子回放器与手写 Kernel 共用 `gpgpu_eval_abi.h`，其前缀引用通用定义，另加软件操作编号和数学常量。
 
 设备模型 `hw/gpgpu/` 按硬件模块分目录，每个模块只访问自己的状态，跨模块通过对方头文件中的函数：
 
 - `gpgpu.c` 负责 QOM/PCI 组装、全局寄存器和复位顺序；`bar0.c` 把 BAR0 每个 0x100 字节的寄存器组挂成独立子区域，统一检查访问宽度，并提供 CP 本地寄存器窗口。
 - `cp/`：`cp_ctrl` 管理原生 CP 的复位与启动，`cp_window` 是 CP 访问 GPU 地址的 64 KiB 窗口，另有 `hqd` 与 `doorbell`。
-- `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv64` 是解释器，`lane_mem` 负责取指与 4／8 字节访存。
+- `compute/`：`dispatch` 处理执行器寄存器与 CP 握手，`scheduler` 按 warp 分段推进，`rv64` 解释标量和自定义指令，`lane_mem` 负责取指与 1／4／8 字节数据访存；`tensor` 通过用户访存读取有界块，执行矩阵或布局指令。
 - `mem/`：`access`（设备内全部 GPU 业务访存的入口，按访问类型经过或绕过 dcache）、`vram`、`phys`（GPU 物理地址到 VRAM 或 Outbound 的路由）、`gpuvm`（用户地址翻译、页缓存属性与故障记录）、`dcache`（WB 数据读写的缓存与维护命令，行为见 [dcache 规格](<../../docs/dcache 第一版规格.md>)）、`dma`。直接读写后备存储的函数只在 `mem/backend.h` 中声明，其他模块经 `access.h` 访问。
 - `irq/`：`irq` 是中断锁存与 PCI 通知，`ih` 是通知记录 Ring。
 
@@ -92,7 +105,7 @@ CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` �
 
 Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
 
-协议当前为版本 6，与版本 5 的差异见 [PROTOCOL_V6.md](./PROTOCOL_V6.md)；更早的差异见 [PROTOCOL_V5.md](./PROTOCOL_V5.md)、[PROTOCOL_V4.md](./PROTOCOL_V4.md) 与 [PROTOCOL_V3.md](./PROTOCOL_V3.md)。
+协议当前为版本 7，组件升级见 [PROTOCOL_V7.md](./PROTOCOL_V7.md)；缓存接口的变化见 [PROTOCOL_V6.md](./PROTOCOL_V6.md)，更早的差异见同目录的历史版本。
 
 ## 1. 应用提交与统一访存
 
@@ -124,7 +137,7 @@ CP 用户访问 / RV64 取指与数据访问
 
 GPUVM 开启时，叶子项没有标为不可缓存的页按 WB 访问，数据读写在权限检查之后经过设备共用的 dcache，VRAM 与 Host 数据都可以缓存；GPUVM 关闭时数据访问都不进入 dcache。取指不经过 dcache；页表遍历、CP 管理域、BAR2、DMA 与 IH 按 DEVICE 访问。Ring、进度、Signal 和通知页是不可缓存对象，驱动的控制对象只经管理域和 IH 访问；CPU 直接改写可缓存对象后，要先失效设备中的旧副本再发布任务。缓存行为与交接顺序见 [dcache 规格](<../../docs/dcache 第一版规格.md>)。
 
-**[DESIGN]** GPU 物理地址为 32 位，布局固定：`[0, vram_size)` 属于 VRAM，`[vram_size, 0x8000_0000)` 是不可路由的空洞，`[0x8000_0000, 0x1_0000_0000)` 属于 Outbound。窗口起点与 VRAM 容量无关，长度为 2 GiB。Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0xc100_0000`；IOVA 0 对应 `0x8000_0000`，允许正常使用。
+**[DESIGN]** GPU 物理地址为 32 位，VRAM 固定为 2 GiB，与 Outbound 在 `0x8000_0000` 边界相邻，中间没有空洞。首页与固件保留区的完整布局见 [CP/MEC 规格第 3.1 节](<../../docs/CP_MEC 第一版规格.md#spec-firmware-layout>)。Outbound 为 `[0x8000_0000, 0x1_0000_0000)`；Host IOVA `0x4100_0000` 对应 GPU 物理地址 `0xc100_0000`，IOVA 0 对应 `0x8000_0000`，允许正常使用。
 
 Outbound 布局由设备固定，BAR0 `0x0b00` 起的布局寄存器只读；驱动在启动 CP 前读回核对，再写 `OUTBOUND_CONTROL` 打开窗口并读取确认状态。窗口由整个设备共用，队列运行期间不重配。DMA 分配统一采用 31 位 mask，保留原始 DMA 地址供 DMA API 释放和映射，转换后的 GPU 物理地址写入设备协议。Host BO 仍逐对象使用 `dma_alloc_coherent()`。
 
@@ -172,7 +185,7 @@ CP 的管理域和用户域显式区分，不根据 `VMID == 0` 猜测地址含�
 
 `csrr` 汇编为 `CSRRS rd, csr, x0`。执行器仅接受此只读形式；`rd=x0` 也先检查 CSR 是否有效。未知 CSR、写入及其他未支持形式均返回指令错误。汇编器接受数字与 `.equ` 常量，并检查 CSR 编号范围。
 
-执行器的整数寄存器与 PC 为 64 位，现有指令子集按 RV64 语义执行，另有 LD、SD 读写 64 位指针。`a0` 直接保存 64 位 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数块每项 8 字节，Kernel 用 `ld` 读取。24 字节 Kernel 描述对象在偏移 `0x00` 保存 64 位代码入口，在 `0x10` 保存 `kernel_abi_version=6`，`0x14` 的保留字段为 0，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本 6，组件必须一起更新。
+执行器的整数寄存器与 PC 为 64 位，现有指令子集按 RV64 语义执行，另有 LD、SD 读写 64 位指针。`a0` 直接保存 64 位 `kernarg_address`：开启 GPUVM 时为 GPUVA，关闭时为 GPU 物理地址。参数块每项 8 字节，Kernel 用 `ld` 读取。24 字节 Kernel 描述对象在偏移 `0x00` 保存 64 位代码入口，在 `0x10` 保存当前 `GPGPU_KERNEL_ABI_VERSION`，`0x14` 的保留字段为 0，其他值被拒绝；AQL 包仍为 64 字节。设备、固件、驱动、用户库与描述对象共用协议版本，组件必须一起更新。
 
 <a id="stack-runtime"></a>
 
@@ -193,6 +206,38 @@ KMT 中的 `gpgpuKmtReserve()`、`gpgpuKmtPublish()`、`gpgpuKmtWaitSignal()` �
 另有一个生命周期示例：同一条队列存活期间释放输出数组、重新分配后再派发一次，两次各比较 17,003 个结果。第二次派发前还会改写 X 并经 COPY 重新上传，结果按新输入比较。它在第一次派发前打印 X、Y、Z 的设备地址，GPUVM 开启时就是这三个数组在进程中的 CPU 地址，关闭时是 GPU 物理地址。
 
 任一数值比较、提交、等待或正常资源回收失败，程序返回非零退出码。
+
+<a id="model-operator-replay"></a>
+
+真实算子由 `scripts/gpgpu_model_eval.py` 和 `demos/gpgpu-model-eval.c` 配合回放，不向客体安装模型框架。以 Qwen decode 的 RMSNorm 为例，主机已有真实输入、权重和 CPU 参考输出，客体要算出全部 896 个结果再逐值比较：
+
+```text
+主机：固定模型、输入与 CPU 参考
+  → prepare：生成命令块，按原 stride 恢复输入的物理存储布局
+  → run：启动同一 1 GiB ARM64 客体与远端设备
+       → 客体回放器：分配 BO，用小 staging 分块上传输入和权重
+       → RT/KMT → AQL → CP → RV64 Kernel
+            归约：每行平方和 → 均值加 epsilon → 倒数范数
+            缩放：每个输入乘倒数范数及对应权重 → 完整输出
+       → 分块回读全部输出 → 与 CPU 参考比较 → 正常回收
+```
+
+`kernels/model_eval.S` 实现计算与布局操作，`model_math.inc` 提供其使用的数学近似。复合算子包含全部归约、逐元素处理和分块派发，`operator_ns` 覆盖参数上传与同步；输入文件读取、分配清零、映射、输入 H2D、验证 D2H 和 CPU 比较分别记录。离线打包只恢复输入原有的 stride，网络中的复制、重复和拼接仍由设备执行，不能把 CPU 参考结果作为设备输出。
+
+回放器默认使用 `--backend scalar`，每个 Lane 按原标量指令计算输出。选择 `--backend block` 后，线性投影、批次矩阵乘、卷积、复制、拼接和 nearest 的 Lane 改为处理一个有界工作块，其他算子及复合归约保留原标量步骤。矩阵 Kernel 仍逐块推进 K，全部分块与布局工作都计入 `operator_ns`，不在 CPU 预先计算 im2col 或输出。指令与参数合同见[硬件手册](<../../docs/GPGPU_硬件手册.html#tensor-block>)；运行配置、实际路径和结果在第 5 节维护。
+
+`run --dual` 在同一个 ARM64 客体中启动两个独立回放进程，分别打开设备、建立自己的队列和地址空间。两个进程使用同一份冻结材料，各自持有输入与输出，按文件屏障协调：
+
+```text
+Qwen 进程：装载与建队列 → ready ─┐
+YOLO 进程：装载与建队列 → ready ─┴→ 主机发布 start
+                                    → 各自回放、完整回读比较 → 各自写 done
+两个 done 均可见 → 主机发布 release → 两进程分别卸载与释放
+```
+
+准备与回收不插入另一进程的长任务中；共同运行期间仍沿 CP 的整 Dispatch 串行调度。每个正式算子的 `operator_ns` 和共同回放区间的宿主墙钟分别保存。后者包含预热、回读验证及屏障观察，不是纯计算时间；先完成的进程等待共同收尾，有限样本的后段可能已解除竞争，不能作为持续饱和负载的稳态吞吐。
+
+**[BOUNDARY]** 当前是独立算子回放。Qwen 的输入和已有 KV 来自原权重 FP32 网络，W8 算子另与同一份 INT8/scale 的 FP32 参考比较；设备误差与量化误差分开记录，不代表完整量化模型的生成质量。数学近似针对材料中的有限输入范围，不是完整 libm；实际覆盖、运行命令、性能估算与日志均见下一节。
 
 <a id="build-and-validation"></a>
 
@@ -245,6 +290,88 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 > **[SOURCE]** 共享配置参数见 [gpgpu_linux.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>) [第 44 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:44:1>)，配置函数与 Linux 入口分别见[第 161 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:161:1>)、[第 168 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_linux.py:168:1>)；首次构建的自动配置见 [Makefile.gpgpu](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>) [第 33～45 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/Makefile.gpgpu:33:1>)。
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
+
+<a id="model-eval-results"></a>
+
+**真实模型算子评估（协议 7）。** 基线为 `17a00fd99de65c2b4fe0255c2f2d621385a26014` 加工作区改动。各阶段的代码快照、组件散列、实际命令、原始样本、错误和日志保存在 `build/gpgpu-validation/model-ops/run-20261108/`；以下目录名均相对于该位置。显存和组件升级见 [PROTOCOL_V7.md](./PROTOCOL_V7.md)。
+
+材料固定为官方 Qwen2.5-0.5B-Instruct revision `7ae557604adf67be50417f59c2c2f167def9a775` 与用户提供的原版 YOLO11n 权重；后者 SHA-256 为 `0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1`。CPU 导出环境在 `build/gpgpu-model-eval/venv/`，依赖锁及下载来源在 `material/`。完整配置、真实文本／图像、精度、量化规则和散列以[参考清单](../../build/gpgpu-model-eval/reference-v2/manifest.json)为准；其 SHA-256 为 `9731c2d5018b870bf6c9cf5728aa966ec5a6fed31b3d029cabe0f9c59510c019`。导出耗时和 RSS 是准备成本，不是设备计算性能。
+
+`block-full-v2` 在 GPUVM 开启、数据页 WB、共享取指、远端设备 O2 构建及块后端下，完整比较通过 250 个数值签名、18,398,447 个输出元素。139 个签名使用张量块指令，111 个使用保留的标量路径；未把元数据视图或原 FP32 对照算成设备执行。数值签名对应冻结调用清单中的 2,635 次调用，另有 225 个元数据签名和 24 个仅供原权重 FP32 对照的签名。BMM、COPY、RoPE 的非连续输入按原 stride 恢复存储，实际复制与拼接仍在设备执行。
+
+比较保持预定的 `atol=rtol=2e-4`，COPY、CONCAT／STACK、NEAREST 按原始位比较，整数精确比较，失败值为零。全组最大绝对误差为 0.00390625，最大相对 L2 为约 `1.4011e-6`；大绝对误差出现在数值较大的 BMM 输出，仍满足逐值绝对／相对容差组合，未因失败放宽阈值。独立量化参考的相对 L2 为约 `6.20e-5～1.35e-2`，它衡量相同真实 FP32 输入上的 W8 与原权重算子差异，不是完整量化网络的生成质量。
+
+**执行与分块的实测变化。** 初始逐 Lane 组在 O0 下保留三次样本；扩展代表组、共享取指组和 O2 组使用同一冻结数据。以完整 prefill 投影 X[128,896]、W[128,896] 为例，`lane-broad-v2` 为 24.321 s，`warp-broad-v2` 为 6.570 s，`o2-warp-extended-v2` 为 2.521 s。剖析确认小 W8 投影的逻辑 Lane 指令数不变，而实际取指／字段译码从 1,038,475 次降到 32,463 次；数据请求量不变。共享内容只含静态字段，类别合法性和执行仍逐 Lane 处理。
+
+同一 O2 设备上，`scalar-max-extended-v2` 把派发容量取自共享线程上限，完整 prefill 投影为 2.336 s、全部 lm_head 为 21.736 s、YOLO 首层卷积为 2.697 s；`block-full-v2` 分别为 0.02575 s、0.70948 s、0.04179 s。DFL 仍使用标量复合步骤，大分块后约 0.480 s，块后端没有把它伪计成矩阵加速。`block-profile-v2` 与正式计时分开：prefill 投影实际完成 14,680,064 MAC，使用 1,792 个安全 SIMD 块、无 SoftFloat 回退；布局计数也与真实完整元素数对应。按每 MAC 计 2 FLOP，该投影的完整算子有效吞吐约 1.14 GFLOP/s；此口径不另计反量化、偏置和整数索引，也不是实体 GPU 峰值。
+
+`tile-default-v2`、`tile-max-v2`、`tile-max-uncached-v2` 和 `tile-max-off-v2` 各选同一组真实算子，预热一次、正式三次。DFL 中位数由 2.115 s 降到 0.489 s，代表复制由 0.830 s 降到 0.188 s。该复制在 on+UNCACHED 下约 0.224 s，off 约 14.409 s。off 的数据均为 DEVICE，而 on+UNCACHED 没有改变 RT 自身参数页的 WB 属性：每 Lane 读取 Host 参数在 off 下会反复经过 Outbound／socket。因此该组不能作为纯地址翻译开销对照，也不支持靠删除少量检查或缓存维护来选择 off；本轮未增加 off 专用快路径。
+
+执行升级采用有界矩阵／布局指令，而不扩展跨轮预译码缓存或计算核 TCG/JIT。共享取指已实际减少约 32 倍取指与字段译码；O2 代表组的旧估算中，prefill 主要耗在线性投影，长上下文 decode 则有大量复制。继续缓存指令不能消除这些逐元素索引、数据请求和浮点操作；TCG/JIT 还需要代码、别名、映射与权限的失效约定。本轮让通用块指令合并确实连续的访存并跨独立输出使用 SIMD，保留原用户访存和故障路径；这是一项显式指令扩展，不称为普通译码优化。
+
+**模型时间与空间预算。** `block-full-v2/estimate.json` 全部使用已测完整数值签名，算子和约为：prefill128 150.44 s；decode 的既有上下文 128／512／2048 分别为 11.57／13.61／20.51 s；YOLO 320×320 单图为 18.81 s。加必要输入和最终输出 COPY 的常驻估算约为 150.48、11.60／13.65／20.55、18.90 s；冷启动准备外推后约为 400.05、215.07／229.29／284.93、31.61 s。这里的冷启动指设备数据尚未驻留，未强制清空宿主文件缓存，也不包含客体启动或材料散列核对。全签名组每例只有一个正式样本，不能把相同上下界称作置信区间或稳定性证明；旧代表组的未测签名与相容类外推均在各自估算文件中显式记录。
+
+预算统计完整去重权重：Qwen 约 496 MB，YOLO 约 10.6 MB。保留全部数值输出到网络结束、不复用输出，仅复用最大 scratch 时，Qwen 各场景规划数据量约 529～964 MB，YOLO 约 76.9 MB；页表、对齐碎片和控制对象不含在这些数值内，尚未实测完整网络同时分配。运行记录中的两套 QEMU 分别采样 PSS，不能把共享映射的 RSS 简单相加；全签名组各次采样均无交换。
+
+当前常驻估算约为 decode 11.6～20.6 s/token、YOLO 18.9 s/图，建议暂缓交互生成与实时检测应用集成。后续若推进，范围宜限定为离线功能原型：先解决 RT 最多登记 32 个对象时的权重打包、缓冲区复用和 KV 生命周期，再实测完整网络同时分配、逐层误差累积与检测结果。独立算子比较通过尚不能证明完整量化模型或检测应用可用。
+
+大对象准备也单列记录：decode embedding 上传 136,742,408 B，使用 64 KiB staging、2,089 个块，覆盖大于旧单 BO 上限及非整块尾部。`vram_clear_dma=1` 使用驱动私有零源加速未发布 BO 的清零，默认仍关闭；页表页保持锁内 BAR 清零。按叶表范围复用 PTE 定位后，同一大表的 `buffer_setup_ns` 从约 23.37 s 降到 9.33 s；实际分配清零约 5.65 s、文件读取约 33.48 s、H2D 约 6.39 s。数据读取仍是冷启动的重要成本。DMA 清零的正常路径、非零偏移、尾块及同址复用后全零已核对，超时／移除竞争尚未做定向注入。
+
+**同客体双进程竞争。** `competition-*` 使用 Qwen decode128 的完整 lm_head 与 YOLO DFL，每例预热一次、正式三次。两边是同一客体内两个不同 PID，分别使用独立用户队列，输出、正常回收与内核日志均通过。分块 65,536 时，单跑中位数分别为 702.8／482.0 ms，共同运行分别为 769.4／1197.7 ms，slowdown 为 1.095／2.485。Qwen 的最长 Dispatch 约 699 ms，YOLO 的已观测最长排队下界约 701 ms，符合 CP 要先完成整个 Dispatch 的行为。
+
+把分块降到 1,024 后，单跑分别为 729.5／2088.7 ms，共同运行分别为 747.4／2245.5 ms，slowdown 为 1.025／1.075；YOLO 最长排队下界降到约 155 ms，但宿主共同区间由 4.943 s 增到 12.072 s。较短 Dispatch 提供了更多换队列机会，更多派发／参数上传／同步也提高了总开销，不能只按 slowdown 选择小分块。大分块下 YOLO 三次样本为约 1206.0、1197.7、499.3 ms，末段因 Qwen 先完成而接近单跑；不把这一有限重放称为稳态双模型运行。
+
+生命周期配对使用同一设备进程的宿主时钟，分别保留 Doorbell、Dispatch 和 CP 推进 R 的时刻。排队值只报告提醒到开始的已观测下界；小分块单跑还出现一次 CP 轮询先于 Doorbell，记录为不可由提醒推算排队，未强行记零。原始样本、PID、队列归属、资源与全部事件保存在下方竞争来源索引中。
+
+独立的 `competition-profile-*` 每进程只取一个正式样本、不预热，用于资源诊断而非性能成绩。单跑与双进程的逻辑指令、实际取指、数据请求和字节数相同；Qwen 的 TLB 未命中均为 75,429 次，YOLO 从 455 次变为 460 次，两边 dcache 未命中都没有整体增长。本组合观察到的主要延迟变化是整 Dispatch 排队，没有看到明显的段内缓存计数恶化；这不说明其他负载没有缓存竞争。驱动锁等待未单独计量，不能给出精确占比。
+
+固件、默认与 O2 两套 QEMU 构建通过，汇编器入口通过 8 个编码用例；标准指令与自定义指令均已同 GNU as 逐字节核对，自定义指令使用 GNU `.insn r4` 作独立参考。完整 O2 QTest 为寄存器 7/7、CP 14/14，包含共享 Lane 顺序与 W8 的 K 分块／末块偏置／行列尾部。标准 `test-gpgpu-stack` 在 GPUVM 开、关下的计算与生命周期示例均比较通过，内核日志检查通过。局部字节存储的定向核对另验证特殊浮点、宿主环境恢复、INT64 转换、空洞和后行故障；它不替代真实 GPUVM 验证。所有 socket 限制、早期高位地址截断和编译／测试修正前的失败记录均保留，未记成模型数值通过。
+
+独立代码评审确认的六项问题均已修复：共享头的增量构建依赖、`copy_` 源输入、估算样本隔离、实际材料散列核对、退出码原子发布及手册版本依据。定向核对拒绝被改写的 job／原数组／打包数据，也拒绝仅含竞争样本或混入竞争样本的单模型估算；重新准备的全部真实 job 与打包数据逐字节不变，原单模型估算不变。评审后复跑完整 QTest、标量／块两条 `copy_` 路径和两种分块的双进程回放，输出、正常回收与内核日志均通过。临时核对材料留在 `build/`，不增加长期测试框架。
+
+最终用户态 `all check` 与结构体、接口的 `kernel-doc` 通过。Linux `checkpatch` 为 0 errors、2 warnings，分别是新增文件的 MAINTAINERS 提示与 `noinline` 属性的宏建议；QEMU 检查器仍对两处单语句 `for` 要求花括号，与本仓库规则相反，按仓库约定保留。原始诊断和退出码均保存，不把这些风格检查写成全通过。文档链接只完成路径、锚点与行号的静态核对，未实际点击 Windows VS Code 预览。
+
+> **[SOURCE] 原始记录**
+>
+> - 材料与覆盖：[参考清单](../../build/gpgpu-model-eval/reference-v2/manifest.json)、[回放参数](../../build/gpgpu-model-eval/jobs-v1/jobs.json)、[量化误差汇总](../../build/gpgpu-validation/model-ops/run-20261108/initial/coverage-quantization.json)。
+> - 阶段结果：[逐 Lane](../../build/gpgpu-validation/model-ops/run-20261108/lane-broad-v2/result.json)、[共享取指](../../build/gpgpu-validation/model-ops/run-20261108/warp-broad-v2/result.json)、[O2 代表组](../../build/gpgpu-validation/model-ops/run-20261108/o2-warp-extended-v2/result.json)、[标量大分块](../../build/gpgpu-validation/model-ops/run-20261108/scalar-max-extended-v2/result.json)、[全部签名](../../build/gpgpu-validation/model-ops/run-20261108/block-full-v2/result.json)及[模型预算](../../build/gpgpu-validation/model-ops/run-20261108/block-full-v2/estimate.json)。
+> - 执行与访存：[共享剖析](../../build/gpgpu-validation/model-ops/run-20261108/profile-warp-v2/result.json)、[块剖析](../../build/gpgpu-validation/model-ops/run-20261108/block-profile-v2/result.json)、[分块与 GPUVM 对照](../../build/gpgpu-validation/model-ops/run-20261108/initial/tile-vm-summary.json)。
+> - 竞争：[汇总](../../build/gpgpu-validation/model-ops/run-20261108/initial/competition-summary.json)、[大分块单跑](../../build/gpgpu-validation/model-ops/run-20261108/competition-solo-max-v2/result.json)、[大分块双进程](../../build/gpgpu-validation/model-ops/run-20261108/competition-dual-max-v2/result.json)、[小分块单跑](../../build/gpgpu-validation/model-ops/run-20261108/competition-solo-small-v2/result.json)、[小分块双进程](../../build/gpgpu-validation/model-ops/run-20261108/competition-dual-small-v2/result.json)、[缓存计数汇总](../../build/gpgpu-validation/model-ops/run-20261108/initial/competition-cache-summary.json)及[单跑](../../build/gpgpu-validation/model-ops/run-20261108/competition-profile-solo-v2/result.json)／[双进程](../../build/gpgpu-validation/model-ops/run-20261108/competition-profile-dual-v2/result.json)剖析。
+> - 回归与边界：[完整 QTest](../../build/gpgpu-validation/model-ops/run-20261108/initial/block-full-qtest-v2.json)、[全栈](../../build/gpgpu-validation/model-ops/run-20261108/final-stack-v2/summary.json)、[浮点与块访存定向核对](../../build/gpgpu-validation/model-ops/run-20261108/initial/tensor-directed-v2.log)、[同址清零](../../build/gpgpu-validation/model-ops/run-20261108/directed-zero/run-v2/result.json)、[GNU R4 独立编码核对](../../build/gpgpu-validation/model-ops/run-20261108/tensor-encoding-v2/result.json)。
+> - 评审与复验：[六项问题及修复依据](../../build/gpgpu-validation/model-ops/run-20261108/initial/independent-review.json)、[主机定向核对](../../build/gpgpu-validation/model-ops/run-20261108/review-host-v1/result.json)、[QTest 与设备复验命令](../../build/gpgpu-validation/model-ops/run-20261108/initial/review-device-v2.json)、[Linux 风格与 kernel-doc](../../build/gpgpu-validation/model-ops/run-20261108/initial/final-style-v2.json)、[QEMU 风格原始诊断](../../build/gpgpu-validation/model-ops/run-20261108/initial/final-qemu-checkpatch-v5.log)。
+
+<a id="model-eval-commands"></a>
+
+复用冻结材料时无需再次导出。`run` 在启动客体前核对所选 job、原始数组与对应 stride 打包数据的 SHA-256，拒绝内容变化；核对成本另存 `material_verification`，不计入算子时间，但读取会预热宿主文件缓存。`estimate` 只接受单进程通过记录，双进程等待不能混入单模型成本。
+
+`run --output` 必须指定新的结果目录，不能覆盖已有样本；下面的 `--tile` 取当前共享能力上限，调整分块时同时保留实际命令和结果。默认 QEMU 配置仍为 O0；独立 O2 构建的参数记录在 `initial/qemu-o2-build.json`，本轮远端设备显式使用该二进制，A57 Host 的 QEMU 保持默认构建。
+
+```sh
+# 查看已冻结的材料和覆盖，不运行模型。
+python3 -I software/gpgpu/scripts/gpgpu_model_eval.py inventory \
+  build/gpgpu-model-eval/reference-v2/manifest.json
+
+# 如需重新生成 job，使用新的目录；原始参考数据保持不变。
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_eval.py prepare \
+  build/gpgpu-model-eval/reference-v2/manifest.json --output build/gpgpu-model-eval/jobs-new
+
+# 在同一 1 GiB 客体逐例回放；不用 --case-regex 时包含全部数值签名。
+python3 -I software/gpgpu/scripts/gpgpu_model_eval.py run build/gpgpu-model-eval/jobs-v1 \
+  --output build/gpgpu-validation/model-ops/user-run-new \
+  --device-qemu build/arm64-qemu-o2/qemu-system-riscv64 \
+  --execution warp --backend block --tile 65536 --driver-param vram_clear_dma=1 \
+  --device-arg=-global --device-arg=gpgpu.tensor_native=on
+
+# 只接受通过且配置、组件和冻结清单一致的运行。
+python3 -I software/gpgpu/scripts/gpgpu_model_eval.py estimate \
+  build/gpgpu-model-eval/reference-v2/manifest.json \
+  build/gpgpu-validation/model-ops/user-run-new/result.json \
+  --output build/gpgpu-validation/model-ops/user-run-new/estimate.json
+```
+
+**[BOUNDARY]** 上述数据是独立算子回放与按真实调用次数汇总的模型估算，不是完整网络推理。KV 来自 CPU 参考，常驻估算假设上下文已驻留；冷启动未计 tokenizer、预处理、mask 构造、采样、生成控制、NMS、界面或未实现的融合。双进程只覆盖上述有限回放组合。完整模型质量、全部对象同时分配、DMA 超时／移除竞争和非 x86 宿主实际构建仍未验证。
+
+以下是协议 6 的既有记录，不替代协议 7 的真实算子验证。
 
 **统一访存入口与页缓存属性的验证。** 本轮在提交 `18504d0` 加未提交改动的代码上运行，命令与日志归档在 `build/gpgpu-validation/unified-mem-access/`，不会被下一次运行覆盖：
 

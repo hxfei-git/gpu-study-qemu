@@ -31,7 +31,7 @@
 | MTYPE | Memory Type | AMDGPU 页表项中的内存类型字段 |
 | ISA | Instruction Set Architecture | 指令集架构 |
 
-本文维护教学设备数据缓存第一版的已确认设计。寄存器偏移、位域与复位值见[硬件手册第 19 章](<./GPGPU_硬件手册.html#dcache-registers>)，协议升级差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)，代码位置、构建命令和实际验证结果见[软件栈说明](<../software/gpgpu/README.md#build-and-validation>)。协议常量以 `software/gpgpu/include/gpgpu/` 为准。
+本文维护教学设备数据缓存第一版的已确认设计，当前接口为协议版本 7。数据缓存在协议版本 6 引入，相关设计差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)；当前升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)。寄存器偏移、位域与复位值见[硬件手册第 19 章](<./GPGPU_硬件手册.html#dcache-registers>)，代码位置、构建命令和实际验证结果见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。协议常量以 `software/gpgpu/include/gpgpu/` 为准。
 
 **[BOUNDARY]** 这是自定义教学设备的缓存模型，不声明复现 MI300X 的缓存层级或默认内存类型。与 AMD 的对照见[第 10 节](#dcache-amd)。
 
@@ -349,13 +349,15 @@ CP 有两条访存路径，只有经访存窗口用户域、页属性为 WB 的�
        └─ 管理域 → 访存入口（DEVICE）
 ```
 
-固件代码、数据和栈位于固定保留区 `[0x03c0_0000, 0x0400_0000)`。用户域访问这段地址时被 GPUVM 拒绝，管理域又按 DEVICE 访问，所以固件区的字节不会有缓存副本，dcache 也不需要按地址范围排除它。
+固件代码、数据和栈的保留范围统一见[CP/MEC 规格第 3.1 节](<./CP_MEC 第一版规格.md#spec-firmware-layout>)。用户域访问固件区时被 GPUVM 拒绝，管理域又按 DEVICE 访问，所以固件区的字节不会有缓存副本，dcache 也不需要按地址范围排除它。
 
 CP 在固件区原生写入临时 IH 记录，IH 模块按 DEVICE 读它；驱动经 BAR2 装载固件。两者都按原有发布顺序进行。
 
-原生 RAM 别名覆盖整个 VRAM，复位向量仍沿用现有入口规则。现有固件经访存窗口访问公共 GPU 对象；自定义 CP 程序若用原生指针访问可缓存对象，必须先完成第 6 节的交接，不能与 dcache 同时访问同一行。本版不提供强制隔离。
+原生 RAM 别名覆盖整个 VRAM，复位向量按上述固件布局配置。现有固件经访存窗口访问公共 GPU 对象；自定义 CP 程序若用原生指针访问可缓存对象，必须先完成第 6 节的交接，不能与 dcache 同时访问同一行。本版不提供强制隔离。
 
-代码由数据写入产生时，执行前要先回写 dcache，以后加入 icache 时再失效 icache。经 BAR2 或 DMA 上传的代码由旁路维护处理。本版不支持执行期间修改自身代码，取指前也不自动回写 dcache。QEMU 原生 CP 的 TCG 翻译状态不作为本设备的 icache。
+代码由数据写入产生时，先结束对旧代码的访问，完成新内容写入并回写 dcache，确认成功后才发布使用新代码的 Dispatch。经 BAR2 或 DMA 上传的代码由旁路维护处理。取指前不自动回写 dcache；以后加入 icache 时，还须在发布前失效相应指令副本。
+
+**[BOUNDARY]** 本版不支持执行期间修改自身代码，也不支持通过热改页表改变当前任务正在访问的映射。没有在途访问依赖的映射仍可按[GPUVM 规格第 5.2 节](<./GPUVM 第一版规格.md#52-queue-存活期间同步修改页表>)同步更新，完成 TLB 失效后才供后续任务使用。QEMU 原生 CP 的 TCG 翻译状态不作为本设备的 icache。
 
 <a id="dcache-stats"></a>
 

@@ -58,13 +58,15 @@
 
 本文集中保存本实验已经确认的架构、行为与接口约束。寄存器名称参考 AMD，实验语义以本文的 `[DESIGN]` 为准，不声明兼容 AMD 的完整硬件协议。
 
-**[DESIGN]** 当前接口为协议版本 6。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其 VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
+**[DESIGN]** 当前接口为协议版本 7。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其旧固件布局、VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
 
-设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。与版本 5 的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)，更早的差异见 [PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>) 与 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
+设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。当前升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)，更早的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)、[PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>) 与 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
+
+> **[SOURCE]** 当前工作树（协议版本 7）：[gpgpu_version.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>) [第 17～22 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>)定义统一协议版本，Kernel ABI 版本也引用该定义。
 
 <a id="spec-overview"></a>
 
-阶段状态见[实验进度](<./实验进度.md>)，范围见[实验大纲](<./QEMU GPGPU 实验大纲.md>)。当前代码与运行命令见[软件栈说明](<../software/gpgpu/README.md>)，验收结果只记录于其中第 5、6 节。寄存器、位域与复位值查阅[硬件手册](<./GPGPU_硬件手册.html>)；旧实现分析和 AMD/gem5 依据见[历史参考](<./历史/CP_MEC 软件实现、参考与扩展.md>)。当前公共库和绑定接口见[GPUVM 规格第 8 节](<./GPUVM 第一版规格.md#gpuvm-device-host-interface>)。
+阶段状态见[实验进度](<./实验进度.md>)，范围见[实验大纲](<./QEMU GPGPU 实验大纲.md>)。当前代码、运行命令与验证结果见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。寄存器、位域与复位值查阅[硬件手册](<./GPGPU_硬件手册.html>)；旧实现分析和 AMD/gem5 依据见[历史参考](<./历史/CP_MEC 软件实现、参考与扩展.md>)。当前公共库和绑定接口见[GPUVM 规格第 8 节](<./GPUVM 第一版规格.md#gpuvm-device-host-interface>)。
 
 ## 1. 整体架构与执行路径
 
@@ -136,7 +138,7 @@ HQD 保存状态，CP 读取状态并执行命令，计算执行器执行 Kernel
 
 Host 建立一条队列时，需要准备 Ring、MQD 和进度内存。MQD 保存队列配置与需要恢复的状态；装入 HQD 后，CP 使用 HQD 中的活动状态读取 Ring。卸载保存时，消费位置和错误快照写回原 MQD，供以后恢复或诊断。MQD 的 64 字节布局与装载、保存范围见[第 2.6 节](#spec-mqd-format)。
 
-**[DESIGN]** GPU 物理空间分为 VRAM `[0, vram_size)`、不可路由的空洞 `[vram_size, 0x8000_0000)` 和固定的 Outbound `[0x8000_0000, 0x1_0000_0000)`。用户访问在 GPUVM 开启时先翻译，关闭时直接使用输入地址；管理对象始终使用 GPU 物理地址。两类访问汇入同一个物理入口，再按范围访问 VRAM 或经 PCIe DMA 访问 Host RAM。
+**[DESIGN]** GPU 物理空间按[第 3.1 节的固定布局](#spec-firmware-layout)划分为相邻的 VRAM 和 Outbound，中间没有空洞。用户访问在 GPUVM 开启时先翻译，关闭时直接使用输入地址；管理对象始终使用 GPU 物理地址。两类访问进入同一个物理入口，再按范围访问 VRAM 或经 PCIe DMA 访问 Host RAM。
 
 <a id="spec-ring-mqd-storage"></a>
 
@@ -195,11 +197,10 @@ CP 本地窗口 load/store
   → 显式访问域
       ├─ 用户域：gpuvm=on 时按 VMID 翻译，off 时直通
       └─ 管理域：输入直接作为 GPU 物理地址
-  → 公共物理入口
-      ├─ [0, vram_size) → VRAM
-      ├─ [vram_size, 0x8000_0000) → 空洞，路由失败
-      └─ [0x8000_0000, 0x1_0000_0000) → 减 0x8000_0000 得到 Host IOVA
-                                            → PCIe DMA → SMMUv3（启用时）→ Host RAM
+  → 公共物理入口（范围见第 3.1 节）
+      ├─ VRAM → 设备存储
+      └─ Outbound → 减 0x8000_0000 得到 Host IOVA
+                         → PCIe DMA → SMMUv3（启用时）→ Host RAM
 ```
 
 CP 的代码、栈和控制寄存器仍使用自己的裸机地址；Host 经 BAR2 读写 VRAM。下面只列 CP 本地窗口，不能将这些地址当作 Kernel 的特殊地址：
@@ -355,7 +356,7 @@ Host 只能读到完整旧值或完整新值
 
 **[DESIGN]** 现有三个示例固定把代码、描述对象和数组放在 VRAM，把参数及队列相关对象放在 Host coherent 存储。库返回统一的 `gpu_address`，调用方用该值填写描述对象、AQL 和参数中的数组指针；参数的 `cpu` 映射供 Host 填写数据。
 
-以向量加法为例，下面设 `gpuvm=off`、VRAM 为 64 MiB，参数的 Host IOVA 为 `0x4100_2000`：
+以向量加法为例，下面设 `gpuvm=off`，物理范围沿用[第 3.1 节](#spec-firmware-layout)，参数的 Host IOVA 为 `0x4100_2000`：
 
 ```text
 Dispatch.kernel_object = 0x4000 → VRAM 中的 24 字节描述对象
@@ -666,41 +667,48 @@ HQD 中 R = 7（32 位）
 
 Host 装载固件后，CP 要持续从 VRAM 取指，并使用其中的栈和全局数据。驱动为 Kernel 和应用数据分配显存时，需要避开这些空间。
 
-**[DESIGN]** 第二阶段采用 64 MiB VRAM 配置。Linux 内核驱动维护设备统一的显存管理功能，管理从偏移 0 开始的前 60 MiB；最后 4 MiB 固定保留给 CP 固件。下面的地址均为 VRAM 字节偏移，不引入设备虚拟地址：
+**[DESIGN]** 设备固定提供 2 GiB VRAM，不接受其他容量。Linux 内核驱动管理固件区之前的 2044 MiB；末尾 4 MiB 固定保留给 CP 固件。图中使用左闭右开区间，VRAM 地址也是相应的字节偏移：
 
 ```text
-VRAM：0x0000_0000 ～ 0x03ff_ffff（64 MiB）
+VRAM：[0x0000_0000, 0x8000_0000)（2 GiB）
 │
-├─ Linux 内核驱动统一管理：0x0000_0000 ～ 0x03bf_ffff（60 MiB）
+├─ Linux 内核驱动统一管理：[0x0000_0000, 0x7fc0_0000)（2044 MiB）
 │    ├─ 首个 Host 页：登记为保留，避免普通显存分配结果为 0
 │    └─ 其余空间：由驱动分配、记录占用和回收
-│         └─ Kernel 描述对象、Kernel 代码、X/Y/Z 等应用数据
+│         └─ 页表、Kernel 描述对象、Kernel 代码、X/Y/Z 等应用数据
 │
-└─ CP 固件保留区：0x03c0_0000 ～ 0x03ff_ffff（4 MiB）
+└─ CP 固件保留区：[0x7fc0_0000, 0x8000_0000)（4 MiB）
      │
-     ├─ 0x03c0_0000 ～ 0x03fe_ffff（4032 KiB）
-     │    ├─ 固件入口：0x03c0_0000
+     ├─ [0x7fc0_0000, 0x7fff_0000)（4032 KiB）
+     │    ├─ 固件入口：0x7fc0_0000
      │    ├─ 固件代码、只读常量
      │    ├─ 已初始化的全局变量
      │    └─ 启动时清零的全局变量、静态工作区
      │
-     └─ 0x03ff_0000 ～ 0x03ff_ffff（64 KiB）
+     └─ [0x7fff_0000, 0x8000_0000)（64 KiB）
           └─ CP 栈，向低地址增长
-               初始 sp = 0x0400_0000
+               初始 sp = 0x8000_0000
+
+紧邻 VRAM 的 GPU 物理区间：
+[0x8000_0000, 0x1_0000_0000) → Outbound → Host IOVA [0, 0x8000_0000)
 ```
 
-CP 地址 `0～vram_size-1` 对应 VRAM 的相同字节偏移。Host 经 `BAR2 基址 + 0x03c0_0000` 写入入口代码，将 `CP_RESET_VECTOR` 设置为 `0x03c0_0000`；解除复位后，CP 从这个本地地址取指。Host 的 BAR 总线地址不能直接填入 CP 入口寄存器。
+VRAM 末端与 Outbound 起点相接，没有不可路由的中间空洞。60～64 MiB 段也属于普通分配范围，不再单独保留给固件。
 
-固件按固定入口链接，第一版不处理运行地址重定位。链接脚本安排代码、只读常量、全局变量和静态工作区，检查它们完整落在前 4032 KiB 内，不得越入栈区。Host 装载时检查目标范围，固件内容越界就拒绝装载。`sp` 初始指向栈区末尾的后一位置，压栈时先减小，再访问栈内地址；栈预算为 64 KiB。4 MiB 是固定保留容量，后续若调整容量或地址布局，须同步修改链接脚本和驱动中的范围定义。
+CP 在 VRAM 范围内的本地地址对应相同字节偏移。Host 经 `BAR2 基址 + GPGPU_FIRMWARE_BASE` 写入入口代码，将 `CP_RESET_VECTOR` 设置为 `GPGPU_FIRMWARE_BASE`；解除复位后，CP 从这个本地地址取指。Host 的 BAR 总线地址不能直接填入 CP 入口寄存器。
 
-驱动中的显存管理功能按设备维护一份统一的空闲、占用和保留状态，记录已分配区间及其所属上下文，负责实际 VRAM 空间的分配与回收。管理范围从偏移 0 开始，覆盖完整的前 60 MiB；首个 Host 页也由该功能登记为保留，普通分配从保留页之后开始。
+容量、固件基址与栈边界只在 `software/gpgpu/include/gpgpu/gpgpu_cp_map.h` 定义，设备与驱动共同引用。固件构建先预处理 `link.ld`，再用生成的链接脚本安排代码、只读常量、全局变量和静态工作区。链接脚本检查这些内容完整落在固件区的前 4032 KiB 内，不得越入栈区。Host 装载时也检查代码与数据的目标范围，越界就拒绝装载。固件按固定入口链接，不处理运行地址重定位。
 
-**[DESIGN]** 参考 AMD 驱动的做法，底层复用内核通用伙伴分配器：目标内核提供 `gpu_buddy` 时使用该接口；目标内核仍提供 `drm_buddy` 时使用对应实现。驱动按设备建立一个分配器实例，管理前 60 MiB，并负责请求校验、并发保护、对象归属及释放时机。普通显存对象仍申请固定连续区间；开启 GPUVM 时由页表映射到该物理区间，关闭时绑定直接返回物理地址。
+`sp` 初始指向栈区末尾的后一位置，本身不属于 VRAM。压栈时先减小 `sp`，再访问栈内地址，因此不会把栈顶数值当作 CP 本地访存窗口来访问；栈预算为 64 KiB。
+
+驱动按设备维护统一的空闲、占用和保留状态，记录已分配区间及其所属上下文。分配器的管理上界是 `GPGPU_VRAM_USABLE_SIZE`，首页在初始化时先登记为保留，普通分配从保留页之后开始。
+
+**[DESIGN]** 参考 AMD 驱动的做法，底层复用内核通用伙伴分配器：目标内核提供 `gpu_buddy` 时使用该接口；目标内核仍提供 `drm_buddy` 时使用对应实现。驱动按设备建立一个分配器实例，并负责请求校验、并发保护、对象归属及释放时机。普通显存对象仍申请固定连续区间；开启 GPUVM 时由页表映射到该物理区间，关闭时绑定直接返回物理地址。
 
 ```text
 应用通过运行时申请 VRAM
   → Linux 内核驱动检查大小、对齐和其他请求条件
-  → 调用 gpu_buddy 或目标内核的 drm_buddy，从前 60 MiB 分配区间
+  → 调用 gpu_buddy 或目标内核的 drm_buddy，在首页之后、固件区之前分配区间
   → 驱动记录占用与所属上下文，将分配结果交给运行时
   → 运行时准备数据，CP 和执行器按对象绑定返回的 GPU 地址访问 VRAM
   → 设备访问结束且满足资源释放条件后，驱动调用分配器回收区间
@@ -708,7 +716,14 @@ CP 地址 `0～vram_size-1` 对应 VRAM 的相同字节偏移。Host 经 `BAR2 �
 
 QEMU 提供显存存储和设备访问接口；应用、运行时和 CP 使用驱动已经分配的显存对象。通用伙伴分配器组织空闲块并完成分配、拆分、回收与合并，驱动维护对象所属上下文及使用状态。构建时须核对目标内核的头文件、配置与导出符号，并启用对应组件；两种接口的关系和 AMD 依据见[通用伙伴分配器说明](<./历史/CP_MEC 软件实现、参考与扩展.md#vram-buddy-allocator>)。
 
-末尾 4 MiB 固件保留区不进入普通显存分配池。这块保留区属于设备，应用退出、队列销毁或 CP 暂时复位都不释放它。更新固件前先停止 CP，并确认相关设备访问已经结束；CP 单独复位的影响见第 3.3 节。
+固件保留区不进入普通显存分配池。这块保留区属于设备，应用退出、队列销毁或 CP 暂时复位都不释放它。更新固件前先停止 CP，并确认相关设备访问已经结束；CP 单独复位的影响见第 3.3 节。
+
+> **[SOURCE] 固定布局与使用方**，当前工作树（协议版本 7）：
+>
+> - 唯一布局定义：[gpgpu_cp_map.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_cp_map.h:18:1>) [第 18～31 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_cp_map.h:18:1>)；设备拒绝其他容量，见 [gpgpu.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:163:1>) [第 163～169 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:163:1>)。
+> - 链接与预处理：[link.ld](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:8:1>) [第 8～26 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:8:1>)引用共享宏并限制代码、数据上界；[firmware/Makefile](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/Makefile:23:1>) [第 23～26 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/Makefile:23:1>)先生成预处理后的链接脚本。
+> - 分配器范围与首页保留：[gpgpu_vram.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vram.c:16:1>) [第 16～24 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vram.c:16:1>)，普通连续分配见同文件[第 62～70 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_vram.c:62:1>)。
+> - 装载范围与入口：[gpgpu_dev.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:309:1>) [第 309～319 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/linux/gpgpu_dev.c:309:1>)在保持 CP 复位后写入固件，并用共享基址配置复位向量。
 
 **[BOUNDARY]** 用户访问在公共入口继续保护 VRAM 首页和固件存储区。当前工作区保留固定固件链接布局与启动初始化，任务统一经队列提交；代码与测试说明见[实现说明](<./历史/CP_MEC 软件实现、参考与扩展.md#implementation>)。
 
@@ -724,21 +739,21 @@ BAR 写入、DMA 写入、计算解释器写入和冷复位清零都应使对应
 
 ### 3.2 配置并激活 KIQ 后解除复位
 
-驱动先在 CP 保持复位、没有活跃 HQD 或在途访问时读回核对 Outbound 布局，再写 CONTROL 并读取确认状态；随后按下列顺序配置 IH、KIQ 和固件。两种 GPUVM 状态都必须核对设备版本与固件握手值为 3。
+驱动在 CP 保持复位时装载固件。没有活跃 HQD 或在途访问时，驱动读回核对 Outbound 布局，写 CONTROL 并确认，再配置 IH 和 KIQ。两种 GPUVM 状态都必须核对设备版本；启动后的固件握手值也须匹配共享的 `GPGPU_PROTOCOL_VERSION`，不能沿用旧组件的版本。
 
 **[DESIGN]** 队列模式在固件启动流程中配置 KIQ，顺序如下：
 
 ```text
 Host 写 CP_CTRL.RESET_HOLD = 1，读回确认
   → 经 BAR2 将固件代码和已初始化数据装入固定保留区
-  → 设置 CP_RESET_VECTOR = 0x03c0_0000
+  → 设置 CP_RESET_VECTOR = GPGPU_FIRMWARE_BASE（布局见第 3.1 节）
   → 准备 KIQ Ring、MQD 和相关内存，保持 KIQ 槽位 ACTIVE = 0
   → 通过 HQD 窗口填写 Ring 地址、容量、指针、MQD 地址、Doorbell 配置和队列格式
   → 保证配置和内存初始化对 CP 可见
   → 最后设置 KIQ 槽位 ACTIVE = 1
   → 执行访问屏障，读回确认写入完成
   → 写 CP_CTRL.RESET_HOLD = 0
-  → CP 从固定入口执行固件，设置 sp = 0x0400_0000
+  → CP 从固定入口执行固件，设置 sp = GPGPU_FIRMWARE_STACK_TOP
   → 清零未初始化全局变量，初始化异常处理和内部状态
   → 检查 KIQ 的 ACTIVE 和可用命令，开始处理队列
 ```
@@ -1602,7 +1617,7 @@ CP 已取得 Dispatch，接下来读取 24 字节描述对象、核对 Kernel AB
 
 ```text
 Dispatch → kernel_object → 用户域读取描述对象
-  → 检查 kernel_abi_version = 5、保留字段为 0、代码与参数范围及对齐
+  → 检查 kernel_abi_version = GPGPU_KERNEL_ABI_VERSION、保留字段为 0、代码与参数范围及对齐
   → 保存 gpuvm_enabled、VMID、HQD 槽、代码和参数地址、长度与工作规模
   → 新建 Warp：填写一次共享启动状态，再填写各 Lane 线程坐标
   → 令 PC = 代码入口，初始化 mhartid，并令各有效 Lane 的 a0 = kernarg_address（64 位）
@@ -1617,11 +1632,11 @@ Dispatch → kernel_object → 用户域读取描述对象
 偏移 0x00：code_entry          代码入口的 GPU 地址，64 位
 偏移 0x08：code_size           代码区域的字节长度，32 位
 偏移 0x0c：kernarg_size        参数块的字节长度，32 位
-偏移 0x10：kernel_abi_version  固定为 5，32 位
+偏移 0x10：kernel_abi_version  GPGPU_KERNEL_ABI_VERSION，32 位
 偏移 0x14：reserved            必须为 0，32 位
 ```
 
-CP 拒绝其他 ABI 版本和非零保留字段。代码入口按 4 字节对齐，代码长度非零且为 4 字节整数倍。CP 先确认入口低于用户地址上限，再检查剩余长度，越界的入口不会让减法回绕；检查通过后把入口的低、高 32 位分别写入 `KERNEL_ADDR_LO/HI`。执行器每次取指仍受声明代码范围约束。描述对象可供同一 Kernel 的多次提交复用，AQL 包仍为 64 字节。
+`GPGPU_KERNEL_ABI_VERSION` 引用本文开头的统一协议版本。CP 拒绝不匹配的 ABI 版本和非零保留字段。代码入口按 4 字节对齐，代码长度非零且为 4 字节整数倍。CP 先确认入口低于用户地址上限，再检查剩余长度，越界的入口不会让减法回绕；检查通过后把入口的低、高 32 位分别写入 `KERNEL_ADDR_LO/HI`。执行器每次取指仍受声明代码范围约束。描述对象可供同一 Kernel 的多次提交复用，AQL 包仍为 64 字节。
 
 #### 6.2.2 Host 参数块的布局与长度
 
@@ -1641,7 +1656,7 @@ CP 拒绝其他 ABI 版本和非零保留字段。代码入口按 4 字节对齐
 
 #### 6.2.3 计算线程用真实 a0 读取参数
 
-`a0 = kernarg_address`。以 GPUVM 关闭、64 MiB VRAM 为例，参数 Host IOVA 为 `0x4100_2000`，对应 GPU 物理地址 `0xc100_2000`：
+`a0 = kernarg_address`。以下关闭 GPUVM，物理范围沿用[第 3.1 节](#spec-firmware-layout)；参数 Host IOVA 为 `0x4100_2000`，对应 GPU 物理地址 `0xc100_2000`：
 
 ```text
 Kernel 执行 ld t0, 24(a0)，a0 = 0xc100_2000
@@ -1769,11 +1784,27 @@ IDLE → 提交 → BUSY → DONE 或 FAILED
 
 忙时重提、未确认时修改配置、非法寄存器宽度或越权访问均保留当前任务及结果，另置全局 `INVALID_CMD`，不能借此覆盖当前 `DISPATCH_ERROR`。
 
+<a id="spec-executor-segments"></a>
+
 #### 6.3.4 执行器分段推进与 CP 等待
 
-**[DESIGN]** 启动操作及时返回，执行器后续分段执行，各段之间保留线程状态，执行预算持续累计。CP 检查执行状态期间，执行器必须能够继续推进；Host 在 Ring 有可复用槽时也能继续发布任务。
+**[DESIGN]** CP 已交付本次网格、代码和参数，执行器需要完成全部 Warp，再交回终态。启动操作及时返回，之后由 QEMU 定时器分段推进：
 
-第一版仍按整个 Dispatch 调度。CP 等待当前任务时不启动其他队列的任务，完成当前任务及收尾后再返回队列主循环。执行器分段推进只是让 QEMU 有机会处理其他活动，不改变本版一次完整执行一个 Dispatch 的队列选择规则。
+```text
+CP 写 DISPATCH → 定时器开始一段
+                 → 当前 Warp 按 Lane 编号执行一轮
+                 → 段用完，或本轮包含有界张量指令
+                     → 保存线程状态，让 QEMU 处理其他活动
+                     → 下一段从原位置继续
+                 → 全部 Warp 完成或首个错误 → 发布 DONE / FAILED
+CP 等待终态 → 读取结果并写 ACK → 完成当前包收尾 → 返回队列主循环
+```
+
+标量路径按本段轮数上限让出；张量指令处理的数据较多，所以执行完包含该指令的整轮后提前让出。两种路径都按原 Lane 顺序保留副作用，累计执行预算不重置。共享取指规则和张量指令的范围分别见[硬件手册第 14.4 节](<./GPGPU_硬件手册.html#fragment-page-stage2--gpu--gpu-datasheet--124-warp>)与[第 15.4 节](<./GPGPU_硬件手册.html#tensor-block>)。
+
+CP 等待期间，Host 在 Ring 有可复用槽时仍能发布任务。第一版按整个 Dispatch 调度：CP 要先完成当前任务及收尾，再选择其他队列，分段让出不提供队列抢占。
+
+> **[SOURCE]** 当前工作树（基线 `17a00fd` 加本轮改动，协议 7）：[scheduler.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/compute/scheduler.c:156:1>) [第 156 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/compute/scheduler.c:156:1>)的 `task_run_warp()` 在整轮结束后检查让出请求；[rv64.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/compute/rv64.c:718:1>) [第 718 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/compute/rv64.c:718:1>)的 `exec_tensor()` 发出该请求，并保留本 Lane 的异常与 PC 更新顺序。
 
 > **[SOURCE]** 当前代码版本 `38cf573`：[software/gpgpu/include/gpgpu/gpgpu_regs.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:103:1>) 的[第 103～159 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_regs.h:103:1>)集中定义分发配置、代码与参数长度、状态、错误和确认寄存器。接入前固定提交 `57543dd` 的 [gpgpu_dispatch.c，第 14～39 行](https://github.com/hxfei-git/gpu-study-qemu/blob/57543dd54b6b046b888277272fa84af81746b1ac/hw/gpgpu/gpgpu_dispatch.c#L14-L39)是同步提交处理，只用于理解后续分段推进为何需要独立的结果握手。
 
@@ -2598,7 +2629,7 @@ CP 本地物理地址：
   0xffff_0300～0xffff_03ff → 槽位 3：供用户队列申请
 ```
 
-四个槽位共映射 `0x400` 字节，即 1 KiB。每个槽位预留 256 字节的寄存器地址范围，其中采用的 15 个 32 位寄存器占 60 字节，其余位置未采用。这里划定的是 CP 的寄存器地址范围，不从前 60 MiB VRAM 分配池中分配 1 KiB；Ring 和 MQD 仍使用 Host RAM，Ring 容量由 `CP_HQD_PQ_CONTROL` 指定。
+四个槽位共映射 `0x400` 字节，即 1 KiB。每个槽位预留 256 字节的寄存器地址范围，其中采用的 15 个 32 位寄存器占 60 字节，其余位置未采用。这里划定的是 CP 的寄存器地址范围，不占用[第 3.1 节的 VRAM 分配池](#spec-firmware-layout)；Ring 和 MQD 仍使用 Host RAM，Ring 容量由 `CP_HQD_PQ_CONTROL` 指定。
 
 `HQD_SELECT` 只改变 Host 窗口的访问对象，不复制 HQD 内容，也不改变 CP 正在处理的队列。接着将它改为 3 时：
 
@@ -2629,7 +2660,7 @@ Host 驱动用锁保护“选槽—访问窗口”，写入选择值后先回读
 
 ## 9. 软件接口约定与确认记录
 
-**[BOUNDARY] 历史确认记录。** 本节保留 2026-10-17～2026-10-19 的原始方案与“尚待实现”表述。这里的 VMID 0、Host 物理地址、旧参数窗口、同步回归及调用方提交职责只说明当时版本；当前实现以第 1～8 节及[GPUVM 规格](<./GPUVM 第一版规格.md>)为准，不按本节旧约定恢复兼容实现。
+**[BOUNDARY] 历史确认记录。** 本节保留 2026-10-17～2026-10-19 的原始方案与“尚待实现”表述，包括当时的固件地址和协议版本。这里的 VMID 0、Host 物理地址、旧参数窗口、同步回归及调用方提交职责也只说明当时版本；当前实现以第 1～8 节及[GPUVM 规格](<./GPUVM 第一版规格.md>)为准，现行固件布局见[第 3.1 节](#spec-firmware-layout)，不按本节旧约定恢复兼容实现。
 
 确认日期与范围归并如下，具体约定仍在对应编号下保存，不再另抄摘要：
 

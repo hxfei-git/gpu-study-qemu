@@ -45,7 +45,7 @@ struct rt_object {
  * @event: 本次派发的事件；派发失败时保留到 destroy。
  * @pending_events: 计算已完成、驱动尚未允许销毁的旧事件。
  * @pending_count: 待回收事件数。
- * @failed: 派发已发布但结果未确认，不能再改写参数块与 Signal。
+ * @failed: 派发或 COPY 结果未确认，不能再改写共享对象或复用暂存区。
  */
 struct GpgpuRt {
 	GpgpuKmtContext *context;
@@ -184,25 +184,86 @@ GpgpuKmtStatus gpgpu_rt_destroy(GpgpuRt *rt)
 	return GPGPU_KMT_SUCCESS;
 }
 
+/* 整段必须位于 VRAM 对象内，Host 数据地址的末尾也不能回绕。 */
+static bool rt_range_valid(const GpgpuKmtMemory *buffer, uint64_t offset, const void *data,
+			   size_t size)
+{
+	return buffer && data && size && buffer->kind == GPGPU_MEMORY_VRAM &&
+		size <= buffer->size && offset <= buffer->size - size &&
+		size <= UINTPTR_MAX - (uintptr_t)data;
+}
+
+GpgpuKmtStatus gpgpu_rt_upload_range(GpgpuRt *rt, GpgpuKmtMemory *buffer, uint64_t offset,
+				     const void *data, size_t size)
+{
+	const uint8_t *bytes = data;
+	GpgpuKmtStatus status;
+
+	/* 1. 完整范围先校验，不能因前几块合法而先写入部分内容。 */
+	if (!rt || !rt_range_valid(buffer, offset, data, size))
+		return GPGPU_KMT_INVALID_PARAMETER;
+	if (rt->failed)
+		return GPGPU_KMT_UNAVAILABLE;
+
+	/* 2. 每块 COPY 成功后才复用暂存区，VRAM 偏移始终为 offset + done。 */
+	for (size_t done = 0; done < size;) {
+		size_t chunk = rt->staging->size;
+
+		if (chunk > size - done)
+			chunk = size - done;
+		memcpy(rt->staging->cpu, bytes + done, chunk);
+		status = gpgpuKmtCopyMemory(rt->staging, 0, buffer, offset + done, chunk,
+					    GPGPU_COPY_H2D);
+		if (status != GPGPU_KMT_SUCCESS) {
+			if (status == GPGPU_KMT_WAIT_TIMEOUT || status == GPGPU_KMT_WAIT_FAILURE)
+				rt->failed = true;
+			return status;
+		}
+		done += chunk;
+	}
+	return GPGPU_KMT_SUCCESS;
+}
+
+GpgpuKmtStatus gpgpu_rt_download_range(GpgpuRt *rt, GpgpuKmtMemory *buffer, uint64_t offset,
+				       void *data, size_t size)
+{
+	uint8_t *bytes = data;
+	GpgpuKmtStatus status;
+
+	/* 1. 完整范围先校验，出界时不修改 Host 目标或启动 COPY。 */
+	if (!rt || !rt_range_valid(buffer, offset, data, size))
+		return GPGPU_KMT_INVALID_PARAMETER;
+	if (rt->failed)
+		return GPGPU_KMT_UNAVAILABLE;
+
+	/* 2. 只把已确认成功的块交给 Host，失败块不复制到目标。 */
+	for (size_t done = 0; done < size;) {
+		size_t chunk = rt->staging->size;
+
+		if (chunk > size - done)
+			chunk = size - done;
+		status = gpgpuKmtCopyMemory(rt->staging, 0, buffer, offset + done, chunk,
+					    GPGPU_COPY_D2H);
+		if (status != GPGPU_KMT_SUCCESS) {
+			if (status == GPGPU_KMT_WAIT_TIMEOUT || status == GPGPU_KMT_WAIT_FAILURE)
+				rt->failed = true;
+			return status;
+		}
+		memcpy(bytes + done, rt->staging->cpu, chunk);
+		done += chunk;
+	}
+	return GPGPU_KMT_SUCCESS;
+}
+
 GpgpuKmtStatus gpgpu_rt_upload(GpgpuRt *rt, GpgpuKmtMemory *buffer, const void *data,
 			       size_t size)
 {
-	if (!rt || !data || size > rt->staging->size)
-		return GPGPU_KMT_INVALID_PARAMETER;
-	memcpy(rt->staging->cpu, data, size);
-	return gpgpuKmtCopyMemory(rt->staging, 0, buffer, 0, size, GPGPU_COPY_H2D);
+	return gpgpu_rt_upload_range(rt, buffer, 0, data, size);
 }
 
 GpgpuKmtStatus gpgpu_rt_download(GpgpuRt *rt, GpgpuKmtMemory *buffer, void *data, size_t size)
 {
-	GpgpuKmtStatus status;
-
-	if (!rt || !data || size > rt->staging->size)
-		return GPGPU_KMT_INVALID_PARAMETER;
-	status = gpgpuKmtCopyMemory(rt->staging, 0, buffer, 0, size, GPGPU_COPY_D2H);
-	if (status == GPGPU_KMT_SUCCESS)
-		memcpy(data, rt->staging->cpu, size);
-	return status;
+	return gpgpu_rt_download_range(rt, buffer, 0, data, size);
 }
 
 GpgpuKmtStatus gpgpu_rt_buffer_alloc(GpgpuRt *rt, size_t size, GpgpuKmtMemory **buffer)

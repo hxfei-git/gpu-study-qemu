@@ -33,8 +33,12 @@
  * @bar0_regions: BAR0 的寄存器组子区域。
  * @num_cus: 属性：DEV_CAPS 报告的计算单元数。
  * @warps_per_cu: 属性：DEV_CAPS 报告的每单元 warp 数。
- * @vram_size: 属性：VRAM 字节数，2 的幂，4 KiB 到 2 GiB（不含）。
+ * @vram_size: 属性：固定 VRAM 字节数，由共享布局定义。
  * @gpuvm: 属性：用户地址是否经 GPUVM 翻译，设备寿命内不变。
+ * @trace_dispatch: 属性：向设备日志输出宿主机时钟的 Dispatch 汇总。
+ * @profile_dispatch: 属性：额外统计执行与访存次数，开启时也输出汇总。
+ * @shared_fetch: 属性：每轮相同 PC 的 lane 共享取指和字段译码。
+ * @tensor_native: 属性：允许安全的宿主 SIMD，否则使用 SoftFloat。
  * @global_ctrl: GLOBAL_CTRL 中锁存的 ENABLE 位。
  * @global_status: GLOBAL_STATUS 的 READY/BUSY/ERROR 位。
  * @error_status: ERROR_STATUS 锁存的错误位。
@@ -59,6 +63,10 @@ struct GPGPUState {
 	uint32_t warps_per_cu;
 	uint64_t vram_size;
 	bool gpuvm;
+	bool trace_dispatch;
+	bool profile_dispatch;
+	bool shared_fetch;
+	bool tensor_native;
 	uint32_t global_ctrl;
 	uint32_t global_status;
 	uint32_t error_status;

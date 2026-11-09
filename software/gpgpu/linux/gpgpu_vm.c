@@ -46,7 +46,7 @@ struct gpgpu_vm_table {
 	u64 offset;
 };
 
-/* 从 VRAM 分配一页已清零的页表页，挂到 VM 的 tables 链表并返回偏移。 */
+/* 表页始终锁内 BAR2 清零，再挂入 VM；不能失锁等待 DMA。 */
 static int vm_table_alloc(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 *offset)
 {
 	struct gpgpu_vm_table *table = kzalloc(sizeof(*table), GFP_KERNEL);
@@ -56,7 +56,7 @@ static int vm_table_alloc(struct gpgpu_device *dev, struct gpgpu_vm *vm, u32 *of
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&table->blocks);
-	ret = gpgpu_vram_alloc(dev, PAGE_SIZE, &table->blocks, &table->offset);
+	ret = gpgpu_vram_alloc(dev, PAGE_SIZE, &table->blocks, &table->offset, false);
 	if (ret) {
 		kfree(table);
 		return ret;
@@ -143,24 +143,48 @@ static int vm_invalidate_range(struct gpgpu_device *dev, struct gpgpu_vm *vm, u6
 }
 
 /*
- * 写 [va, va + size) 的叶子 PTE：flags 非零时逐页写入
- * “(page + 偏移) | VALID | flags”，page 是地址域起点，Host 对象为 IOVA 且
- * flags 带 SYSTEM，VRAM 对象为 VRAM 偏移。flags 为 0 表示撤销映射，把叶子
- * 项清零，中间级本就不存在的页跳过。是否撤销看 flags 而不看 page：IOVA 0
- * 是合法的 Host 页。写完后由调用者失效 TLB。
+ * vm_set_ptes() - 按叶表范围写入或撤销一段 PTE
+ *
+ * MAP/UNMAP 持 dev->lock 调用，表页不会在函数内失锁。page 为地址域起点：
+ * Host 对象是 IOVA，flags 带 SYSTEM；VRAM 对象是 VRAM 偏移。flags=0 撤销，
+ * 不用 page=0 判断，因为 IOVA 0 也合法。
+ *
+ * 一张叶表覆盖 span，表内相邻 PTE 相差 sizeof(u64) 字节。例如从
+ * VA=0x1f_f000 修改两页时，先写本表最后一项，再重新定位下一张叶表。
+ *
+ * 1. 每段只沿目录找到一次叶子位置，缺失的撤销段直接跳过；
+ * 2. 在同一叶表内逐页写入“物理页 | VALID | flags”或零，再进入下一段。
+ *
+ * 函数不失效 TLB，交由调用者在写完后执行；失败前的写入不回退。
+ *
+ * Return: 0 表示成功，否则为表页分配或查找错误。
  */
 static int vm_set_ptes(struct gpgpu_device *dev, struct gpgpu_vm *vm, u64 va, u64 size,
 		       u64 page, u64 flags)
 {
-	for (u64 i = 0; i < size; i += PAGE_SIZE) {
-		u32 leaf;
-		int ret = vm_leaf(dev, vm, va + i, flags != 0, &leaf);
+	const u64 span = 1ULL << GPGPU_VM_LEVEL_SHIFT(GPGPU_VM_LEVELS - 2);
+	u64 done = 0;
 
-		if (ret == -ENOENT && !flags)
-			continue;
-		if (ret)
+	while (done < size) {
+		u64 addr = va + done;
+		u64 chunk = min(size - done, span - (addr & (span - 1)));
+		u32 leaf;
+		int ret;
+
+		/* 1. 目录查找只做一次，后续不跨越这张叶表的末尾。 */
+		ret = vm_leaf(dev, vm, addr, flags != 0, &leaf);
+		if (ret && (ret != -ENOENT || flags))
 			return ret;
-		writeq(flags ? (page + i) | GPGPU_VM_VALID | flags : 0, dev->vram + leaf);
+
+		/* 2. 相邻页只前进 PTE 偏移，不重复读取三级目录。 */
+		if (!ret) {
+			for (u64 i = 0; i < chunk; i += PAGE_SIZE) {
+				u64 value = flags ? (page + done + i) | GPGPU_VM_VALID | flags : 0;
+
+				writeq(value, dev->vram + leaf + (i >> PAGE_SHIFT) * sizeof(value));
+			}
+		}
+		done += chunk;
 	}
 	return 0;
 }

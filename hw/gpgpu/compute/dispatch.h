@@ -28,6 +28,9 @@ typedef struct GPGPUTask GPGPUTask;
  * @timer: 分段推进任务的定时器。
  * @status: GpgpuDispatchStatus。
  * @error: GpgpuDispatchError，终态时有效。
+ * @trace_start_ns: 宿主机单调时钟的开始值，单位 ns；0 表示不计时。
+ * @trace_service_ns: 本次任务在分段回调中执行的累计宿主机时间，单位 ns。
+ * @trace_segments: 本次任务已经推进的段数。
  */
 typedef struct GPGPUDispatchState {
 	GPGPUKernelParams config;
@@ -35,6 +38,9 @@ typedef struct GPGPUDispatchState {
 	QEMUTimer *timer;
 	uint32_t status;
 	uint32_t error;
+	uint64_t trace_start_ns;
+	uint64_t trace_service_ns;
+	uint64_t trace_segments;
 } GPGPUDispatchState;
 
 /* Dispatch 寄存器组读取（Host 与 CP 视图相同）。 */

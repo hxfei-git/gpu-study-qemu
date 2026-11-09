@@ -4,4 +4,5 @@ system_ss.add(when: 'CONFIG_GPGPU', if_true: files(
     'scheduler.c',
     'rv64.c',
     'lane_mem.c',
+    'tensor.c',
 ))

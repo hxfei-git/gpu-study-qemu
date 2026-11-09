@@ -60,12 +60,20 @@ typedef struct GPGPUWarp {
  * struct GPGPUExecContext - 解释器与 lane 访存共用的任务上下文
  * @device: 设备，任务寿命内有效。
  * @params: 派发配置快照。
+ * @profile: 可选的任务统计；NULL 时不统计逐指令计数。
  * @error: 当前指令失败时写入的 GpgpuDispatchError。
+ * @shared_fetch: 本任务是否在每轮内共享取指和字段译码。
+ * @tensor_native: 本任务是否允许张量指令尝试安全的宿主 SIMD。
+ * @yield_requested: 本轮包含张量指令，全部 Lane 完成这一轮后提前让出本段。
  */
 typedef struct GPGPUExecContext {
 	GPGPUState *device;
 	GPGPUKernelParams params;
+	GPGPUExecProfile *profile;
 	uint32_t error;
+	bool shared_fetch;
+	bool tensor_native;
+	bool yield_requested;
 } GPGPUExecContext;
 
 /* 记录当前指令的失败原因，返回 false 以便调用者直接返回。 */

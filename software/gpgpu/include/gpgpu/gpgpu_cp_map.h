@@ -15,14 +15,18 @@
 #ifndef GPGPU_CP_MAP_H
 #define GPGPU_CP_MAP_H
 
-/* 固件在 VRAM 中的保留区起点，也是驱动可分配 VRAM 的上界。 */
-#define GPGPU_FIRMWARE_BASE 0x03c00000u
+/* 固定 VRAM 容量，单位字节；无 C 后缀，供固件链接脚本共同引用。 */
+#define GPGPU_VRAM_SIZE 0x80000000
 /* 固件保留区字节数，包含代码、数据与栈。 */
-#define GPGPU_FIRMWARE_SIZE 0x00400000u
+#define GPGPU_FIRMWARE_SIZE 0x00400000
+/* 固件栈容量，单位字节。 */
+#define GPGPU_FIRMWARE_STACK_SIZE 0x00010000
+/* 固件在 VRAM 中的保留区起点，也是驱动可分配 VRAM 的上界。 */
+#define GPGPU_FIRMWARE_BASE (GPGPU_VRAM_SIZE - GPGPU_FIRMWARE_SIZE)
+/* 固件初始栈顶，向低地址增长；栈顶本身不属于 VRAM。 */
+#define GPGPU_FIRMWARE_STACK_TOP GPGPU_VRAM_SIZE
 /* 固件栈区起点；代码与数据不得越过此地址。 */
-#define GPGPU_FIRMWARE_STACK_BASE 0x03ff0000u
-/* 固件初始栈顶，向低地址增长。 */
-#define GPGPU_FIRMWARE_STACK_TOP 0x04000000u
+#define GPGPU_FIRMWARE_STACK_BASE (GPGPU_FIRMWARE_STACK_TOP - GPGPU_FIRMWARE_STACK_SIZE)
 /* 驱动可分配的 VRAM 字节数（固件区之前）；驱动另行保留首页。 */
 #define GPGPU_VRAM_USABLE_SIZE GPGPU_FIRMWARE_BASE
 

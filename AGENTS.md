@@ -439,6 +439,6 @@ TAP 计划与结果，不固定通过数；Linux 全栈核对实际比较结果�
 - 与 AMD 实现的差异分析、已发现的缺陷和改进草案在
   [第三阶段规格评审](<./docs/第三阶段规格评审.md>)；草案确认后转入对应规格，评审只保留链接。
 - 寄存器、位域、访问权限和复位值在[硬件手册](<./docs/GPGPU_硬件手册.html>)；
-  组件升级差异在 [PROTOCOL_V6.md](<./software/gpgpu/PROTOCOL_V6.md>)（更早版本见同目录），协议常量以
+  组件升级差异在 [PROTOCOL_V7.md](<./software/gpgpu/PROTOCOL_V7.md>)（更早版本见同目录），协议常量以
   `software/gpgpu/include/gpgpu/` 为准。
 - 学习进度与个人安排不在本仓库记录。

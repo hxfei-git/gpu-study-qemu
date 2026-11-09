@@ -48,7 +48,7 @@ static void regs_start(RegsTest *t, bool gpuvm)
 	g_assert_nonnull(t->dev);
 	qpci_device_enable(t->dev);
 	t->regs = qpci_iomap(t->dev, 0, NULL);
-	t->vram = qpci_iomap(t->dev, 2, NULL);
+    t->vram = gpgpu_test_map_vram(t->dev);
 }
 
 /* 解除映射并关闭客体。 */
@@ -63,12 +63,12 @@ static void regs_stop(RegsTest *t)
 /* BAR0 的对齐 32 位读写，宽度和对齐都符合设备要求。 */
 static uint32_t rd(RegsTest *t, uint64_t reg)
 {
-	return qpci_io_readl(t->dev, t->regs, reg);
+    return gpgpu_test_readl(t->dev, t->regs, reg);
 }
 
 static void wr(RegsTest *t, uint64_t reg, uint32_t value)
 {
-	qpci_io_writel(t->dev, t->regs, reg, value);
+    gpgpu_test_writel(t->dev, t->regs, reg, value);
 }
 
 /* 以 Host 身份发出一条 dcache 命令；设备同步执行，返回 STATUS。 */
@@ -98,9 +98,9 @@ static uint32_t take_errors(RegsTest *t)
 /*
  * test_identity() - 身份寄存器与复位状态
  *
- * 期望：设备号、当前协议版本对应的 DEV_VERSION、64 MiB VRAM 容量和 GPUVM
- * 协议版本都符合头文件定义；VM_MODE 反映 gpuvm 属性；复位后设备 READY、
- * 没有错误。进程内设备没有连接 CP，CP_CTRL 读作 0。
+ * 设备号、DEV_VERSION、容量与协议均符合共享头。
+ * VM_MODE 反映 gpuvm 属性；复位后设备 READY、没有错误。
+ * 进程内设备没有连接 CP，CP_CTRL 读作 0。
  */
 static void test_identity(void)
 {
@@ -137,7 +137,7 @@ static void test_access_rules(void)
 	regs_start(&t, true);
 
 	/* 1. BAR0 只接受对齐的 32 位访问，16 位读取锁存 INVALID_CMD。 */
-	qpci_io_readw(t.dev, t.regs, GPGPU_REG_DEV_ID);
+    gpgpu_test_readw(t.dev, t.regs, GPGPU_REG_DEV_ID);
 	g_assert_cmphex(take_errors(&t), ==, GPGPU_ERR_INVALID_CMD);
 
 	/* 2. Dispatch 寄存器组只允许 CP 写入；Host 写入被拒绝，读回仍为 0。 */
@@ -201,12 +201,14 @@ static void test_vram(void)
 	RegsTest t = { 0 };
 
 	regs_start(&t, true);
-	qpci_io_writel(t.dev, t.vram, 0x1000, 0x12345678);
-	qpci_io_writeq(t.dev, t.vram, 0x2000, 0x0123456789abcdefULL);
-	g_assert_cmphex(qpci_io_readl(t.dev, t.vram, 0x1000), ==, 0x12345678);
-	g_assert_cmphex(qpci_io_readq(t.dev, t.vram, 0x2000), ==, 0x0123456789abcdefULL);
-	qpci_io_writel(t.dev, t.vram, GPGPU_TEST_VRAM_SIZE - 4, 0xa5a5a5a5);
-	g_assert_cmphex(qpci_io_readl(t.dev, t.vram, GPGPU_TEST_VRAM_SIZE - 4), ==, 0xa5a5a5a5);
+    gpgpu_test_writel(t.dev, t.vram, 0x1000, 0x12345678);
+    gpgpu_test_writeq(t.dev, t.vram, 0x2000, 0x0123456789abcdefULL);
+    g_assert_cmphex(gpgpu_test_readl(t.dev, t.vram, 0x1000), ==, 0x12345678);
+    g_assert_cmphex(gpgpu_test_readq(t.dev, t.vram, 0x2000),
+                    ==, 0x0123456789abcdefULL);
+    gpgpu_test_writel(t.dev, t.vram, GPGPU_TEST_VRAM_SIZE - 4, 0xa5a5a5a5);
+    g_assert_cmphex(gpgpu_test_readl(t.dev, t.vram,
+                                    GPGPU_TEST_VRAM_SIZE - 4), ==, 0xa5a5a5a5);
 	g_assert_cmphex(rd(&t, GPGPU_REG_ERROR_STATUS), ==, 0);
 	regs_stop(&t);
 }

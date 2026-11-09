@@ -381,9 +381,11 @@ static bool vm_translated_rw(GPGPUState *s, enum GPGPUMemClient client, uint32_t
 		reason = vm_lookup(s, vmid, addr, &pte);
 		if (!reason && !(pte & access))
 			reason = GPGPU_VM_FAULT_PERMISSION;
+		if (reason)
+			break;
 		type = pte & GPGPU_VM_UNCACHED ? GPGPU_MEM_DEVICE : GPGPU_MEM_WB;
-		if (!reason && !user_phys_rw(s, client, (pte & GPGPU_VM_ADDR_MASK) + offset, buf,
-					     chunk, access, type))
+		if (!user_phys_rw(s, client, (pte & GPGPU_VM_ADDR_MASK) + offset, buf,
+				  chunk, access, type))
 			reason = GPGPU_VM_FAULT_STORAGE;
 		if (!reason) {
 			addr += chunk;

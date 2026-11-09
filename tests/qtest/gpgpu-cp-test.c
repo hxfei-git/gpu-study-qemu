@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 #include <glib/gstdio.h>
 #include "qemu/bswap.h"
+#include "gpgpu/gpgpu_tensor_abi.h"
 #include "libqtest.h"
 #include "libqos/generic-pcihost.h"
 #include "libqos/pci.h"
@@ -70,6 +71,8 @@ typedef struct CPTest {
 	QPCIBar vram;
 	QPCIBar doorbell;
 	bool gpuvm;
+    /* 启动时是否允许张量指令使用安全的宿主 SIMD。 */
+    bool tensor_native;
 	uint64_t sequence;
 } CPTest;
 
@@ -88,7 +91,7 @@ static void save_device(QPCIDevice *dev, int devfn, void *opaque)
  * 必须先建好服务端 socket，第 2 步的 Host 进程才能连上；设备日志在
  * 设置 QTEST_GPGPU_REMOTE_LOG_DIR 时保留，便于失败后查看固件输出。
  */
-static void cp_start(CPTest *s, bool gpuvm)
+static void cp_start(CPTest *s, bool gpuvm, bool shared_fetch)
 {
 	const char *logs = g_getenv("QTEST_GPGPU_REMOTE_LOG_DIR");
 	static unsigned int run;
@@ -103,7 +106,7 @@ static void cp_start(CPTest *s, bool gpuvm)
 	/*
 	 * 1. 在临时目录中启动 gpgpu-cp 远端进程，再用 QMP 的 object-add 创建
 	 *    vfio-user 服务端，把设备 gpu0 导出到 gpu.sock。设备的 stderr 写入
-	 *    日志文件，gpuvm 开关经 -global 传给设备。
+     *    日志单独保存；属性通过 -global 配置。
 	 */
 	s->directory = g_dir_make_tmp("gpgpu-qtest-XXXXXX", NULL);
 	g_assert_nonnull(s->directory);
@@ -112,9 +115,14 @@ static void cp_start(CPTest *s, bool gpuvm)
 		g_assert_cmpint(g_mkdir_with_parents(logs, 0700), ==, 0);
 	s->log = g_strdup_printf("%s/device-%u.log", logs ? logs : s->directory, ++run);
 	quoted_log = g_shell_quote(s->log);
-	remote_args = g_strdup_printf("-machine gpgpu-cp,auto-shutdown=off -accel tcg "
-				      "-nodefaults -serial none -global gpgpu.gpuvm=%s 2>%s",
-				      gpuvm ? "on" : "off", quoted_log);
+    remote_args = g_strdup_printf("-machine gpgpu-cp,auto-shutdown=off "
+                                  "-accel tcg -nodefaults -serial none "
+                                  "-global gpgpu.gpuvm=%s "
+                                  "-global gpgpu.shared_fetch=%s "
+                                  "-global gpgpu.tensor_native=%s 2>%s",
+                                  gpuvm ? "on" : "off",
+                                  shared_fetch ? "on" : "off",
+                                  s->tensor_native ? "on" : "off", quoted_log);
 	s->remote = qtest_init_ext("QTEST_GPGPU_REMOTE_BINARY", remote_args, NULL, true);
 	qtest_qmp_assert_success(s->remote,
 				 "{ 'execute': 'object-add', 'arguments': {"
@@ -145,7 +153,7 @@ static void cp_start(CPTest *s, bool gpuvm)
 	g_assert_nonnull(s->dev);
 	qpci_device_enable(s->dev);
 	s->regs = qpci_iomap(s->dev, 0, NULL);
-	s->vram = qpci_iomap(s->dev, 2, NULL);
+    s->vram = gpgpu_test_map_vram(s->dev);
 	s->doorbell = qpci_iomap(s->dev, 4, NULL);
 }
 
@@ -170,7 +178,7 @@ static void cp_stop(CPTest *s)
 /* BAR0 寄存器读写：设备只接受对齐的 32 位访问，64 位分两次读写。 */
 static uint32_t rd(CPTest *s, uint64_t reg)
 {
-	return qpci_io_readl(s->dev, s->regs, reg);
+    return gpgpu_test_readl(s->dev, s->regs, reg);
 }
 
 static uint64_t rd64(CPTest *s, uint64_t reg)
@@ -180,7 +188,7 @@ static uint64_t rd64(CPTest *s, uint64_t reg)
 
 static void wr(CPTest *s, uint64_t reg, uint32_t value)
 {
-	qpci_io_writel(s->dev, s->regs, reg, value);
+    gpgpu_test_writel(s->dev, s->regs, reg, value);
 }
 
 static void wr64(CPTest *s, uint64_t reg, uint64_t value)
@@ -276,6 +284,7 @@ static void queue_mqd(CPTest *s, unsigned int slot)
 /*
  * cp_boot() - 按驱动的冷启动顺序启动 CP 固件
  * @ih_bytes: IH Ring 字节容量。
+ * @shared_fetch: 在设备启动时选择同轮取指与译码共享。
  *
  * 1. 保持 CP 复位时写入固件和复位向量；
  * 2. 使能 Outbound，使 Host RAM 可经 GPU 物理地址访问；
@@ -287,7 +296,7 @@ static void queue_mqd(CPTest *s, unsigned int slot)
  * 配置，HQD 在 CP 运行后对 Host 只读。KIQ 由 Host 直接装载，HIQ 和
  * 用户队列之后再经管理命令映射。
  */
-static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes)
+static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes, bool shared_fetch)
 {
 	const char *path = g_getenv("QTEST_GPGPU_FIRMWARE");
 	g_autofree char *image = NULL;
@@ -296,7 +305,7 @@ static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes)
 	g_assert_nonnull(path);
 	g_assert_true(g_file_get_contents(path, &image, &size, NULL));
 	g_assert_cmpuint(size, <, GPGPU_FIRMWARE_STACK_BASE - GPGPU_FIRMWARE_BASE);
-	cp_start(s, gpuvm);
+    cp_start(s, gpuvm, shared_fetch);
 	qtest_memset(s->host, QUEUE_HOST, 0, 0x10000);
 
 	/*
@@ -304,7 +313,7 @@ static void cp_boot(CPTest *s, bool gpuvm, uint32_t ih_bytes)
 	 *    写到 VRAM 末尾的固件区，复位向量指向它的入口。
 	 */
 	g_assert_cmphex(rd(s, GPGPU_REG_CP_CTRL), ==, GPGPU_CP_PRESENT | GPGPU_CP_RESET_HOLD);
-	qpci_memwrite(s->dev, s->vram, GPGPU_FIRMWARE_BASE, image, size);
+    gpgpu_test_memwrite(s->dev, s->vram, GPGPU_FIRMWARE_BASE, image, size);
 	wr(s, GPGPU_REG_CP_RESET_VECTOR, GPGPU_FIRMWARE_BASE);
 
 	/*
@@ -383,7 +392,7 @@ static uint32_t queue_manage(CPTest *s, unsigned int source, uint32_t opcode, ui
 	qtest_memwrite(s->host, QUEUE_RING(source) + ((wptr + 1) % slots) * 32, &completion,
 		       sizeof(completion));
 	qtest_writel(s->host, QUEUE_WPTR(source), wptr + 2);
-	qpci_io_writeq(s->dev, s->doorbell, source * 8, wptr + 2);
+    gpgpu_test_writeq(s->dev, s->doorbell, source * 8, wptr + 2);
 	wait_host32(s, QUEUE_RPTR(source), wptr + 2);
 	g_assert_cmphex(qtest_readq(s->host, QUEUE_RESULT), ==, s->sequence);
 	return qtest_readl(s->host, QUEUE_RESULT + 8);
@@ -419,16 +428,18 @@ static void kernel_load(CPTest *s, uint64_t code_entry)
 		.kernel_abi_version = cpu_to_le32(GPGPU_KERNEL_ABI_VERSION),
 	};
 
-	qpci_memwrite(s->dev, s->vram, KERNEL_DESC, &desc, sizeof(desc));
+    gpgpu_test_memwrite(s->dev, s->vram, KERNEL_DESC, &desc, sizeof(desc));
 	for (unsigned int i = 0; i < ARRAY_SIZE(code); i++)
-		qpci_io_writel(s->dev, s->vram, KERNEL_CODE + 4 * i, code[i]);
+                gpgpu_test_writel(s->dev, s->vram, KERNEL_CODE + 4 * i,
+                                  code[i]);
 }
 
 /*
- * aql_submit() - 填写一个 1×1×1 派发包并发布
+ * aql_submit() - 填写一个单工作组的一维派发包并发布
  * @number: 包编号；物理槽为 number 对 Ring 槽数取模。
  * @task: 测试任务编号，选择 Signal、通知槽和参数块，事件编号为 task + 1。
- * @out: Kernel 写入的目标地址，Kernel 会在这里写 0xaabb0000 + task。
+ * @out: 参数块中的目标地址；默认 Kernel 写入 0xaabb0000 + task。
+ * @lanes: 工作组与网格的 X 维线程数，发布前填好。
  *
  * 1. 准备 Signal（值 1、事件编号、通知槽）与参数；
  * 2. 以 INVALID Header 写入包体；3. 最后写有效 Header，推进 W 并敲 Doorbell。
@@ -436,9 +447,10 @@ static void kernel_load(CPTest *s, uint64_t code_entry)
  *
  * 测试是单生产者，直接把 W 写成 number + 1，不经过原子预留。
  */
-static void aql_submit(CPTest *s, unsigned int slot, uint32_t number, unsigned int task,
-		       uint64_t desc, uint64_t args, uint64_t signal, uint64_t mailbox,
-		       uint64_t out)
+static void aql_submit(CPTest *s, unsigned int slot, uint32_t number,
+                       unsigned int task, uint64_t desc, uint64_t args,
+                       uint64_t signal, uint64_t mailbox, uint64_t out,
+                       unsigned int lanes)
 {
 	GpgpuSignal sig = {
 		.value = cpu_to_le64(1),
@@ -447,10 +459,10 @@ static void aql_submit(CPTest *s, unsigned int slot, uint32_t number, unsigned i
 	};
 	GpgpuAqlPacket packet = {
 		.full_header = cpu_to_le32(GPGPU_AQL_INVALID),
-		.workgroup_size_x = cpu_to_le16(1),
+        .workgroup_size_x = cpu_to_le16(lanes),
 		.workgroup_size_y = cpu_to_le16(1),
 		.workgroup_size_z = cpu_to_le16(1),
-		.grid_size_x = cpu_to_le32(1),
+        .grid_size_x = cpu_to_le32(lanes),
 		.grid_size_y = cpu_to_le32(1),
 		.grid_size_z = cpu_to_le32(1),
 		.kernel_object = cpu_to_le64(desc),
@@ -481,14 +493,15 @@ static void aql_submit(CPTest *s, unsigned int slot, uint32_t number, unsigned i
 	 */
 	qtest_writel(s->host, at, AQL_DISPATCH_1D);
 	qtest_writel(s->host, QUEUE_WPTR(slot), number + 1);
-	qpci_io_writeq(s->dev, s->doorbell, slot * 8, number + 1);
+    gpgpu_test_writeq(s->dev, s->doorbell, slot * 8, number + 1);
 }
 
 /* GPUVM 关闭时的提交：所有地址都是 GPU 物理地址。 */
 static void aql_submit_phys(CPTest *s, unsigned int slot, uint32_t number, unsigned int task)
 {
-	aql_submit(s, slot, number, task, KERNEL_DESC, GPA(QUEUE_ARGS(task)),
-		   GPA(QUEUE_SIGNAL(task)), GPA(QUEUE_MAILBOX(task)), KERNEL_OUT + 4 * task);
+    aql_submit(s, slot, number, task, KERNEL_DESC, GPA(QUEUE_ARGS(task)),
+               GPA(QUEUE_SIGNAL(task)), GPA(QUEUE_MAILBOX(task)),
+               KERNEL_OUT + 4 * task, 1);
 }
 
 /*
@@ -519,7 +532,7 @@ static void test_management(void)
 {
 	CPTest s = { 0 };
 
-	cp_boot(&s, false, 4096);
+    cp_boot(&s, false, 4096, false);
 	queue_mqd(&s, 1);
 	queue_map(&s, 1);
 	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_FIRMWARE), ==, GPGPU_PROTOCOL_VERSION);
@@ -582,14 +595,13 @@ static void test_management(void)
  * 数据访问都不进入 dcache，命中与未命中计数不变；每个任务的 Signal
  * 归零、通知槽为事件编号、Header 恢复 INVALID；IH 中有 3 条
  * SIGNAL_NOTIFY；卸载槽 2 后 saved_rptr 为 2，即这条队列消费的包数。
- * Outbound 已打开时，Host 端落在 VRAM 与窗口之间空洞里的 DMA 仍然失败。
  */
 static void test_dispatch(void)
 {
 	CPTest s = { 0 };
 	uint32_t hits, misses;
 
-	cp_boot(&s, false, 4096);
+    cp_boot(&s, false, 4096, false);
 	queue_mqd(&s, 1);
 	queue_map(&s, 1);
 	queue_mqd(&s, 2);
@@ -608,8 +620,9 @@ static void test_dispatch(void)
 	wait_host32(&s, QUEUE_RPTR(2), 2);
 
 	for (unsigned int task = 0; task < 3; task++)
-		g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT + 4 * task), ==,
-				0xaabb0000 + task);
+                g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram,
+                                                KERNEL_OUT + 4 * task),
+                                ==, 0xaabb0000 + task);
 	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_HITS), ==, hits);
 	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_MISSES), ==, misses);
 	assert_retired(&s, 2, 0, 0);
@@ -634,19 +647,246 @@ static void test_dispatch(void)
 	g_assert_cmpuint(qtest_readq(s.host, QUEUE_MQD(2) + offsetof(GpgpuMqd, saved_rptr)), ==,
 			 2);
 
-	/*
-	 * 空洞不可路由：Host 端取 VRAM 末端之后的 0x0400_1000，即使窗口已
-	 * 打开，START 时检查也失败，状态为 ERROR 并锁存 DMA_FAULT。
-	 */
-	wr(&s, GPGPU_REG_DMA_SRC_LO, GPGPU_TEST_VRAM_SIZE + 0x1000);
-	wr(&s, GPGPU_REG_DMA_SRC_HI, 0);
-	wr(&s, GPGPU_REG_DMA_DST_LO, 0x3000);
-	wr(&s, GPGPU_REG_DMA_DST_HI, 0);
-	wr(&s, GPGPU_REG_DMA_SIZE, 64);
-	wr(&s, GPGPU_REG_DMA_CTRL, GPGPU_DMA_START);
-	g_assert_cmphex(rd(&s, GPGPU_REG_DMA_STATUS), ==, GPGPU_DMA_ERROR);
-	g_assert_cmphex(rd(&s, GPGPU_REG_ERROR_STATUS), ==, GPGPU_ERR_DMA_FAULT);
 	cp_stop(&s);
+}
+
+/*
+ * test_shared_fetch_lanes() - 共享取指的 Lane 顺序与退出
+ *
+ * 四个 Lane 在同一轮分别执行：0 写 x=base、1 读 x、
+ * 2 写 x=base+2、3 读 x。偶数 Lane 随后先 EBREAK，
+ * 奇数 Lane 再把读值写到 out[lane_id]。
+ * 按 PC 分组执行会破坏这两个观测值；若任一 Lane 的
+ * EBREAK 结束整个 Warp，奇数 Lane 也会来不及写结果。
+ *
+ * 每个模式连续派发两次。
+ * 前次收尾后同址改写 ADDI，第二次须用新代码。
+ * 再把奇数路径 LW 换成非法指令：
+ * Lane1 失败前 Lane0 的写入保留，Lane2 不得写入，
+ * 失败任务不得发布成功。shared_fetch 是启动属性，
+ * 两个模式各使用独立的双进程环境。
+ */
+static void test_shared_fetch_lanes(void)
+{
+    enum {
+        /* 单个工作组内的活跃线程数。 */
+        ORDER_LANES = 4,
+        /* 可替换 ADDI 在下面代码数组中的指令下标。 */
+        ORDER_VALUE_INSN = 2,
+        /* 奇数 Lane 的 LW 在下面代码数组中的指令下标。 */
+        ORDER_LOAD_INSN = 7,
+    };
+    const uint32_t values[] = { 7, 11 };
+    const uint32_t clear[ORDER_LANES] = { 0 };
+    const uint32_t code[] = {
+        0x00053283, /* ld t0,0(a0)：参数中的共享字地址。 */
+        0xcc002373, /* csrr t1,THREAD_ID_X。 */
+        0x00030393, /* addi t2,t1,base：发布前填入 12 位立即数。 */
+        0x00137e13, /* andi t3,t1,1。 */
+        0x000e1663, /* bne t3,zero,+12：奇数 Lane 跳到 LW。 */
+        0x0072a023, /* sw t2,0(t0)：偶数 Lane 改写共享字。 */
+        0x00100073, /* ebreak：只退出当前偶数 Lane。 */
+        0x0002ae83, /* lw t4,0(t0)：奇数 Lane 读取共享字。 */
+        0x00231f13, /* slli t5,t1,2。 */
+        0x005f0f33, /* add t5,t5,t0。 */
+        0x01df2023, /* sw t4,0(t5)：out[lane_id] 保存观测值。 */
+        0x00100073, /* ebreak：奇数 Lane 完成。 */
+    };
+    const unsigned int fault_task = ARRAY_SIZE(values);
+
+    for (unsigned int mode = 0; mode < 2; mode++) {
+        CPTest s = { 0 };
+
+        cp_boot(&s, false, 4096, mode != 0);
+        queue_mqd(&s, 1);
+        queue_map(&s, 1);
+        queue_mqd(&s, 2);
+        queue_map(&s, 2);
+        kernel_load(&s, KERNEL_CODE);
+        gpgpu_test_writel(s.dev, s.vram,
+                         KERNEL_DESC +
+                         offsetof(GpgpuKernelDescriptor, code_size),
+                         sizeof(code));
+        for (unsigned int i = 0; i < ARRAY_SIZE(code); i++)
+            gpgpu_test_writel(s.dev, s.vram,
+                             KERNEL_CODE + i * sizeof(code[0]), code[i]);
+
+        for (unsigned int task = 0; task < ARRAY_SIZE(values); task++) {
+            uint32_t value = values[task];
+
+            /* 前次已收尾；BAR 写完成后发布新包。 */
+            gpgpu_test_writel(s.dev, s.vram,
+                             KERNEL_CODE +
+                             ORDER_VALUE_INSN * sizeof(code[0]),
+                             code[ORDER_VALUE_INSN] | (value << 20));
+            gpgpu_test_memwrite(s.dev, s.vram, KERNEL_OUT, clear,
+                               sizeof(clear));
+            aql_submit(&s, 2, task, task, KERNEL_DESC,
+                       GPA(QUEUE_ARGS(task)), GPA(QUEUE_SIGNAL(task)),
+                       GPA(QUEUE_MAILBOX(task)), KERNEL_OUT, ORDER_LANES);
+            wait_host32(&s, QUEUE_RPTR(2), task + 1);
+            assert_retired(&s, 2, task, task);
+            g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram, KERNEL_OUT),
+                             ==, value + 2);
+            g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram,
+                                             KERNEL_OUT + sizeof(value)),
+                             ==, value);
+            g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram,
+                                             KERNEL_OUT + 3 * sizeof(value)),
+                             ==, value + 2);
+        }
+
+        /* Lane0 先写，Lane1 随后报告非法指令。 */
+        gpgpu_test_writel(s.dev, s.vram,
+                         KERNEL_CODE + ORDER_VALUE_INSN * sizeof(code[0]),
+                         code[ORDER_VALUE_INSN] | (values[0] << 20));
+        gpgpu_test_writel(s.dev, s.vram,
+                         KERNEL_CODE + ORDER_LOAD_INSN * sizeof(code[0]), 0);
+        gpgpu_test_memwrite(s.dev, s.vram, KERNEL_OUT, clear, sizeof(clear));
+        aql_submit(&s, 2, fault_task, fault_task, KERNEL_DESC,
+                   GPA(QUEUE_ARGS(fault_task)), GPA(QUEUE_SIGNAL(fault_task)),
+                   GPA(QUEUE_MAILBOX(fault_task)), KERNEL_OUT, ORDER_LANES);
+        wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
+        g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram, KERNEL_OUT),
+                         ==, values[0]);
+        g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram,
+                                         KERNEL_OUT + sizeof(clear[0])), ==, 0);
+        g_assert_cmpuint(gpgpu_test_readl(s.dev, s.vram,
+                                         KERNEL_OUT + 3 * sizeof(clear[0])),
+                         ==, 0);
+        g_assert_cmphex(qtest_readq(s.host, QUEUE_SIGNAL(fault_task)), ==, 1);
+        g_assert_cmpuint(qtest_readl(s.host, QUEUE_RPTR(2)), ==, fault_task);
+        g_assert_cmpuint(queue_manage(&s, 1, GPGPU_UNMAP_QUEUES,
+                                     GPA(QUEUE_MQD(2))),
+                         ==, GPGPU_MANAGEMENT_OK);
+        cp_stop(&s);
+    }
+}
+
+/*
+ * test_tensor_k_tail() - W8 的 K 分块与行列尾部
+ *
+ * M、N、K 均比一条指令的块宽多 1，覆盖完整矩阵。
+ * 首次只执行 K=0 的块，输出不加偏置。
+ * 第二次从 TILE_K 继续，读取部分和后在末块加偏置。
+ * 输入为 1，权重按列交替为 -2/3，
+ * scale=0.5、bias=0.25，期望值都能精确表示为 FP32。
+ * 分别关闭/开启 native 优化，核对同一合同。
+ */
+static void test_tensor_k_tail(void)
+{
+    enum {
+        /* 测试行数，覆盖 M 尾块。 */
+        TENSOR_ROWS = GPGPU_TENSOR_TILE_M + 1,
+        /* 测试列数，覆盖 N 尾块。 */
+        TENSOR_COLS = GPGPU_TENSOR_TILE_N + 1,
+        /* 测试归约宽度，覆盖 K 尾块。 */
+        TENSOR_K = GPGPU_TENSOR_TILE_K + 1,
+        /* 一维工作项数，从行列数及共享块宽推导。 */
+        TENSOR_BLOCKS = DIV_ROUND_UP(TENSOR_ROWS, GPGPU_TENSOR_TILE_M) *
+                        DIV_ROUND_UP(TENSOR_COLS, GPGPU_TENSOR_TILE_N),
+        /* 下面代码数组中设置 K 起点的 ADDI 下标。 */
+        TENSOR_K_INSN = 2,
+    };
+    const uint64_t x = KERNEL_OUT;
+    const uint64_t weights = x + TENSOR_ROWS * TENSOR_K * sizeof(uint32_t);
+    const uint64_t scales = QEMU_ALIGN_UP(weights + TENSOR_COLS * TENSOR_K,
+                                         sizeof(uint32_t));
+    const uint64_t bias = scales + TENSOR_COLS * sizeof(uint32_t);
+    const uint64_t output = bias + TENSOR_COLS * sizeof(uint32_t);
+    const uint64_t command = QEMU_ALIGN_UP(output + TENSOR_ROWS * TENSOR_COLS *
+                                         sizeof(uint32_t),
+                                         GPGPU_TENSOR_SLOT_BYTES);
+    const uint32_t code[] = {
+        0x00053283, /* ld t0,0(a0)：通用命令 GPU 地址。 */
+        0xcc0023f3, /* csrr t2,THREAD_ID_X：线性块号。 */
+        0x00000313, /* addi t1,zero,k_base：发布前同步替换。 */
+        (6U << 27) | (GPGPU_TENSOR_LINEAR_W8 << 25) | (7U << 20) |
+        (5U << 15) | (GPGPU_TENSOR_KIND_MATRIX << 12) |
+        GPGPU_TENSOR_OPCODE,
+        0x00100073, /* ebreak：本 Lane 已完成这一段 K。 */
+    };
+    uint8_t prefix[GPGPU_TENSOR_PARAM_BYTES] = { 0 };
+    uint8_t input[TENSOR_ROWS * TENSOR_K * sizeof(uint32_t)];
+    int8_t q[TENSOR_COLS * TENSOR_K];
+
+    stq_le_p(prefix + GPGPU_TENSOR_IN0, x);
+    stq_le_p(prefix + GPGPU_TENSOR_IN1, weights);
+    stq_le_p(prefix + GPGPU_TENSOR_IN2, scales);
+    stq_le_p(prefix + GPGPU_TENSOR_IN3, bias);
+    stq_le_p(prefix + GPGPU_TENSOR_OUT, output);
+    stq_le_p(prefix + GPGPU_TENSOR_ELEMENTS, TENSOR_ROWS * TENSOR_COLS);
+    stq_le_p(prefix + GPGPU_TENSOR_DIMS, TENSOR_ROWS);
+    stq_le_p(prefix + GPGPU_TENSOR_DIMS + GPGPU_TENSOR_SLOT_BYTES,
+             TENSOR_COLS);
+    stq_le_p(prefix + GPGPU_TENSOR_DIMS + 2 * GPGPU_TENSOR_SLOT_BYTES,
+             TENSOR_K);
+    for (unsigned int i = 0; i < TENSOR_ROWS * TENSOR_K; i++)
+        stl_le_p(input + i * sizeof(uint32_t), 0x3f800000);
+
+    for (unsigned int n = 0; n < TENSOR_COLS; n++)
+        memset(q + n * TENSOR_K, n & 1 ? 3 : (uint8_t)-2, TENSOR_K);
+
+    for (unsigned int mode = 0; mode < 2; mode++) {
+        CPTest s = { .tensor_native = mode != 0 };
+
+        cp_boot(&s, false, 4096, true);
+        queue_mqd(&s, 1);
+        queue_map(&s, 1);
+        queue_mqd(&s, 2);
+        queue_map(&s, 2);
+        kernel_load(&s, KERNEL_CODE);
+        gpgpu_test_writel(s.dev, s.vram,
+                         KERNEL_DESC +
+                         offsetof(GpgpuKernelDescriptor, code_size),
+                         sizeof(code));
+        for (unsigned int i = 0; i < ARRAY_SIZE(code); i++)
+            gpgpu_test_writel(s.dev, s.vram,
+                             KERNEL_CODE + i * sizeof(code[0]), code[i]);
+        gpgpu_test_memwrite(s.dev, s.vram, command, prefix, sizeof(prefix));
+        gpgpu_test_memwrite(s.dev, s.vram, x, input, sizeof(input));
+        gpgpu_test_memwrite(s.dev, s.vram, weights, q, sizeof(q));
+        for (unsigned int n = 0; n < TENSOR_COLS; n++) {
+            gpgpu_test_writel(s.dev, s.vram, scales + n * sizeof(uint32_t),
+                             0x3f000000);
+            gpgpu_test_writel(s.dev, s.vram, bias + n * sizeof(uint32_t),
+                             0x3e800000);
+        }
+        for (unsigned int i = 0; i < TENSOR_ROWS * TENSOR_COLS; i++)
+            gpgpu_test_writel(s.dev, s.vram, output + i * sizeof(uint32_t),
+                             0x7fc00000);
+
+        for (unsigned int task = 0; task < 2; task++) {
+            unsigned int k_base = task ? GPGPU_TENSOR_TILE_K : 0;
+            unsigned int terms = task ? TENSOR_K : GPGPU_TENSOR_TILE_K;
+
+            /* 收尾后同址换代码，再发布新包。 */
+            gpgpu_test_writel(s.dev, s.vram,
+                             KERNEL_CODE + TENSOR_K_INSN * sizeof(code[0]),
+                             code[TENSOR_K_INSN] | (k_base << 20));
+            aql_submit(&s, 2, task, task, KERNEL_DESC,
+                       GPA(QUEUE_ARGS(task)), GPA(QUEUE_SIGNAL(task)),
+                       GPA(QUEUE_MAILBOX(task)), command, TENSOR_BLOCKS);
+            wait_host32(&s, QUEUE_RPTR(2), task + 1);
+            assert_retired(&s, 2, task, task);
+            for (unsigned int i = 0; i < TENSOR_ROWS * TENSOR_COLS; i++) {
+                union {
+                    float value;
+                    uint32_t bits;
+                } expected = {
+                    .value = terms *
+                             ((i % TENSOR_COLS) & 1 ? 1.5f : -1.0f) +
+                             (task ? 0.25f : 0.0f),
+                };
+
+                g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram,
+                                                output + i *
+                                                sizeof(uint32_t)),
+                                ==, expected.bits);
+            }
+        }
+        cp_stop(&s);
+    }
 }
 
 /*
@@ -662,7 +902,7 @@ static void test_fault_scope(void)
 	CPTest s = { 0 };
 	uint64_t at = QUEUE_RING(2);
 
-	cp_boot(&s, false, 4096);
+    cp_boot(&s, false, 4096, false);
 	queue_mqd(&s, 1);
 	queue_map(&s, 1);
 	queue_mqd(&s, 2);
@@ -786,12 +1026,12 @@ static uint32_t vm_entry(CPTest *s, uint64_t va, unsigned int level, uint32_t *n
 	for (unsigned int i = 0; i < level; i++) {
 		uint32_t index = (va >> GPGPU_VM_LEVEL_SHIFT(i)) & GPGPU_VM_INDEX_MASK;
 		uint32_t entry_at = table + index * 8;
-		uint64_t entry = qpci_io_readq(s->dev, s->vram, entry_at);
+        uint64_t entry = gpgpu_test_readq(s->dev, s->vram, entry_at);
 
 		if (!(entry & GPGPU_VM_VALID)) {
 			entry = *next_table | GPGPU_VM_VALID;
 			*next_table += GPGPU_VM_PAGE_SIZE;
-			qpci_io_writeq(s->dev, s->vram, entry_at, entry);
+            gpgpu_test_writeq(s->dev, s->vram, entry_at, entry);
 		}
 		table = entry & GPGPU_VM_ADDR_MASK;
 	}
@@ -850,7 +1090,7 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 	};
 	uint32_t next_table = VM_ROOT + GPGPU_VM_PAGE_SIZE;
 
-	cp_boot(s, true, 4096);
+    cp_boot(s, true, 4096, false);
 	queue_mqd(s, 1);
 	queue_map(s, 1);
 	kernel_load(s, VM_CODE);
@@ -861,10 +1101,12 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
 	 *    UNCACHED 与权限位，以及 VALID。
 	 */
 	for (uint32_t off = 0; off < 8 * GPGPU_VM_PAGE_SIZE; off += 8)
-		qpci_io_writeq(s->dev, s->vram, VM_ROOT + off, 0);
+                gpgpu_test_writeq(s->dev, s->vram, VM_ROOT + off, 0);
 	for (unsigned int i = 0; i < ARRAY_SIZE(maps); i++)
-		qpci_io_writeq(s->dev, s->vram, vm_leaf(s, maps[i].va, &next_table),
-			       maps[i].target | maps[i].flags | GPGPU_VM_VALID);
+                gpgpu_test_writeq(s->dev, s->vram,
+                                  vm_leaf(s, maps[i].va, &next_table),
+                                  maps[i].target | maps[i].flags |
+                                  GPGPU_VM_VALID);
 
 	/*
 	 * 2. 写 VMID 1 的页表根，同步失效该 VMID 的 TLB 并确认 ACK，
@@ -892,8 +1134,8 @@ static void vm_prepare(CPTest *s, uint64_t code_flags)
  */
 static void vm_submit(CPTest *s, uint32_t number, unsigned int task, uint64_t out)
 {
-	aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + ARGS_BYTES * task, VM_SIGNAL + 32 * task,
-		   VM_NOTIFY + 8 * task, out);
+    aql_submit(s, 2, number, task, VM_DESC, VM_ARGS + ARGS_BYTES * task,
+               VM_SIGNAL + 32 * task, VM_NOTIFY + 8 * task, out, 1);
 }
 
 /*
@@ -912,7 +1154,8 @@ static void test_gpuvm_translation(void)
 	vm_prepare(&s, GPGPU_VM_READ | GPGPU_VM_EXEC);
 	vm_submit(&s, 0, 0, VM_DATA);
 	wait_host32(&s, QUEUE_RPTR(2), 1);
-	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+    g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram, KERNEL_OUT),
+                    ==, 0xaabb0000);
 	assert_retired(&s, 2, 0, 0);
 
 	/*
@@ -986,15 +1229,18 @@ static void test_gpuvm_system(void)
 
 	/* 1. 找到指向 VM_RING 所在叶表的 L2 项；路径已建立，不分配表页。 */
 	dir_entry = vm_entry(&s, VM_RING, GPGPU_VM_LEVELS - 2, &no_alloc);
-	leaf_table = qpci_io_readq(s.dev, s.vram, dir_entry) & GPGPU_VM_ADDR_MASK;
-	qpci_memread(s.dev, s.vram, leaf_table, table, sizeof(table));
+    leaf_table = gpgpu_test_readq(s.dev, s.vram, dir_entry) &
+                 GPGPU_VM_ADDR_MASK;
+    gpgpu_test_memread(s.dev, s.vram, leaf_table, table, sizeof(table));
 	qtest_memwrite(s.host, VM_HOST_TABLE, table, sizeof(table));
-	qpci_io_writeq(s.dev, s.vram, dir_entry, VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_VALID);
+    gpgpu_test_writeq(s.dev, s.vram, dir_entry,
+                      VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_VALID);
 	vm_invalidate(&s);
 	queue_map(&s, 2);
 	vm_submit(&s, 0, 0, VM_DATA);
 	wait_host32(&s, QUEUE_RPTR(2), 1);
-	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+    g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram, KERNEL_OUT),
+                    ==, 0xaabb0000);
 
 	/* 2. SYSTEM=0 的叶子按 VRAM 偏移解释，0xc100_b000 超出 VRAM。 */
 	queue_unmap(&s, 2);
@@ -1013,7 +1259,7 @@ static void test_gpuvm_system(void)
 	queue_unmap(&s, 2);
 	wr(&s, fault + GPGPU_VM_FAULT_CLEAR, 1);
 	queue_mqd_at(&s, 2, VM_RING, VM_PROGRESS + 40, VM_PROGRESS + 32);
-	qpci_io_writeq(s.dev, s.vram, dir_entry,
+    gpgpu_test_writeq(s.dev, s.vram, dir_entry,
 		       VM_HOST_TABLE | GPGPU_VM_SYSTEM | GPGPU_VM_UNCACHED | GPGPU_VM_VALID);
 	vm_invalidate(&s);
 	g_assert_cmpuint(queue_manage(&s, 1, GPGPU_MAP_QUEUES, GPA(QUEUE_MQD(2))), ==,
@@ -1067,14 +1313,16 @@ static void test_gpuvm_tlb(void)
 	vm_tlb_round(&s, &number);
 	round_misses = rd(&s, GPGPU_REG_VM_TLB_MISSES) - misses;
 	for (unsigned int k = 0; k < VM_TLB_PAGES; k++)
-		g_assert_cmphex(qpci_io_readl(s.dev, s.vram, VM_TLB_OUT(k)), ==, 0xaabb0000 + k);
+                g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram,
+                                                VM_TLB_OUT(k)),
+                                ==, 0xaabb0000 + k);
 	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_EVICTIONS) - evictions, >=, 1);
 
 	/*
 	 * c. 队列仍驻留，第 4 页改指 VM_TLB_OUT(5)，按 VPN 只失效这一页。
 	 *    页已映射，vm_leaf() 只查找叶子项，不会分配新表页。
 	 */
-	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_TLB_DATA(last), &no_alloc),
+    gpgpu_test_writeq(s.dev, s.vram, vm_leaf(&s, VM_TLB_DATA(last), &no_alloc),
 		       VM_TLB_OUT(VM_TLB_PAGES) | GPGPU_VM_READ | GPGPU_VM_WRITE | GPGPU_VM_VALID);
 	wr64(&s, GPGPU_REG_VM_INV_VPN_START_LO, vpn);
 	wr64(&s, GPGPU_REG_VM_INV_VPN_END_LO, vpn);
@@ -1083,7 +1331,8 @@ static void test_gpuvm_tlb(void)
 	misses = rd(&s, GPGPU_REG_VM_TLB_MISSES);
 	vm_submit(&s, number, VM_TLB_PAGES, VM_TLB_DATA(last));
 	wait_host32(&s, QUEUE_RPTR(2), ++number);
-	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, VM_TLB_OUT(VM_TLB_PAGES)), ==,
+    g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram,
+                                    VM_TLB_OUT(VM_TLB_PAGES)), ==,
 			0xaabb0000 + VM_TLB_PAGES);
 	g_assert_cmpuint(rd(&s, GPGPU_REG_VM_TLB_MISSES) - misses, ==, 1);
 
@@ -1119,7 +1368,7 @@ static void test_gpuvm_cached_permission(void)
 	wait_host32(&s, QUEUE_RPTR(2), 1);
 
 	queue_unmap(&s, 2);
-	qpci_io_writeq(s.dev, s.vram, vm_leaf(&s, VM_DATA, &no_alloc),
+    gpgpu_test_writeq(s.dev, s.vram, vm_leaf(&s, VM_DATA, &no_alloc),
 		       KERNEL_OUT | GPGPU_VM_READ | GPGPU_VM_VALID);
 	vm_invalidate(&s);
 	queue_map(&s, 2);
@@ -1127,7 +1376,8 @@ static void test_gpuvm_cached_permission(void)
 	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_EXECUTOR);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_REASON), ==, GPGPU_VM_FAULT_PERMISSION);
 	g_assert_cmpuint(rd(&s, fault + GPGPU_VM_FAULT_ACCESS), ==, GPGPU_VM_WRITE);
-	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, KERNEL_OUT), ==, 0xaabb0000);
+    g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram, KERNEL_OUT),
+                    ==, 0xaabb0000);
 	cp_stop(&s);
 }
 
@@ -1163,8 +1413,8 @@ static void dcache_args(CPTest *s, uint64_t target, uint32_t value)
  */
 static void dcache_run(CPTest *s, uint32_t number)
 {
-	aql_submit(s, 2, number, number, VM_DESC, VM_DCACHE, VM_SIGNAL + 32 * number,
-		   VM_NOTIFY + 8 * number, 0);
+    aql_submit(s, 2, number, number, VM_DESC, VM_DCACHE,
+               VM_SIGNAL + 32 * number, VM_NOTIFY + 8 * number, 0, 1);
 	wait_host32(s, QUEUE_RPTR(2), number + 1);
 }
 
@@ -1202,8 +1452,8 @@ static void test_dcache_shared_line(void)
 			 dcache_lines(KERNEL_DESC, shared + sizeof(uint32_t)));
 	g_assert_cmpuint(rd(&s, GPGPU_REG_DCACHE_WRITEBACKS) - writebacks, ==,
 			 dcache_lines(shared, shared + sizeof(uint32_t)));
-	g_assert_cmphex(qpci_io_readl(s.dev, s.vram, shared), ==, 0xaabb0000);
-	g_assert_cmphex(qpci_io_readq(s.dev, s.vram, KERNEL_DESC), ==, VM_CODE);
+    g_assert_cmphex(gpgpu_test_readl(s.dev, s.vram, shared), ==, 0xaabb0000);
+    g_assert_cmphex(gpgpu_test_readq(s.dev, s.vram, KERNEL_DESC), ==, VM_CODE);
 	cp_stop(&s);
 }
 
@@ -1266,7 +1516,7 @@ static void test_dcache_bar_write(void)
 	dcache_prepare(&s, expected);
 	vm_submit(&s, 0, 0, VM_DATA);
 	wait_host32(&s, QUEUE_RPTR(2), 1);
-	qpci_io_writel(s.dev, s.vram,
+    gpgpu_test_writel(s.dev, s.vram,
 		       KERNEL_DESC + offsetof(GpgpuKernelDescriptor, kernel_abi_version), 0);
 	vm_submit(&s, 1, 1, VM_DATA);
 	wait_queue_error(&s, 2, GPGPU_QUEUE_ERROR_DESCRIPTOR);
@@ -1278,6 +1528,8 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	qtest_add_func("/gpgpu/cp/management", test_management);
 	qtest_add_func("/gpgpu/cp/dispatch", test_dispatch);
+    qtest_add_func("/gpgpu/cp/shared-fetch-lanes", test_shared_fetch_lanes);
+    qtest_add_func("/gpgpu/cp/tensor-k-tail", test_tensor_k_tail);
 	qtest_add_func("/gpgpu/cp/fault-scope", test_fault_scope);
 	qtest_add_func("/gpgpu/cp/gpuvm-translation", test_gpuvm_translation);
 	qtest_add_func("/gpgpu/cp/gpuvm-exec-fault", test_gpuvm_exec_fault);

@@ -3,6 +3,9 @@
  * 调度器：网格规模检查、warp 初始化与分段推进
  */
 #include "qemu/osdep.h"
+#include "hw/gpgpu/gpgpu.h"
+#include "hw/gpgpu/mem/dcache.h"
+#include "hw/gpgpu/mem/gpuvm.h"
 #include "compute_internal.h"
 #include "rv64.h"
 #include "scheduler.h"
@@ -10,6 +13,7 @@
 /**
  * struct GPGPUTask - 一次派发的执行进度
  * @exec: 配置快照与当前指令的错误。
+ * @profile: 可选的派发统计，由 exec.profile 引用。
  * @warp: 正在执行的 warp。
  * @block_count: 工作组总数。
  * @threads_per_block: 每工作组线程数。
@@ -21,6 +25,7 @@
  */
 struct GPGPUTask {
 	GPGPUExecContext exec;
+	GPGPUExecProfile profile;
 	GPGPUWarp warp;
 	uint32_t block_count;
 	uint32_t threads_per_block;
@@ -98,6 +103,8 @@ static void task_init_warp(GPGPUTask *task)
 	};
 
 	memset(warp, 0, sizeof(*warp));
+	if (task->exec.profile)
+		task->profile.warps++;
 
 	/* 1. 启动值依次为 blockIdx[3]、blockDim[3]、gridDim[3]。 */
 	for (unsigned int i = 0; i < 3; i++) {
@@ -141,7 +148,8 @@ static GPGPUExecResult task_failed(GPGPUTask *task)
  * 退出活跃掩码，掩码清空即 warp 结束。本段轮数用完时返回 CONTINUE，
  * 下一段从同一位置继续。warp_rounds 跨段累计，超过
  * GPGPU_WARP_ROUND_BUDGET 判为超预算，防止死循环的 Kernel 永不结束。
- * 预算按轮计数，与活跃 lane 数无关。
+ * 预算按轮计数，与活跃 lane 数无关。张量指令完成整轮后提前让出本段，
+ * 不提高累计预算，也不允许其他队列抢占当前 Dispatch。
  *
  * Return: warp 结束为 COMPLETE，段用完为 CONTINUE，指令失败或超预算为 FAILED。
  */
@@ -160,11 +168,13 @@ static GPGPUExecResult task_run_warp(GPGPUTask *task)
 			return task_failed(task);
 		}
 
-		/* 每个活跃 lane 各执行一条指令，任一失败即任务失败。 */
-		for (unsigned int lane_id = 0; lane_id < GPGPU_WARP_SIZE; lane_id++)
-			if (warp->lanes[lane_id].active &&
-			    !gpgpu_rv64_step(&task->exec, warp, lane_id))
-				return task_failed(task);
+		/* 预算仍按轮计；共享只减少取指/译码，不改变 lane 顺序。 */
+		task->exec.yield_requested = false;
+		if (!gpgpu_rv64_round(&task->exec, warp))
+			return task_failed(task);
+		/* 张量指令较重，但仍须先执行完这一轮的全部 Lane 才让出。 */
+		if (task->exec.yield_requested && warp->active_mask)
+			return (GPGPUExecResult) { .status = GPGPU_EXEC_CONTINUE };
 	}
 	return (GPGPUExecResult) { .status = GPGPU_EXEC_COMPLETE };
 }
@@ -176,11 +186,25 @@ GPGPUTask *gpgpu_task_create(GPGPUState *s, const GPGPUKernelParams *params)
 	/* 复制配置快照，之后 Dispatch 寄存器的写入不影响本任务。 */
 	task->exec.device = s;
 	task->exec.params = *params;
+	task->exec.shared_fetch = gpgpu_shared_fetch_enabled(s);
+	task->exec.tensor_native = gpgpu_tensor_native_enabled(s);
+	if (gpgpu_profile_enabled(s))
+		task->exec.profile = &task->profile;
 	if (!task_set_shape(task)) {
 		g_free(task);
 		return NULL;
 	}
 	return task;
+}
+
+/* 只读现有寄存器；不清零全局计数，避免影响 CP 与其他队列的观察。 */
+static void task_cache_counters(GPGPUState *s, GPGPUExecProfile *profile)
+{
+	profile->tlb_hits = gpgpu_vm_read(s, GPGPU_REG_VM_TLB_HITS);
+	profile->tlb_misses = gpgpu_vm_read(s, GPGPU_REG_VM_TLB_MISSES);
+	profile->dcache_hits = gpgpu_dcache_read(s, GPGPU_REG_DCACHE_HITS);
+	profile->dcache_misses = gpgpu_dcache_read(s, GPGPU_REG_DCACHE_MISSES);
+	profile->dcache_writebacks = gpgpu_dcache_read(s, GPGPU_REG_DCACHE_WRITEBACKS);
 }
 
 /*
@@ -195,16 +219,22 @@ GPGPUTask *gpgpu_task_create(GPGPUState *s, const GPGPUKernelParams *params)
  */
 GPGPUExecResult gpgpu_task_step(GPGPUTask *task)
 {
+	GPGPUExecProfile *profile = task->exec.profile;
+	GPGPUExecProfile before;
+	GPGPUExecProfile after;
 	GPGPUExecResult result;
+
+	if (profile)
+		task_cache_counters(task->exec.device, &before);
 
 	/* 1. warp_ready 为 false 表示刚换到新位置。 */
 	if (!task->warp_ready)
 		task_init_warp(task);
 
-	/* 2. CONTINUE 或 FAILED 直接返回给 Dispatch。 */
+	/* 2. CONTINUE 或 FAILED 保持原状态，统计之后原样交给 Dispatch。 */
 	result = task_run_warp(task);
 	if (result.status != GPGPU_EXEC_COMPLETE)
-		return result;
+		goto out;
 
 	/* 3. 当前 warp 已结束，移到下一个 warp 或下一个工作组。 */
 	task->warp_ready = false;
@@ -212,10 +242,28 @@ GPGPUExecResult gpgpu_task_step(GPGPUTask *task)
 		task->warp_index = 0;
 		task->block_index++;
 	}
-	return (GPGPUExecResult) {
+	result = (GPGPUExecResult) {
 		.status = task->block_index == task->block_count ? GPGPU_EXEC_COMPLETE :
 								   GPGPU_EXEC_CONTINUE,
 	};
+
+out:
+	/* 主锁下的段内增量不含段间 CP 轮询；按 32 位回绕累加为 64 位。 */
+	if (profile) {
+		task_cache_counters(task->exec.device, &after);
+		profile->tlb_hits += (uint32_t)(after.tlb_hits - before.tlb_hits);
+		profile->tlb_misses += (uint32_t)(after.tlb_misses - before.tlb_misses);
+		profile->dcache_hits += (uint32_t)(after.dcache_hits - before.dcache_hits);
+		profile->dcache_misses += (uint32_t)(after.dcache_misses - before.dcache_misses);
+		profile->dcache_writebacks +=
+			(uint32_t)(after.dcache_writebacks - before.dcache_writebacks);
+	}
+	return result;
+}
+
+const GPGPUExecProfile *gpgpu_task_profile(const GPGPUTask *task)
+{
+	return task->exec.profile;
 }
 
 void gpgpu_task_destroy(GPGPUTask *task)

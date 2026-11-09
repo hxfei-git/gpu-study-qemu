@@ -202,6 +202,14 @@ static void hqd_write(GPGPUState *s, unsigned int slot, hwaddr field, uint32_t v
 	if (!hqd_value_valid(s, slot, hqd, field, value))
 		goto invalid;
 	hqd[field / 4] = value;
+	/* 原生 CP 在收尾后推进 R；与 Dispatch、Doorbell 共用宿主单调时钟。 */
+	if (gpgpu_trace_enabled(s) && from_cp && field == GPGPU_HQD_RPTR && old != value &&
+	    slot >= GPGPU_HQD_USER_FIRST && hqd_get(hqd, GPGPU_HQD_ACTIVE) &&
+	    hqd_get(hqd, GPGPU_HQD_AQL))
+		fprintf(stderr, "GPGPU_QUEUE_PROGRESS {\"host_ns\":%" PRIu64
+			",\"slot\":%u,\"doorbell_offset\":%u,\"rptr_before\":%u,\"rptr_after\":%u}\n",
+			(uint64_t)g_get_monotonic_time() * 1000, slot,
+			hqd_get(hqd, GPGPU_HQD_DOORBELL) & GPGPU_DOORBELL_OFFSET_MASK, old, value);
 	return;
 
 invalid:

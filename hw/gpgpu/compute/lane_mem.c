@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * lane 访存：取指与 32/64 位数据访问
+ * lane 访存：取指与 8/32/64 位数据访问
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -43,10 +43,14 @@ bool gpgpu_lane_load(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, ui
 	const GPGPUKernelParams *p = &ctx->params;
 	uint8_t buf[8];
 
+	if (ctx->profile) {
+		ctx->profile->data_reads++;
+		ctx->profile->read_bytes += size;
+	}
 	if (!gpgpu_user_rw(ctx->device, GPGPU_MEM_EXECUTOR, p->vmid, p->source_slot, addr, buf,
 			   size, GPGPU_VM_READ, GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);
-	*value = size == 8 ? ldq_le_p(buf) : ldl_le_p(buf);
+	*value = ldn_le_p(buf, size);
 	return true;
 }
 
@@ -55,10 +59,11 @@ bool gpgpu_lane_store(GPGPUExecContext *ctx, uint64_t addr, unsigned int size, u
 	const GPGPUKernelParams *p = &ctx->params;
 	uint8_t buf[8];
 
-	if (size == 8)
-		stq_le_p(buf, value);
-	else
-		stl_le_p(buf, value);
+	if (ctx->profile) {
+		ctx->profile->data_writes++;
+		ctx->profile->write_bytes += size;
+	}
+	stn_le_p(buf, size, value);
 	if (!gpgpu_user_rw(ctx->device, GPGPU_MEM_EXECUTOR, p->vmid, p->source_slot, addr, buf,
 			   size, GPGPU_VM_WRITE, GPGPU_VM_PHASE_DATA))
 		return gpgpu_exec_fail(ctx, GPGPU_EXEC_ERR_MEMORY);

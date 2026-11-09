@@ -20,9 +20,11 @@ $(BUILD_DIR)/%.o: %.c cp.h $(wildcard ../include/gpgpu/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD_DIR)/start.o: start.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(BUILD_DIR)/gpgpu-cp.elf: $(OBJECTS) link.ld
-	$(CC) $(CFLAGS) -nostdlib -Wl,--build-id=none,-T,link.ld,-Map,$(BUILD_DIR)/gpgpu-cp.map $(OBJECTS) -o $@
+$(BUILD_DIR)/link.ld: link.ld ../include/gpgpu/gpgpu_cp_map.h | $(BUILD_DIR)
+	$(CC) -E -P -x c -I../include $< -o $@
+$(BUILD_DIR)/gpgpu-cp.elf: $(OBJECTS) $(BUILD_DIR)/link.ld
+	$(CC) $(CFLAGS) -nostdlib -Wl,--build-id=none,-T,$(BUILD_DIR)/link.ld,-Map,$(BUILD_DIR)/gpgpu-cp.map $(OBJECTS) -o $@
 $(BUILD_DIR)/gpgpu-cp.bin: $(BUILD_DIR)/gpgpu-cp.elf
 	$(OBJCOPY) -O binary $< $@
 clean:
-	rm -f $(OBJECTS) $(BUILD_DIR)/gpgpu-cp.elf $(BUILD_DIR)/gpgpu-cp.bin $(BUILD_DIR)/gpgpu-cp.map
+	rm -f $(OBJECTS) $(BUILD_DIR)/gpgpu-cp.elf $(BUILD_DIR)/gpgpu-cp.bin $(BUILD_DIR)/gpgpu-cp.map $(BUILD_DIR)/link.ld

@@ -43,6 +43,14 @@ GPGPUTask *gpgpu_task_create(GPGPUState *s, const GPGPUKernelParams *params);
  */
 GPGPUExecResult gpgpu_task_step(GPGPUTask *task);
 
+/**
+ * gpgpu_task_profile() - 取得可选的派发剖析计数
+ * @task: 尚未销毁的任务。
+ *
+ * Return: 未开启剖析时为 NULL；否则指针只在任务寿命内有效。
+ */
+const GPGPUExecProfile *gpgpu_task_profile(const GPGPUTask *task);
+
 /* 释放任务；可以为 NULL。调用前已停止后续推进。 */
 void gpgpu_task_destroy(GPGPUTask *task);
 

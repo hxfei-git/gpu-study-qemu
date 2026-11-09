@@ -29,8 +29,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GPGPUState, GPGPU)
 /* PCI 类别：3D 控制器。 */
 #define GPGPU_CLASS_CODE PCI_CLASS_DISPLAY_3D
 
-/* QOM 属性 vram_size 的默认值，单位字节。 */
-#define GPGPU_DEFAULT_VRAM_SIZE (64 * 1024 * 1024)
+/* QOM 属性 vram_size 的固定默认值，单位字节。 */
+#define GPGPU_DEFAULT_VRAM_SIZE GPGPU_VRAM_SIZE
 /* DEV_CAPS 报告的计算单元数默认值；执行器不使用该值。 */
 #define GPGPU_DEFAULT_NUM_CUS 4
 /* DEV_CAPS 报告的每计算单元 warp 数默认值；执行器不使用该值。 */
@@ -67,6 +67,38 @@ void gpgpu_set_busy(GPGPUState *s, bool busy);
  * Return: 属性在设备寿命内不变；为 true 时用户地址需经页表翻译。
  */
 bool gpgpu_gpuvm_enabled(GPGPUState *s);
+
+/**
+ * gpgpu_trace_enabled() - 查询是否记录 Dispatch 的宿主机计时
+ * @s: 设备实例。
+ *
+ * Return: trace_dispatch 或 profile_dispatch 开启时为 true，输出汇总日志。
+ */
+bool gpgpu_trace_enabled(GPGPUState *s);
+
+/**
+ * gpgpu_profile_enabled() - 查询是否额外统计执行与访存次数
+ * @s: 设备实例。
+ *
+ * Return: 启动属性 profile_dispatch 开启时为 true；剖析与正式计时分开。
+ */
+bool gpgpu_profile_enabled(GPGPUState *s);
+
+/**
+ * gpgpu_shared_fetch_enabled() - 查询是否在一轮内共享取指和字段译码
+ * @s: 设备实例。
+ *
+ * Return: 启动属性 shared_fetch 开启时为 true；逐 lane 执行顺序不变。
+ */
+bool gpgpu_shared_fetch_enabled(GPGPUState *s);
+
+/**
+ * gpgpu_tensor_native_enabled() - 查询张量指令是否允许安全的宿主 SIMD
+ * @s: 设备实例。
+ *
+ * Return: tensor_native 开启时为 true；不满足安全条件仍用 SoftFloat。
+ */
+bool gpgpu_tensor_native_enabled(GPGPUState *s);
 
 /**
  * gpgpu_reset_registers() - 停止执行并复位全部寄存器，保留 VRAM

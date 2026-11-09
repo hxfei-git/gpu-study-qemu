@@ -134,21 +134,45 @@ static const struct drm_gem_object_funcs bo_funcs = {
 };
 
 /*
- * 种类为 Host 或 VRAM；长度非零且不超过可用 VRAM；
- * 对齐为 2 的幂且不超过 GPGPU_QUEUE_RING_MAX；
- * 标志只能是 GPGPU_BO_EVENT_PAGE 与 GPGPU_BO_UNCACHED，通知页须为一页
- * Host 对象。
+ * bo_args_valid() - 检查对象参数与对应内存域的容量
+ *
+ * 1. 检查标志、通知页和内存域；Host 容量由 Outbound 窗口限制，VRAM 不含
+ *    固件保留区；
+ * 2. 页对齐前检查 size_t 上界，再检查映射长度与对齐要求的较大值。
+ *    取大后的长度不能超过对应内存域的容量。
+ *
+ * 实际能否分配仍由 DMA 分配器或连续 buddy 分配决定。
+ *
+ * Return: 参数、取整和分配长度均有效时为 true。
  */
 static bool bo_args_valid(const struct gpgpu_bo_create *args)
 {
+	u64 capacity, mapped_size;
+
+	/* 1. 通知页只能是一页 Host 对象，未知内存域不参与容量计算。 */
 	if (args->flags & ~(GPGPU_BO_EVENT_PAGE | GPGPU_BO_UNCACHED))
 		return false;
 	if ((args->flags & GPGPU_BO_EVENT_PAGE) &&
 	    (args->kind != GPGPU_MEMORY_HOST || args->size != GPGPU_EVENT_PAGE_SIZE))
 		return false;
-	return (args->kind == GPGPU_MEMORY_HOST || args->kind == GPGPU_MEMORY_VRAM) &&
-		args->size && args->size <= GPGPU_VRAM_USABLE_SIZE && args->alignment &&
-		is_power_of_2(args->alignment) && args->alignment <= GPGPU_QUEUE_RING_MAX;
+	switch (args->kind) {
+	case GPGPU_MEMORY_HOST:
+		capacity = GPGPU_OUTBOUND_SIZE;
+		break;
+	case GPGPU_MEMORY_VRAM:
+		capacity = GPGPU_VRAM_USABLE_SIZE;
+		break;
+	default:
+		return false;
+	}
+
+	/* 2. 先挡住 PAGE_ALIGN 溢出和 size_t 截断，再校验实际分配长度。 */
+	if (!args->size || args->size > SIZE_MAX - (PAGE_SIZE - 1) || !args->alignment ||
+	    !is_power_of_2(args->alignment) || args->alignment > GPGPU_QUEUE_RING_MAX)
+		return false;
+
+	mapped_size = PAGE_ALIGN(args->size);
+	return max_t(u64, mapped_size, args->alignment) <= capacity;
 }
 
 /* 请求长度至少覆盖对象与对齐要求，底层分配器负责内部取整。 */
@@ -162,7 +186,7 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
 		bo->phys_addr = bo->host.addr;
 		return ret;
 	}
-	return gpgpu_vram_alloc(bo->dev, size, &bo->vram_blocks, &bo->phys_addr);
+	return gpgpu_vram_alloc(bo->dev, size, &bo->vram_blocks, &bo->phys_addr, true);
 }
 
 /**
@@ -180,7 +204,8 @@ static int bo_storage_alloc(struct gpgpu_bo *bo, u64 alignment)
  * 2. 分配并清零存储。带 GPGPU_BO_UNCACHED 或 GPGPU_BO_EVENT_PAGE 的对象
  *    记为不可缓存，绑定时写进叶子项。然后初始化 GEM。对象另取 DRM 与
  *    设备引用，句柄和会话都关闭后对象仍能安全释放存储；挂入会话链表
- *    即持有列表引用。
+ *    即持有列表引用。可选 VRAM DMA 清零只在这个未公开阶段释放主锁，
+ *    重锁后先复核设备与会话状态，之后才初始化 GEM。
  *    通知页在第 4 步解锁之前登记，并发的第二个通知页请求会在第 1 步
  *    失败；
  * 3. 建立 mmap 偏移，对象之后可经 render node 映射到用户态：Host 对象
@@ -220,9 +245,21 @@ int gpgpu_bo_create(struct gpgpu_fpriv *fpriv, struct gpgpu_bo_create *args)
 	INIT_LIST_HEAD(&bo->vram_blocks);
 
 	ret = bo_storage_alloc(bo, args->alignment);
-	if (ret) {
-		kfree(bo);
-		return ret;
+	if (ret)
+		goto free_bo;
+
+	/* DMA 清零曾放下主锁；对象尚未公开，复核后才能登记 GEM。 */
+	if (bo->kind == GPGPU_MEMORY_VRAM && dev->vram_zero.cpu) {
+		if (!dev->present)
+			ret = -ENODEV;
+		else if (READ_ONCE(dev->fatal))
+			ret = -EIO;
+		else if (fpriv->vm.failed)
+			ret = -EBUSY;
+		if (ret) {
+			bo_storage_free(bo);
+			goto free_bo;
+		}
 	}
 
 	bo->gem.funcs = &bo_funcs;
@@ -274,6 +311,10 @@ drop:
 	if (fpriv->vm.notify == bo)
 		gpgpu_vm_set_event_page(fpriv, NULL);
 	gpgpu_bo_drop(bo);
+	return ret;
+
+free_bo:
+	kfree(bo);
 	return ret;
 }
 
@@ -335,6 +376,28 @@ static void copy_start(struct gpgpu_device *dev, bool to_host, u64 host, u64 vra
 		   GPGPU_DMA_START | GPGPU_DMA_IRQ_ENABLE | (to_host ? GPGPU_DMA_DIR_FROM_VRAM : 0));
 }
 
+int gpgpu_dma_copy(struct gpgpu_device *dev, bool to_host, u64 host, u64 vram, u32 size)
+{
+	int ret;
+
+	/* 1. 调用者已持 dma_lock，拒绝不能安全启动的新事务。 */
+	if (!READ_ONCE(dev->present) || READ_ONCE(dev->dma_uncertain) || READ_ONCE(dev->fatal))
+		return -EIO;
+
+	/* 2. COPY 与 BO 清零共用同一份发布和 completion 初始化逻辑。 */
+	copy_start(dev, to_host, host, vram, size);
+
+	/* 3. 只有本次等待超时才表示本次访问仍可能在途。 */
+	if (!wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(GPGPU_TIMEOUT_MS))) {
+		WRITE_ONCE(dev->dma_uncertain, true);
+		ret = -ETIMEDOUT;
+	} else {
+		ret = READ_ONCE(dev->dma_failed) ? -EIO : 0;
+	}
+	dma_rmb();
+	return ret;
+}
+
 /**
  * gpgpu_bo_copy() - COPY：在 Host 对象与 VRAM 对象之间同步搬运
  * @fpriv: 会话；调用者持 dev->lock，函数内会暂时释放。
@@ -374,24 +437,10 @@ int gpgpu_bo_copy(struct gpgpu_fpriv *fpriv, struct gpgpu_memory_copy *args)
 	vram->users++;
 	mutex_unlock(&dev->lock);
 
-	/* 2. 换成 dma_lock，设备仍可用时启动 DMA。 */
+	/* 2. 3. 换成 dma_lock，共用物理 DMA 的启动、等待和超时处理。 */
 	mutex_lock(&dev->dma_lock);
-	if (!READ_ONCE(dev->present) || READ_ONCE(dev->dma_uncertain) || READ_ONCE(dev->fatal)) {
-		ret = -EIO;
-		goto unlock;
-	}
-	copy_start(dev, to_host, host->phys_addr + args->host_offset,
-		   vram->phys_addr + args->vram_offset, args->size);
-
-	/* 3. 等完成中断；超时时不能确认 DMA 已结束。 */
-	if (!wait_for_completion_timeout(&dev->dma_done, msecs_to_jiffies(GPGPU_TIMEOUT_MS))) {
-		WRITE_ONCE(dev->dma_uncertain, true);
-		ret = -ETIMEDOUT;
-	} else {
-		ret = READ_ONCE(dev->dma_failed) ? -EIO : 0;
-	}
-	dma_rmb();
-unlock:
+	ret = gpgpu_dma_copy(dev, to_host, host->phys_addr + args->host_offset,
+			     vram->phys_addr + args->vram_offset, args->size);
 	mutex_unlock(&dev->dma_lock);
 
 	/* 4. 回到 dev->lock；只有本次 DMA 结果未知时保留使用计数。 */

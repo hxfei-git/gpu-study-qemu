@@ -21,11 +21,20 @@
 #include <linux/delay.h>
 #include <linux/dma-map-ops.h>
 #include <linux/firmware.h>
+#include <linux/moduleparam.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include "gpgpu_drv.h"
 
 /* DMA 地址的可用范围，等于 Outbound 窗口长度（31 位）。 */
 #define GPGPU_DMA_LIMIT GPGPU_OUTBOUND_SIZE
+/* 设备只读零源的字节数，不随 BO 大小增长。 */
+#define DEV_ZERO_BYTES SZ_64K
+
+/* 只供 A/B 测量；默认保持原有 BAR2 清零，加载后不能改写。 */
+static bool vram_clear_dma;
+module_param(vram_clear_dma, bool, 0444);
+MODULE_PARM_DESC(vram_clear_dma, "未发布 VRAM BO 使用 DMA 清零，默认关闭");
 
 /* ---- dcache ---- */
 
@@ -175,7 +184,9 @@ static void gpgpu_release_retired(struct gpgpu_device *dev)
 }
 
 /*
- * 最后一个引用：释放管理对象、IH、保留的存储、VRAM 分配器与 PCI 引用。
+ * 最后一个引用：释放管理对象、IH、只读零源、保留存储与 VRAM 分配器。
+ * DMA 仍可能在途时，会话或 stop 的引用保留设备。
+ * 未发布设备尚未启动 DMA，沿原有初始化失败路径回收。
  * 保留的 VRAM 块在 dev->reserved_blocks 中，随分配器一起归还。
  */
 static void gpgpu_device_release(struct kref *refs)
@@ -184,6 +195,7 @@ static void gpgpu_device_release(struct kref *refs)
 
 	gpgpu_mgmt_fini(dev);
 	gpgpu_dma_buf_free(dev, &dev->ih);
+	gpgpu_dma_buf_free(dev, &dev->vram_zero);
 	gpgpu_release_retired(dev);
 	gpgpu_vram_fini(dev);
 	if (dev->vram)
@@ -205,14 +217,15 @@ void gpgpu_device_put(struct gpgpu_device *dev)
 /* ---- 创建 ---- */
 
 /*
- * 驱动对设备的假设：DMA 一致；刚复位，CP 在位且保持复位；VRAM 恰为固件
- * 布局要求的 64 MiB（栈顶即 VRAM 末尾）；Doorbell BAR 至少 3 页。
+ * 驱动要求：DMA 一致；刚复位，CP 在位且保持复位；VRAM 容量与共享
+ * 布局一致；Doorbell BAR 至少 3 页。
  */
 static bool gpgpu_device_supported(struct pci_dev *pdev, void __iomem *regs)
 {
 	return dev_is_dma_coherent(&pdev->dev) &&
 		readl(regs + GPGPU_REG_CP_CTRL) == (GPGPU_CP_PRESENT | GPGPU_CP_RESET_HOLD) &&
-		readl(regs + GPGPU_REG_VRAM_SIZE_LO) == GPGPU_FIRMWARE_STACK_TOP &&
+		!readl(regs + GPGPU_REG_VRAM_SIZE_HI) &&
+		readl(regs + GPGPU_REG_VRAM_SIZE_LO) == GPGPU_VRAM_SIZE &&
 		GPGPU_DOORBELL_BAR_SIZE / 3 >= PAGE_SIZE;
 }
 
@@ -221,14 +234,15 @@ static bool gpgpu_device_supported(struct pci_dev *pdev, void __iomem *regs)
  *
  * probe 在复位并使能设备后调用，只分配软件对象和内存，不启动 CP。
  *
- * 1. 检查设备满足驱动假设：一致性 DMA、CP 在位且保持复位、VRAM 为
- *    64 MiB，Doorbell BAR 至少容纳 3 页；
+ * 1. 检查一致性 DMA、CP 在位且保持复位、VRAM 与共享布局一致，
+ *    Doorbell BAR 至少容纳 3 页；
  * 2. 分配设备对象，初始化锁、链表与引用计数（probe 持有第一个引用）。
  *    Doorbell 第 0 页留给管理队列，管理请求序号从 1 开始；
  * 3. 建立 VRAM 分配器（预留首页），映射 BAR2 用于装载固件、清零对象
  *    和写页表；
  * 4. 分配 KIQ、HIQ 的 Ring 与 MQD，以及 IH Ring。CP 管理域与 IH 都按
- *    DEVICE 访问它们，不需要登记缓存属性。
+ *    DEVICE 访问它们，不需要登记缓存属性。可选 DMA 零源在此后分配，
+ *    失败保持 BAR2 清零；成功后只读，随设备的最终安全释放归还。
  *
  * 失败时放下唯一的引用，gpgpu_device_release() 只回收已分配的部分。
  */
@@ -288,6 +302,12 @@ struct gpgpu_device *gpgpu_device_create(struct pci_dev *pdev, void __iomem *reg
 	if (ret)
 		goto fail;
 
+	/* 零源只在发布设备前写一次；失败不影响原有 BAR2 路径。 */
+	if (vram_clear_dma) {
+		ret = gpgpu_dma_buf_alloc(dev, &dev->vram_zero, DEV_ZERO_BYTES, DEV_ZERO_BYTES);
+		if (ret)
+			dev_warn(&pdev->dev, "DMA 零源分配失败 %d，使用 BAR2\n", ret);
+	}
 	return dev;
 fail:
 	gpgpu_device_put(dev);

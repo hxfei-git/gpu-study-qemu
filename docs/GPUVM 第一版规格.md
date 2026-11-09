@@ -55,7 +55,7 @@
 | WB     | Write-Back | 写回；本实验指页属性允许进入数据缓存的访问类型 |
 | MTYPE  | Memory Type | AMDGPU 页表项中的内存类型字段 |
 
-本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 6，与版本 5 的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明](<../software/gpgpu/README.md#stage-three-gpuvm>)。
+本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 7，升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。
 
 **[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口。开启时，数据读写在翻译和权限检查之后按叶子项的缓存属性决定是否经过设备的数据缓存；关闭时没有页表给出属性，数据访问都不进入缓存。缓存行为见 [dcache 第一版规格](<./dcache 第一版规格.md#dcache-paths>)。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
 
@@ -165,7 +165,7 @@ AMDGPU 还通过 TTM 管理允许的存储位置及当前资源。本期只保�
 
 KIQ/HIQ Ring、MQD、管理结果区、IH、页表和固件由驱动管理，应用不能把这些区域映射成普通对象。通知页是用户态创建的普通 Host 对象，创建时登记给驱动，见[第 6.1 节](#gpuvm-signal)。
 
-> **[SPEC]** [CP/MEC 第一版规格，内存对象](<./CP_MEC 第一版规格.md#spec-objects-addresses>)、[Kernel 数据存储](<./CP_MEC 第一版规格.md#spec-kernel-data-storage>)与[固件保留区](<./CP_MEC 第一版规格.md#spec-firmware-layout>)，2026-10-19 状态：普通 VRAM 为前 60 MiB，首个页保留；末尾 4 MiB 固件区不参与普通分配。第三阶段页表也从驱动管理的存储中分配并登记占用。
+> **[SPEC]** 对象存放位置见 [CP/MEC 第一版规格，内存对象](<./CP_MEC 第一版规格.md#spec-objects-addresses>)与[Kernel 数据存储](<./CP_MEC 第一版规格.md#spec-kernel-data-storage>)。首页保留、固件区和分配器范围统一按[第 3.1 节的现行布局](<./CP_MEC 第一版规格.md#spec-firmware-layout>)执行；页表也从驱动管理的存储中分配并登记占用。
 
 <a id="gpuvm-addresses"></a>
 
@@ -250,7 +250,7 @@ SYSTEM 决定地址域的含义，设备据此换算出 GPU 物理页，再交�
        → GPU 物理页 0x0001_1000 → VRAM
 
 叶子项 0xc100_2000 | VALID | R
-  └─ SYSTEM=0，但地址域不在 64 MiB VRAM 内 → 页表错误
+  └─ SYSTEM=0，但地址域不在固定 VRAM 范围内 → 页表错误
 ```
 
 地址域与 SYSTEM 不一致时报页表错误，设备不按地址数值去猜它属于 VRAM 还是 Outbound。最后一个例子是版本 3 的写法：当时 PTE 直接保存 GPU 物理地址，bit 1 必须为 0。版本 4 把 bit 1 定义为 SYSTEM，Host 页的叶子项改存 IOVA 并置 SYSTEM。
@@ -296,13 +296,14 @@ BO_CREATE 带 GPGPU_BO_UNCACHED 或 GPGPU_BO_EVENT_PAGE
 
 对象和块搬运可以跨页，每一页分别检查。单次标量访问要求自然对齐且不跨页，完整 32/64 位共享字段不能拆成部分写入。跨页操作后续失败时保留先前写入，不提供回滚。
 
+<a id="gpuvm-host-dma"></a>
+
 ### 3.3 Host DMA 与系统 IOMMU
 
-驱动已取得 Host 对象的 DMA 地址，需要把它放入 GPU 可访问的物理空间。Outbound 窗口固定从 `0x8000_0000` 开始，与 VRAM 容量无关。设 VRAM 为 64 MiB，设备物理布局和换算如下：
+驱动已取得 Host 对象的 DMA 地址，需要把它放入 GPU 可访问的物理空间。按[CP/MEC 第 3.1 节的固定布局](<./CP_MEC 第一版规格.md#spec-firmware-layout>)，VRAM 与 Outbound 相邻；Host 对象通过 Outbound 换算：
 
 ```text
-GPU 物理地址 [0x0000_0000, 0x0400_0000)   → VRAM
-GPU 物理地址 [0x0400_0000, 0x8000_0000)   → 空洞，不可路由
+GPU 物理地址 [0x0000_0000, 0x8000_0000)   → VRAM
 GPU 物理地址 [0x8000_0000, 0x1_0000_0000) → Outbound
 
 Host IOVA 0x4100_0000
@@ -312,16 +313,15 @@ Host IOVA 0x4100_0000
 用户访问 → GPUVM 开启时翻译，关闭时直通
   → 公共物理入口
       ├─ VRAM：访问设备存储
-      ├─ 空洞：路由失败，按窗口未使能处理
       └─ Outbound：减 0x8000_0000 → Host IOVA → PCIe DMA
                                        └─ SMMUv3（启用时）→ Host 物理内存
 ```
 
-Outbound 的 GPU 基址固定为 `0x8000_0000`，Host IOVA 基址为 0，窗口长度为 2 GiB。VRAM 改变容量时，Host 对象的 GPU 物理地址不变；VRAM 末端到窗口起点之间的空洞不可路由。访问空洞与访问未使能的窗口按同样的方式报错：用户访问记 GPUVM 故障，CP 管理域访问记队列错误，DMA 引擎置 `DMA_FAULT`。
+Outbound 的 GPU 基址固定为 `0x8000_0000`，Host IOVA 基址为 0，窗口长度为 2 GiB。本版没有可调 VRAM 容量或中间空洞。访问未使能的窗口仍会失败：用户访问记 GPUVM 故障，CP 管理域访问记队列错误，DMA 引擎置 `DMA_FAULT`。
 
 BAR0 `0x0b00～0x0b10` 布局寄存器只读，驱动在 CP 启动前读回核对起点、长度和 Host 基址，再写 `0x0b14` CONTROL 并确认成功；写只读布局置 `OUTBOUND_STATUS.ERROR` 并锁存 `INVALID_CMD`；窗口由整个设备共用，运行期间拒绝重配置。窗口覆盖仅决定路由，Host 存储或 IOMMU 映射不存在仍会访问失败。
 
-驱动统一设置 31 位 DMA mask，正好覆盖窗口对应的 2 GiB IOVA；`vram_size < 2 GiB` 的限制保证 VRAM 不伸进窗口。每次分配都用 64 位算术校验完整 DMA 区间，IOVA 0 合法，对应 GPU 物理地址 `0x8000_0000`。用户 Host BO、管理 Ring、MQD、完成区、IH 和通知页遵守同一规则；Host BO 独立使用 `dma_alloc_coherent()`，不建立大块连续池。原始 `dma_addr_t` 供 DMA API 映射和释放，转换后的地址供设备协议使用。
+驱动统一设置 31 位 DMA mask，正好覆盖窗口对应的 2 GiB IOVA；固定布局中的 VRAM 上界就是 Outbound 起点，两个区间不重叠。每次分配都用 64 位算术校验完整 DMA 区间，IOVA 0 合法，对应 GPU 物理地址 `0x8000_0000`。用户 Host BO、管理 Ring、MQD、完成区、IH 和通知页遵守同一规则；Host BO 独立使用 `dma_alloc_coherent()`，不建立大块连续池。原始 `dma_addr_t` 供 DMA API 映射和释放，转换后的地址供设备协议使用。
 
 GPUVM 选择应用页表，SMMUv3 处理设备 DMA，不把 GPU VMID 当成系统 IOMMU 的进程标识。本轮保留 SMMUv3 功能，但只在 `IOMMU=none` 下运行既有三个计算示例，不追加 IOMMU 验收矩阵。
 
@@ -352,7 +352,7 @@ CP 现有访存窗口显式选择管理域或用户域。管理域直接进入�
 
 <a id="gpuvm-executor"></a>
 
-AQL 的 `kernel_object`、`kernarg_address`、`completion_signal` 统一使用用户 GPU 地址。描述对象为 24 字节：64 位代码入口、代码长度、参数块长度、`kernel_abi_version = 5` 和必须为 0 的保留字段，CP 拒绝其他版本和非零保留字段，再把入口的高、低 32 位分别写入 Dispatch 的 `KERNEL_ADDR_HI/LO`。
+AQL 的 `kernel_object`、`kernarg_address`、`completion_signal` 统一使用用户 GPU 地址。24 字节描述对象保存 64 位代码入口、代码长度、参数块长度、`kernel_abi_version` 和必须为 0 的保留字段。ABI 版本取共享的 `GPGPU_KERNEL_ABI_VERSION`，由统一协议版本派生。CP 拒绝版本不匹配或保留字段非零的描述对象；检查通过后，才把代码入口的高、低 32 位分别写入 Dispatch 的 `KERNEL_ADDR_HI/LO`。
 
 执行器是 RV64 解释器：整数寄存器与 PC 为 64 位，参数块每项占 8 字节，Kernel 用 `ld` 读出 64 位指针或标量。以向量加法为例，参数块依次是 X、Y、Z 的地址和元素数，Kernel 读元素数时访问 `a0 + 24`：
 
@@ -622,7 +622,7 @@ IH 自身故障 → 锁存状态、拒绝新记录、停止新取包和调度
 
 > **[SOURCE]** 固定 Linux 源码：[amdgpu_gem.c，第 811～886 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c#L811-L886)校验地址、权限、操作及文件所属对象句柄；[第 944～974 行](https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c#L944-L974)区分映射、解除、清理与替换。本期只采用同步、整对象 `MAP/UNMAP` 子集。
 
-DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数（开启为 48、关闭为 32）、4 KiB 页、可分配 GPUVA 区间数量（开启为 1、关闭为 0）、两个用户编号、每上下文一 Queue 及当前绑定数量。默认应用不接触物理 DMA 地址。
+DRM ioctl 的 version 字段与能力查询返回的版本均须匹配 `GPGPU_PROTOCOL_VERSION`。能力查询还返回地址位数（开启为 48、关闭为 32）、4 KiB 页、可分配 GPUVA 区间数量（开启为 1、关闭为 0）、两个用户编号、每上下文一 Queue 及当前绑定数量。默认应用不接触物理 DMA 地址。
 
 库由 `gpgpuKmtAllocMemory()` 接收权限和固定 GPUVA 参数，`fixed_va=0` 时由库申请 CPU 地址并以同一数值作为 GPUVA；代码对象必须显式添加取指权限。`gpgpuKmtGetVmInfo()` 查询能力，`gpgpuKmtGetVmFault()` 查询尚持有的队列对象的首次故障。关闭队列前先保存故障；队列对象销毁后不能再用其编号查询。内存、队列和事件结构须保持有效直至显式释放或 `gpgpuKmtClose()` 完成。
 
@@ -630,7 +630,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数�
 
 ### 8.3 单一 DRM 入口与协议版本
 
-两种状态都只开放 DRM render node。驱动读取设备的 `gpuvm` 属性后固定使用，删除 `queue_mode`、`/dev/gpgpu0`、旧同步提交和旧 Runtime。设备／固件队列协议、DRM 与 GPUVM 编码均为版本 6，旧组件明确拒绝，不增加兼容转换。AQL 包仍为 64 字节，Kernel 描述对象为 24 字节。
+两种状态都只开放 DRM render node。驱动读取设备的 `gpuvm` 属性后固定使用，删除 `queue_mode`、`/dev/gpgpu0`、旧同步提交和旧 Runtime。设备／固件队列协议、DRM 与 GPUVM 编码均使用本文开头的统一协议版本，旧组件明确拒绝，不增加兼容转换。AQL 包仍为 64 字节，Kernel 描述对象为 24 字节。
 
 公共 HSAKMT 风格库承担槽位预留、Header 发布、8 字节 Doorbell 更新、Signal 等待与事件配合、排空和 Queue 销毁；示例通过 `lib/rt/` 调用 `lib/kmt/`，统一链接 `libgpgpu.a`。应用只使用 `cpu` 和 `gpu_address`，不选择 Host DMA 地址、VRAM 偏移或 GPUVA 三套字段。
 
@@ -657,7 +657,7 @@ DRM ioctl 的 version 字段及能力查询返回版本均为 5、地址位数�
 <a id="gpuvm-confirm-memory-access"></a>
 <a id="gpuvm-confirm-host-dma"></a>
 
-- **地址与页表：** 48 位 GPUVA 等于对象的 CPU 地址，GPU 物理地址仍为 32 位；RV64 执行器、真实 `a0`、只读启动 CSR；开启时使用四级 4 KiB 页表和读写取指权限，关闭时不创建页表；两者共用同一物理布局：VRAM 在低端，Outbound 固定从 `0x8000_0000` 开始，中间的空洞不可路由。
+- **地址与页表：** 48 位 GPUVA 等于对象的 CPU 地址，GPU 物理地址仍为 32 位；RV64 执行器、真实 `a0`、只读启动 CSR；开启时使用四级 4 KiB 页表和读写取指权限，关闭时不创建页表；两者共用[第 3.3 节的固定物理布局](#gpuvm-host-dma)，固件保留与普通分配范围见[CP/MEC 第 3.1 节](<./CP_MEC 第一版规格.md#spec-firmware-layout>)。
 
 <a id="gpuvm-confirm-access"></a>
 <a id="gpuvm-confirm-address-fields"></a>
