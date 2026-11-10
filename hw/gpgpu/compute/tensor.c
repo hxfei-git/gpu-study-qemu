@@ -906,6 +906,115 @@ static uint32_t tensor_matrix_load(GPGPUExecContext *ctx, const TensorCommand *c
 	return 0;
 }
 
+/* 每行只提取一次最大编码指数；255 表示存在 NaN/Inf，空 K 块返回 0。 */
+static unsigned int tensor_w8_a_exp_max(const TensorMatrix *t, unsigned int row)
+{
+	unsigned int a_exp_max = 0;
+
+	for (unsigned int k = 0; k < t->depth; k++)
+		a_exp_max = MAX(a_exp_max, (t->a[row][k] >> 23) & 255);
+	return a_exp_max;
+}
+
+/*
+ * tensor_w8_compensated_valid() - 用本行最大指数判断一个 W8 输出能否补偿
+ *
+ * 标量 Kernel 使用同一组 ABI 指数界限，预筛不执行浮点运算：
+ *
+ *   FP32 位     31       30..23       22..0
+ *   含义        符号     编码指数 E   小数
+ *
+ * 例：A=scale=1 时两指数均为 127，指数和 254 在共享安全界内。
+ * 1. 检查本输出的 seed、scale 指数；大有限值及 NaN/Inf 直接拒绝；
+ * 2. 用本行最大 A 指数检查非有限值及指数和，不依赖其他输出列。
+ *    scale 指数非负，因此最大指数通过等价于该行每个 A 指数通过。
+ *
+ * 本函数不反量化、不试算补偿，避免拒绝路径泄漏浮点异常。
+ * Return: 可以直接执行补偿时为 true，否则必须从原 seed 严格逐 K FMA。
+ */
+static bool tensor_w8_compensated_valid(const TensorMatrix *t, unsigned int row, unsigned int col,
+				      unsigned int a_exp_max)
+{
+	unsigned int seed_exp = (t->seed[row][col] >> 23) & 255;
+	unsigned int scale_exp = (t->scale[col] >> 23) & 255;
+
+	/* 1. 同一输出列只使用自己的 seed 和 scale 选择数值路径。 */
+	if (seed_exp > GPGPU_TENSOR_W8_SAFE_EXP_MAX ||
+	    scale_exp > GPGPU_TENSOR_W8_SAFE_EXP_MAX)
+		return false;
+
+	/* 2. 最大指数为 255 时，该行至少有一个 NaN/Inf。 */
+	return a_exp_max != 255 && a_exp_max + scale_exp <= GPGPU_TENSOR_W8_SAFE_PRODUCT_EXP_SUM;
+}
+
+/* 收集并清除局部异常，避免 sticky inexact 触发宿主 hardfloat。 */
+static float32 tensor_soft_result(float32 value, float_status *soft, int *flags)
+{
+	*flags |= get_float_exception_flags(soft);
+	set_float_exception_flags(0, soft);
+	return value;
+}
+
+/*
+ * tensor_w8_compensated() - 用 FP32 TwoProduct/TwoSum 累加一个固定 K 块
+ *
+ * 整数预筛通过后才调用，权重已独立反量化。各步与标量 Kernel 对齐：
+ *
+ *   A*W ─TwoProduct─▶ product + product_error
+ *   sum+product ─TwoSum─▶ next + sum_error
+ *   correction += sum_error+product_error；sum=next
+ *
+ * 例：大乘积约 -1058 后加小项，低位先存到 correction，
+ * 而不是每项都丢给大 sum 舍入。
+ * 1. 独立乘法取得 product，再用 FMA 恢复乘积低位；
+ * 2. 用 TwoSum 恢复加法低位，与乘积低位一起加到 correction；
+ * 3. 块末只发布一个 FP32 sum+correction。
+ *
+ * 本函数不改变反量化、块边界、偏置或访存；极值回退在调用前决定。
+ * Return: 按本块 FP32 补偿公式舍入的输出，异常并入 flags。
+ */
+static float32 tensor_w8_compensated(const TensorMatrix *t, unsigned int row, unsigned int col,
+				    float_status *soft, int *flags)
+{
+	float32 sum = t->seed[row][col];
+	float32 correction = float32_zero;
+
+	set_float_exception_flags(0, soft);
+	for (unsigned int k = 0; k < t->depth; k++) {
+		float32 a = t->a[row][k];
+		float32 b = t->b[k][col];
+		float32 product;
+		float32 negative;
+		float32 product_error;
+		float32 next;
+		float32 part;
+		float32 left;
+		float32 right;
+		float32 error;
+
+		/* 1. 权重已先舍入；乘法低位只补回本次 A*W 的误差。 */
+		product = tensor_soft_result(float32_mul(a, b, soft), soft, flags);
+		negative = tensor_soft_result(float32_mul(product, float32_chs(float32_one), soft),
+					     soft, flags);
+		product_error = tensor_soft_result(float32_muladd(a, b, negative, 0, soft),
+						  soft, flags);
+
+		/* 2. 不假设 sum 与 product 的绝对值大小关系。 */
+		next = tensor_soft_result(float32_add(sum, product, soft), soft, flags);
+		part = tensor_soft_result(float32_sub(next, sum, soft), soft, flags);
+		left = tensor_soft_result(float32_sub(next, part, soft), soft, flags);
+		left = tensor_soft_result(float32_sub(sum, left, soft), soft, flags);
+		right = tensor_soft_result(float32_sub(product, part, soft), soft, flags);
+		error = tensor_soft_result(float32_add(left, right, soft), soft, flags);
+		error = tensor_soft_result(float32_add(error, product_error, soft), soft, flags);
+		correction = tensor_soft_result(float32_add(correction, error, soft), soft, flags);
+		sum = next;
+	}
+
+	/* 3. 低位不跨指令保存，后续 K 块只读取该 FP32 结果。 */
+	return tensor_soft_result(float32_add(sum, correction, soft), soft, flags);
+}
+
 /*
  * tensor_matrix_reference() - 完整 SoftFloat 参考路径
  *
@@ -914,7 +1023,7 @@ static uint32_t tensor_matrix_load(GPGPUExecContext *ctx, const TensorCommand *c
  * 因此参考路径不依赖宿主舍入、FTZ/DAZ 或异常环境。
  *
  * 1. W8 的每项先精确转 FP32，再用独立 FP32 乘法乘该输出通道的 scale；
- * 2. 每个输出从自己的 seed 开始，严格按 K 递增逐次 float32_muladd；
+ * 2. 每个输出从自己的 seed 开始；安全 W8 块做补偿，其他情况严格逐 K FMA；
  * 3. 末块再做一次独立 FP32 bias 加法，把所有异常并入当前 Lane。
  *
  * 不访问 GPU，不改变 PC/fcsr；native 尝试失败时从原 seed 完整重算。
@@ -943,17 +1052,23 @@ static void tensor_matrix_reference(TensorMatrix *t,
 	}
 
 	for (unsigned int row = 0; row < t->rows; row++) {
+		unsigned int a_exp_max = t->format == GPGPU_TENSOR_LINEAR_W8 ?
+					 tensor_w8_a_exp_max(t, row) : 0;
+
 		for (unsigned int col = 0; col < t->cols; col++) {
 			float32 acc = t->seed[row][col];
 
-			/*
-			 * 2. 每次先清局部 sticky inexact，
-			 *    强制走 SoftFloat 软件实现。
-			 */
-			for (unsigned int k = 0; k < t->depth; k++) {
-				set_float_exception_flags(0, &soft);
-				acc = float32_muladd(t->a[row][k], t->b[k][col], acc, 0, &soft);
-				flags |= get_float_exception_flags(&soft);
+			/* 2. 不符合指数界时，直接用原 seed 逐 K FMA。 */
+			if (t->format == GPGPU_TENSOR_LINEAR_W8 &&
+			    tensor_w8_compensated_valid(t, row, col, a_exp_max)) {
+				acc = tensor_w8_compensated(t, row, col, &soft, &flags);
+			} else {
+				for (unsigned int k = 0; k < t->depth; k++) {
+					set_float_exception_flags(0, &soft);
+					acc = float32_muladd(t->a[row][k], t->b[k][col],
+							    acc, 0, &soft);
+					flags |= get_float_exception_flags(&soft);
+				}
 			}
 
 			/*
@@ -979,12 +1094,18 @@ static void tensor_matrix_reference(TensorMatrix *t,
 static bool tensor_native_inputs_valid(const TensorMatrix *t)
 {
 	for (unsigned int row = 0; row < t->rows; row++) {
+		unsigned int a_exp_max = t->format == GPGPU_TENSOR_LINEAR_W8 ?
+					 tensor_w8_a_exp_max(t, row) : 0;
+
 		for (unsigned int k = 0; k < t->depth; k++) {
 			if (!float32_is_zero_or_normal(t->a[row][k]))
 				return false;
 		}
 		for (unsigned int col = 0; col < t->cols; col++) {
 			if (!float32_is_zero_or_normal(t->seed[row][col]))
+				return false;
+			if (t->format == GPGPU_TENSOR_LINEAR_W8 &&
+			    !tensor_w8_compensated_valid(t, row, col, a_exp_max))
 				return false;
 		}
 	}
@@ -1047,7 +1168,8 @@ static bool __attribute__((target("avx2,fma"))) tensor_native_vector_valid(__m25
  *
  * 1. 把真实列复制到补零的局部行，尾部补位不读取额外 GPU 元素；
  * 2. W8 逐项 FP32 乘 scale，每次舍入后检查中间值；
- * 3. 每组 SIMD 列共享 K 顺序，每个输出仍逐 K FMA，末块再独立加 bias；
+ * 3. SIMD 各列按相同 K 顺序计算；W8 与软件路径同公式补偿，
+ *    其他格式仍逐 K FMA，块末独立加 bias；
  * 4. 只复制真实输出列，异常标志仍由调用者在恢复宿主环境前检查。
  *
  * 子正规或非有限中间值立即拒绝；调用者从原 seed 运行完整参考路径。
@@ -1099,14 +1221,54 @@ tensor_native_kernel_ok(const TensorMatrix *t,
 			__m256 acc = _mm256_castsi256_ps(
 				_mm256_loadu_si256((const __m256i *)&c[row][col]));
 
-			for (unsigned int k = 0; k < t->depth; k++) {
-				__m256 a = _mm256_castsi256_ps(_mm256_set1_epi32(t->a[row][k]));
-				__m256 weight = _mm256_castsi256_ps(
-					_mm256_loadu_si256((const __m256i *)&b[k][col]));
+			if (t->format == GPGPU_TENSOR_LINEAR_W8) {
+				__m256 correction = _mm256_setzero_ps();
+				__m256 sign = _mm256_castsi256_ps(_mm256_set1_epi32(INT32_MIN));
 
-				acc = _mm256_fmadd_ps(a, weight, acc);
+				for (unsigned int k = 0; k < t->depth; k++) {
+					__m256 a = _mm256_castsi256_ps(
+						_mm256_set1_epi32(t->a[row][k]));
+					__m256 weight = _mm256_castsi256_ps(
+						_mm256_loadu_si256((const __m256i *)&b[k][col]));
+					__m256 product = _mm256_mul_ps(a, weight);
+					__m256 product_error = _mm256_fmadd_ps(
+						a, weight, _mm256_xor_ps(product, sign));
+					__m256 next = _mm256_add_ps(acc, product);
+					__m256 part = _mm256_sub_ps(next, acc);
+					__m256 back = _mm256_sub_ps(next, part);
+					__m256 left = _mm256_sub_ps(acc, back);
+					__m256 right = _mm256_sub_ps(product, part);
+					__m256 sum_error = _mm256_add_ps(left, right);
+					__m256 error = _mm256_add_ps(sum_error, product_error);
+
+					correction = _mm256_add_ps(correction, error);
+					if (!tensor_native_vector_valid(product) ||
+					    !tensor_native_vector_valid(product_error) ||
+					    !tensor_native_vector_valid(next) ||
+					    !tensor_native_vector_valid(part) ||
+					    !tensor_native_vector_valid(back) ||
+					    !tensor_native_vector_valid(left) ||
+					    !tensor_native_vector_valid(right) ||
+					    !tensor_native_vector_valid(sum_error) ||
+					    !tensor_native_vector_valid(error) ||
+					    !tensor_native_vector_valid(correction))
+						return false;
+					acc = next;
+				}
+				acc = _mm256_add_ps(acc, correction);
 				if (!tensor_native_vector_valid(acc))
 					return false;
+			} else {
+				for (unsigned int k = 0; k < t->depth; k++) {
+					__m256 a = _mm256_castsi256_ps(
+						_mm256_set1_epi32(t->a[row][k]));
+					__m256 weight = _mm256_castsi256_ps(
+						_mm256_loadu_si256((const __m256i *)&b[k][col]));
+
+					acc = _mm256_fmadd_ps(a, weight, acc);
+					if (!tensor_native_vector_valid(acc))
+						return false;
+				}
 			}
 			if (t->has_bias) {
 				__m256 offset = _mm256_castsi256_ps(

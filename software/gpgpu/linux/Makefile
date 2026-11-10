@@ -14,7 +14,11 @@ PYTHON ?= python3
 IOMMU ?= none
 GPUVM ?= on
 DEVICE_QEMU ?= $(MODULE_DIR)/../../../build/arm64-qemu/qemu-system-riscv64
-.PHONY: all clean kernel module run
+MODEL_DEVICE_QEMU ?= $(MODULE_DIR)/../../../build/arm64-qemu-o2/qemu-system-riscv64
+MODEL_DIR ?= $(MODULE_DIR)/../../../build/gpgpu-model-apps/default
+INPUT_DIR ?= $(MODULE_DIR)/../../../build/gpgpu-model-eval/material/yolo-input-complete
+RESULT_DIR ?= $(MODULE_DIR)/../../../build/gpgpu-model-results
+.PHONY: all clean kernel module run run-models
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(MODULE_DIR)" MO="$(BUILD_DIR)" modules
@@ -31,4 +35,9 @@ module:
 run:
 	$(PYTHON) "$(SCRIPTS_DIR)/gpgpu_linux.py" run --output-dir "$(BUILD_DIR)" \
 		--iommu "$(IOMMU)" --gpuvm "$(GPUVM)" --device-qemu "$(DEVICE_QEMU)"
+
+run-models:
+	$(PYTHON) "$(SCRIPTS_DIR)/gpgpu_linux.py" run --output-dir "$(BUILD_DIR)" \
+		--iommu "$(IOMMU)" --gpuvm "$(GPUVM)" --device-qemu "$(MODEL_DEVICE_QEMU)" \
+		--models-dir "$(MODEL_DIR)" --input-dir "$(INPUT_DIR)" --results-dir "$(RESULT_DIR)"
 endif

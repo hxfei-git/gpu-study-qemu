@@ -31,7 +31,7 @@
 | MTYPE | Memory Type | AMDGPU 页表项中的内存类型字段 |
 | ISA | Instruction Set Architecture | 指令集架构 |
 
-本文维护教学设备数据缓存第一版的已确认设计，当前接口为协议版本 7。数据缓存在协议版本 6 引入，相关设计差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)；当前升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)。寄存器偏移、位域与复位值见[硬件手册第 19 章](<./GPGPU_硬件手册.html#dcache-registers>)，代码位置、构建命令和实际验证结果见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。协议常量以 `software/gpgpu/include/gpgpu/` 为准。
+本文维护教学设备数据缓存第一版的已确认设计，当前接口为协议版本 8。数据缓存在协议版本 6 引入，相关设计差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)；当前升级差异见 [PROTOCOL_V8.md](<../software/gpgpu/PROTOCOL_V8.md>)。寄存器偏移、位域与复位值见[硬件手册第 19 章](<./GPGPU_硬件手册.html#dcache-registers>)，代码位置、构建命令和实际验证结果见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。协议常量以 `software/gpgpu/include/gpgpu/` 为准。
 
 **[BOUNDARY]** 这是自定义教学设备的缓存模型，不声明复现 MI300X 的缓存层级或默认内存类型。与 AMD 的对照见[第 10 节](#dcache-amd)。
 

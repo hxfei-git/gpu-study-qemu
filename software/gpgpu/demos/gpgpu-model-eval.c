@@ -28,14 +28,13 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include "gpgpu/gpgpu_eval_abi.h"
-#include "gpgpu_rt.h"
 #include "model_eval.h"
+#include "model_ops.h"
 
 /* 文件读缓冲与 RT 暂存区的字节数，不随张量大小增长。 */
 #define EVAL_STAGING_BYTES (64u * 1024u)
-/* 每个 X 方向工作组的线程数，可调整但仍受共享执行上限约束。 */
-#define EVAL_BLOCK_THREADS 64u
+/* 每个 X 方向工作组的线程数，与常驻网络执行器共用唯一定义。 */
+#define EVAL_BLOCK_THREADS GPGPU_MODEL_BLOCK_THREADS
 /* 未指定时的目标 tile 工作项数，实际值按工作组取整并限制上界。 */
 #define EVAL_DEFAULT_TILE 1024u
 /* 单次同步派发的默认等待上限，单位毫秒。 */
@@ -49,17 +48,22 @@
 /* BO 记录数组首次分配的记录数，后续按需扩容。 */
 #define EVAL_BO_INITIAL_RECORDS 8u
 /* 命令前缀中的输入地址槽数，从共享偏移推导。 */
-#define EVAL_INPUTS ((GPGPU_EVAL_IN5 - GPGPU_EVAL_IN0) / GPGPU_EVAL_SLOT_BYTES + 1)
+#define EVAL_INPUTS GPGPU_MODEL_INPUTS
 /* 命令前缀中可保存 scratch 地址的槽数。 */
-#define EVAL_SCRATCHES ((GPGPU_EVAL_AUX2 - GPGPU_EVAL_AUX0) / GPGPU_EVAL_SLOT_BYTES + 1)
+#define EVAL_SCRATCHES GPGPU_MODEL_SCRATCHES
 /* 命令前缀的小端 64 位槽数。 */
-#define EVAL_WORDS (GPGPU_EVAL_PARAM_BYTES / GPGPU_EVAL_SLOT_BYTES)
+#define EVAL_WORDS GPGPU_MODEL_WORDS
 /* 命令前缀中的维度槽数。 */
-#define EVAL_DIMS ((GPGPU_EVAL_D15 - GPGPU_EVAL_D0) / GPGPU_EVAL_SLOT_BYTES + 1)
+#define EVAL_DIMS GPGPU_MODEL_DIMS
 /* RT 接收的参数槽数：命令地址与 tile 起点。 */
-#define EVAL_RT_ARGS ((GPGPU_EVAL_RT_BASE + GPGPU_EVAL_SLOT_BYTES) / GPGPU_EVAL_SLOT_BYTES)
-/* Copy 形状与 stride 的最大秩，取自共享张量 ABI。 */
-#define EVAL_COPY_RANK_MAX GPGPU_TENSOR_MAX_RANK
+#define EVAL_RT_ARGS GPGPU_MODEL_RT_ARGS
+
+/* 各 scratch 的分配用途，与共享 ABI 的 AUX0..AUX2 顺序一致。 */
+static const char *const eval_scratch_roles[EVAL_SCRATCHES] = {
+	"scratch_stats",
+	"scratch_exp",
+	"scratch_prob",
+};
 
 /* 输出的两种存储类型。 */
 enum EvalType {
@@ -124,6 +128,7 @@ typedef struct EvalFile {
  * @rows: 由维度推导的归约行数。
  * @work_count: 复合步骤需要覆盖的工作项数。
  * @vocabulary: embedding 权重中的词表项数。
+ * @scratch_bytes: 公共布局检查推导的各 scratch 字节数，零表示不分配。
  * @launch_count: 基本算子的工作项数，不覆盖输出和 scratch 长度。
  * @backend: 实际采用的后端；不支持块执行的算子保持 SCALAR。
  */
@@ -139,6 +144,7 @@ typedef struct EvalJob {
 	uint64_t rows;
 	uint64_t work_count;
 	uint64_t vocabulary;
+	uint64_t scratch_bytes[EVAL_SCRATCHES];
 	/* 基本算子派发量，不覆盖 count/output_bytes 或 scratch 长度。 */
 	uint64_t launch_count;
 	/* 只有支持张量块的基本算子可选 BLOCK，其余保持 SCALAR。 */
@@ -310,15 +316,6 @@ typedef int EvalIoctlRequest;
 /* 只供本 binary 的链接包装使用，不改变 KMT/RT 的公开接口。 */
 static EvalRun *eval_observer;
 __typeof__(ioctl) __real_ioctl;
-
-/* 无符号乘法可表示时写入结果。 */
-static bool multiply_ok(uint64_t a, uint64_t b, uint64_t *result)
-{
-	if (a && b > UINT64_MAX / a)
-		return false;
-	*result = a * b;
-	return true;
-}
 
 /* 无符号加法可表示时写入结果。 */
 static bool add_ok(uint64_t a, uint64_t b, uint64_t *result)
@@ -712,10 +709,8 @@ static int load_job(EvalRun *run)
 		job->words[i] = le64toh(job->words[i]);
 	job->op = command_get(job->words, GPGPU_EVAL_OP);
 	job->count = command_get(job->words, GPGPU_EVAL_COUNT);
-	if (!job->count ||
-	    !multiply_ok(job->count, job->type == EVAL_F32 ? sizeof(float) : sizeof(int64_t),
-			 &job->output_bytes) || job->output_bytes > SIZE_MAX) {
-		eval_error(run, "输出长度为空或超出可表示范围");
+	if (!job->count) {
+		eval_error(run, "输出长度为空");
 		goto out;
 	}
 
@@ -732,10 +727,6 @@ static int load_job(EvalRun *run)
 	}
 	if (open_data(run, &job->reference))
 		goto out;
-	if (job->reference.bytes != job->output_bytes) {
-		eval_error(run, "reference 长度与 COUNT、dtype 不一致");
-		goto out;
-	}
 	result = 0;
 out:
 	if (fclose(stream) && !result)
@@ -743,413 +734,51 @@ out:
 	return result;
 }
 
-/* 检查一个已提供数组能覆盖本算子实际需要的元素范围。 */
-static bool input_size_ok(const EvalJob *job, unsigned int index, uint64_t elements,
-			  uint64_t element_bytes)
-{
-	uint64_t bytes;
-
-	return index < EVAL_INPUTS && job->inputs[index].stream && elements &&
-		multiply_ok(elements, element_bytes, &bytes) &&
-		job->inputs[index].bytes >= bytes && !(job->inputs[index].bytes % element_bytes);
-}
-
-/* 连续 shape 的正维度乘积必须可表示。 */
-static bool shape_product_ok(const uint64_t *shape, unsigned int rank, uint64_t *elements)
-{
-	uint64_t product = 1;
-
-	for (unsigned int i = 0; i < rank; i++)
-		if (!shape[i] || !multiply_ok(product, shape[i], &product))
-			return false;
-	*elements = product;
-	return true;
-}
-
-/* 非负元素 stride 的最大访问下标加 1；零 stride 合法。 */
-static bool storage_span_ok(const uint64_t *shape, const uint64_t *stride, unsigned int rank,
-			    uint64_t *span)
-{
-	uint64_t last = 0;
-
-	for (unsigned int i = 0; i < rank; i++) {
-		uint64_t part;
-
-		if (!shape[i] || !multiply_ok(shape[i] - 1, stride[i], &part) ||
-		    !add_ok(last, part, &last))
-			return false;
-	}
-	return add_ok(last, 1, span);
-}
-
-/* 对归约布局检查 width、inner 与完整行数。 */
-static bool rows_ok(uint64_t count, uint64_t width, uint64_t inner, uint64_t *rows)
-{
-	if (!width || !inner || count % width)
-		return false;
-	*rows = count / width;
-	return *rows && !(*rows % inner);
-}
-
 /*
- * layout_valid() - 检查会影响真实数组访问范围的算子属性
+ * layout_valid() - 用公共布局推导核对冻结文件与声明 dtype
  *
- * 1. 按 Kernel 的 IN/DIMS 契约计算正维度、逻辑长度或 stride span；
- * 2. 用真实文件长度检查访问上界，并确认输出 dtype；
- * 3. 为复合算子保存输入工作项数与归约行数，用于暂存分配。
+ * 1. 把 fstat 得到的输入长度交给公共检查，不重新实现算子几何；
+ * 2. 核对 reference 长度和 dtype，保存分配与执行所需的派生字段。
  *
- * 不登记原始 shape 副本，不改写 Host 的布局，也不计算参考结果。
+ * 数值范围仍由原始文件装载路径检查，不在这里读取 token 或数组内容。
  *
- * Return: 契约与长度均成立时为 true。
+ * Return: 公共布局及文件约定均成立时为 true。
  */
 static bool layout_valid(EvalJob *job)
 {
-	uint64_t d[EVAL_DIMS];
-	uint64_t shape[4], count = job->count;
-	uint64_t a, b, c, n, width, inner;
-	bool integer = false;
+	GpgpuModelLayout layout;
+	uint64_t input_bytes[EVAL_INPUTS];
 
-	for (unsigned int i = 0; i < EVAL_DIMS; i++)
-		d[i] = command_get(job->words, GPGPU_EVAL_DIMS + i * GPGPU_EVAL_SLOT_BYTES);
-	job->work_count = count;
-
-	/* 1. 只检查本次操作真正使用的维度和数组。 */
-	switch (job->op) {
-	case GPGPU_EVAL_LINEAR_F32:
-	case GPGPU_EVAL_LINEAR_W8:
-		if (!d[0] || !d[1] || !d[2] || !multiply_ok(d[0], d[1], &a) || a != count ||
-		    !multiply_ok(d[0], d[2], &a) || !multiply_ok(d[1], d[2], &b) ||
-		    !input_size_ok(job, 0, a, sizeof(float)) ||
-		    !input_size_ok(job, 1, b,
-				   job->op == GPGPU_EVAL_LINEAR_W8 ? 1 : sizeof(float)) ||
-		    (job->op == GPGPU_EVAL_LINEAR_W8 &&
-		     !input_size_ok(job, 2, d[1], sizeof(float))) ||
-		    (job->inputs[3].stream && !input_size_ok(job, 3, d[1], sizeof(float))))
-			return false;
-		break;
-	case GPGPU_EVAL_BMM:
-		shape[0] = d[0];
-		shape[1] = d[1];
-		shape[2] = d[2];
-		if (!shape_product_ok(shape, 3, &a) || a != count || !d[3] || d[10] > 1)
-			return false;
-		shape[2] = d[3];
-		if (d[10]) {
-			if (!storage_span_ok(shape, d + 4, 3, &a))
-				return false;
-		} else if (!shape_product_ok(shape, 3, &a)) {
-			return false;
-		}
-		shape[1] = d[3];
-		shape[2] = d[2];
-		if (d[10]) {
-			if (!storage_span_ok(shape, d + 7, 3, &b))
-				return false;
-		} else if (!shape_product_ok(shape, 3, &b)) {
-			return false;
-		}
-		if (!input_size_ok(job, 0, a, sizeof(float)) ||
-		    !input_size_ok(job, 1, b, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_EMBEDDING_W8:
-		if (!d[0] || !job->inputs[1].stream || job->inputs[1].bytes % d[0] ||
-		    !job->inputs[0].stream || job->inputs[0].bytes % sizeof(int64_t))
-			return false;
-		job->vocabulary = job->inputs[1].bytes / d[0];
-		a = job->inputs[0].bytes / sizeof(int64_t);
-		if (!job->vocabulary || !multiply_ok(a, d[0], &b) || b != count ||
-		    !input_size_ok(job, 2, job->vocabulary, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_ADD:
-	case GPGPU_EVAL_MUL:
-	case GPGPU_EVAL_SUB:
-	case GPGPU_EVAL_DIV:
-		if (!input_size_ok(job, 0, d[0], sizeof(float)) ||
-		    !input_size_ok(job, 1, d[1], sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_MUL_SCALAR:
-	case GPGPU_EVAL_ADD_SCALAR:
-	case GPGPU_EVAL_SILU:
-	case GPGPU_EVAL_SIGMOID:
-	case GPGPU_EVAL_SIN:
-	case GPGPU_EVAL_COS:
-		if (!input_size_ok(job, 0, count, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_REDUCE_MAX:
-	case GPGPU_EVAL_REDUCE_SUM:
-	case GPGPU_EVAL_REDUCE_RMS:
-	case GPGPU_EVAL_DFL_PROJECT:
-		if (!d[0] || !d[1] || count % d[1] || !multiply_ok(count, d[0], &a) ||
-		    !input_size_ok(job, 0, a, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_EXP_SHIFT:
-	case GPGPU_EVAL_DIV_ROW:
-	case GPGPU_EVAL_RMS_APPLY:
-	case GPGPU_EVAL_SOFTMAX:
-	case GPGPU_EVAL_RMSNORM:
-		if (!rows_ok(count, d[0], d[1], &job->rows) ||
-		    !input_size_ok(job, 0, count, sizeof(float)))
-			return false;
-		if ((job->op == GPGPU_EVAL_EXP_SHIFT || job->op == GPGPU_EVAL_DIV_ROW) &&
-		    !input_size_ok(job, 1, job->rows, sizeof(float)))
-			return false;
-		if ((job->op == GPGPU_EVAL_RMS_APPLY || job->op == GPGPU_EVAL_RMSNORM) &&
-		    !input_size_ok(job, 1, d[0], sizeof(float)))
-			return false;
-		if (job->op == GPGPU_EVAL_RMS_APPLY &&
-		    !input_size_ok(job, 2, job->rows, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_DFL:
-		if (!d[0] || !d[1] || count % d[1] ||
-		    !multiply_ok(count, d[0], &job->work_count) ||
-		    !input_size_ok(job, 0, job->work_count, sizeof(float)))
-			return false;
-		job->rows = count;
-		break;
-	case GPGPU_EVAL_BATCHNORM:
-		if (!d[0] || !d[1] || !multiply_ok(d[0], d[1], &a) || count % a ||
-		    !input_size_ok(job, 0, count, sizeof(float)))
-			return false;
-		for (unsigned int i = 1; i <= 4; i++)
-			if (!input_size_ok(job, i, d[0], sizeof(float)))
-				return false;
-		break;
-	case GPGPU_EVAL_CONV2D:
-		shape[0] = d[3];
-		shape[1] = d[4];
-		shape[2] = d[5];
-		if (!shape_product_ok(shape, 3, &a) || count % a || !d[14] || !d[0] ||
-		    d[0] % d[14] || d[3] % d[14] || !d[8] || !d[9] || !d[12] || !d[13])
-			return false;
-		n = count / a;
-		shape[0] = n;
-		shape[1] = d[0];
-		shape[2] = d[1];
-		shape[3] = d[2];
-		if (!shape_product_ok(shape, 4, &a) || !input_size_ok(job, 0, a, sizeof(float)))
-			return false;
-		shape[0] = d[3];
-		shape[1] = d[0] / d[14];
-		shape[2] = d[6];
-		shape[3] = d[7];
-		if (!shape_product_ok(shape, 4, &a) || !input_size_ok(job, 1, a, sizeof(float)) ||
-		    (job->inputs[2].stream && !input_size_ok(job, 2, d[3], sizeof(float))))
-			return false;
-		break;
-	case GPGPU_EVAL_MAXPOOL2D:
-		shape[0] = d[0];
-		shape[1] = d[3];
-		shape[2] = d[4];
-		if (!shape_product_ok(shape, 3, &a) || count % a || !d[5] || !d[6] ||
-		    !d[7] || !d[8] || !d[11] || !d[12])
-			return false;
-		n = count / a;
-		shape[0] = n;
-		shape[1] = d[0];
-		shape[2] = d[1];
-		shape[3] = d[2];
-		if (!shape_product_ok(shape, 4, &a) || !input_size_ok(job, 0, a, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_NEAREST2D:
-		if (!d[0] || !d[1] || !d[2] || !d[3] ||
-		    !multiply_ok(d[2], d[3], &a) || count % a)
-			return false;
-		n = count / a;
-		if (!multiply_ok(n, d[0], &a) || !multiply_ok(a, d[1], &a) ||
-		    !input_size_ok(job, 0, a, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_CONCAT:
-		width = d[1];
-		inner = d[0];
-		if (!width || !inner || !d[2] || d[2] > EVAL_INPUTS ||
-		    !multiply_ok(width, inner, &a) || count % a)
-			return false;
-		n = count / a;
-		b = 0;
-		for (unsigned int i = 0; i < d[2]; i++) {
-			if (!d[3 + i] || !add_ok(b, d[3 + i], &b) ||
-			    !multiply_ok(n, d[3 + i], &a) || !multiply_ok(a, inner, &a) ||
-			    !input_size_ok(job, i, a, sizeof(float)))
-				return false;
-		}
-		if (b != width)
-			return false;
-		break;
-	case GPGPU_EVAL_COPY:
-		if (d[0] > GPGPU_EVAL_COPY_I64 || d[1] > EVAL_COPY_RANK_MAX)
-			return false;
-		integer = d[0] == GPGPU_EVAL_COPY_I64;
-		a = count;
-		if (d[1] && (!shape_product_ok(d + 2, d[1], &b) || b != count ||
-			     !storage_span_ok(d + 2, d + 2 + d[1], d[1], &a)))
-			return false;
-		if (!input_size_ok(job, 0, a,
-				   d[0] == GPGPU_EVAL_COPY_F32 ? sizeof(float) : sizeof(int64_t)))
-			return false;
-		break;
-	case GPGPU_EVAL_ROPE:
-		if (!d[0] || !d[1] || !d[2] || (d[2] & 1) || d[7] > 1 ||
-		    !multiply_ok(d[0], d[1], &a) || !multiply_ok(a, d[2], &a) || count % a)
-			return false;
-		n = count / a;
-		shape[0] = n;
-		shape[1] = d[0];
-		shape[2] = d[1];
-		shape[3] = d[2];
-		a = count;
-		if (d[7] && !storage_span_ok(shape, d + 3, 4, &a))
-			return false;
-		if (!multiply_ok(n, d[1], &b) || !multiply_ok(b, d[2], &b) ||
-		    !input_size_ok(job, 0, a, sizeof(float)) ||
-		    !input_size_ok(job, 1, b, sizeof(float)) ||
-		    !input_size_ok(job, 2, b, sizeof(float)))
-			return false;
-		break;
-	case GPGPU_EVAL_BOX_DECODE:
-		if (!d[0] || d[1] > 1 || !multiply_ok(d[0], 4, &a) || count % a)
-			return false;
-		n = count / a;
-		if (!multiply_ok(n, 2, &b) || !multiply_ok(b, d[0], &b) ||
-		    !input_size_ok(job, 0, count, sizeof(float)) ||
-		    !input_size_ok(job, 1, b, sizeof(float)) ||
-		    (job->inputs[2].stream && !input_size_ok(job, 2, d[0], sizeof(float))))
-			return false;
-		break;
-	case GPGPU_EVAL_ARANGE:
-	case GPGPU_EVAL_FULL:
-		if (d[2] != GPGPU_EVAL_TYPE_F32 && d[2] != GPGPU_EVAL_TYPE_I64)
-			return false;
-		integer = d[2] == GPGPU_EVAL_TYPE_I64;
-		break;
-	default:
-		return false;
-	}
-
-	/* 2. dtype 只由共享模式决定，其他算子输出 FP32。 */
-	if (integer != (job->type == EVAL_I64))
+	/* 1. 未提供的可选输入为零，不能由模板中的设备地址猜测。 */
+	for (unsigned int i = 0; i < EVAL_INPUTS; i++)
+		input_bytes[i] = job->inputs[i].stream ? job->inputs[i].bytes : 0;
+	if (!gpgpu_model_layout_valid(job->words, input_bytes, &layout))
 		return false;
 
-	/* 3. scratch 的字节换算必须能交给 size_t 接口。 */
-	return multiply_ok(job->work_count, sizeof(float), &c) && c <= SIZE_MAX;
+	/* 2. 本程序的分配和流式比较接口使用 size_t 字节数。 */
+	if (layout.integer_output != (job->type == EVAL_I64) ||
+	    layout.output_bytes != job->reference.bytes || layout.output_bytes > SIZE_MAX)
+		return false;
+	for (unsigned int i = 0; i < EVAL_SCRATCHES; i++)
+		if (layout.scratch_bytes[i] > SIZE_MAX)
+			return false;
+	job->output_bytes = layout.output_bytes;
+	job->rows = layout.rows;
+	job->work_count = layout.work_count;
+	job->vocabulary = layout.vocabulary;
+	memcpy(job->scratch_bytes, layout.scratch_bytes, sizeof(job->scratch_bytes));
+	return true;
 }
 
-/* 按正块宽向上取整，避免 count+width-1 的加法溢出。 */
-static uint64_t blocks_for(uint64_t count, uint64_t width)
-{
-	return count / width + !!(count % width);
-}
-
-/*
- * select_backend() - 为基本算子选择标量元素或张量块工作项
- *
- * main() 在 layout_valid() 成功后调用，维度均已按原始文件验证。
- * 例：Linear 的 M=9、N=33 时，输出仍有 297 项，通用 tile 对应 2*2 个工作项。
- *
- * 1. 默认保留标量路径与完整输出计数，非目标算子不解释 AUX 后端标志；
- * 2. 按共享块宽计算派发量；Conv 推导 batch 后逐组分块。
- *
- * 不改原始 count/output_bytes、复合算子的 work_count 或输入存储布局。
- *
- * Return: 0 表示工作项数可表示，否则为 -1。
- */
+/* 只保存公共派发计算结果，完整布局仍由原有文件检查负责。 */
 static int select_backend(EvalRun *run)
 {
 	EvalJob *job = &run->job;
-	uint64_t d[EVAL_DIMS];
-	uint64_t m, n, blocks, batches = 1;
 
-	/* 1. 请求 block 也不会改变其他算子及复合 lowering 的原路径。 */
-	job->backend = GPGPU_EVAL_BACKEND_SCALAR;
-	job->launch_count = job->count;
-	if (run->options.backend != GPGPU_EVAL_BACKEND_BLOCK)
-		return 0;
-
-	/* 2. 只对既有基本算子启用通用指令，块宽不在回放器中另抄。 */
-	for (unsigned int i = 0; i < EVAL_DIMS; i++)
-		d[i] = command_get(job->words, GPGPU_EVAL_DIMS + i * GPGPU_EVAL_SLOT_BYTES);
-	switch (job->op) {
-	case GPGPU_EVAL_LINEAR_F32:
-	case GPGPU_EVAL_LINEAR_W8:
-		m = d[0];
-		n = d[1];
-		break;
-	case GPGPU_EVAL_BMM:
-		batches = d[0];
-		m = d[1];
-		n = d[2];
-		break;
-	case GPGPU_EVAL_CONV2D:
-		if (!multiply_ok(d[4], d[5], &m) || !multiply_ok(d[3], m, &batches))
-			return eval_error(run, "卷积每张输出元素数溢出");
-		batches = job->count / batches;
-		if (!multiply_ok(batches, d[14], &batches))
-			return eval_error(run, "卷积 batch 与 groups 的乘积溢出");
-		n = d[3] / d[14];
-		break;
-	case GPGPU_EVAL_COPY:
-	case GPGPU_EVAL_CONCAT:
-	case GPGPU_EVAL_NEAREST2D:
-		job->launch_count = blocks_for(job->count, GPGPU_TENSOR_BLOCK_ELEMENTS);
-		job->backend = GPGPU_EVAL_BACKEND_BLOCK;
-		return 0;
-	default:
-		return 0;
-	}
-	if (!multiply_ok(batches, blocks_for(m, GPGPU_TENSOR_TILE_M), &blocks) ||
-	    !multiply_ok(blocks, blocks_for(n, GPGPU_TENSOR_TILE_N), &job->launch_count))
-		return eval_error(run, "矩阵块工作项数溢出");
-	job->backend = GPGPU_EVAL_BACKEND_BLOCK;
+	if (!gpgpu_model_launch_valid(job->words, run->options.backend, &job->launch_count,
+				      &job->backend))
+		return eval_error(run, "算子工作项数或后端不合法");
 	return 0;
-}
-
-/* FP32 位不经过整数数值转换，命令槽高 32 位保持零。 */
-static void constant_set(uint64_t *words, size_t offset, float value)
-{
-	uint32_t bits;
-
-	memcpy(&bits, &value, sizeof(bits));
-	command_set(words, offset, bits);
-}
-
-/* 数学常量只在这里初始化，Host 模板和 Kernel 不保存第二份数值。 */
-static void initialize_constants(uint64_t *words)
-{
-	constant_set(words, GPGPU_EVAL_ONE, 1.0f);
-	constant_set(words, GPGPU_EVAL_LN2_HI, 0.693145751953125f);
-	constant_set(words, GPGPU_EVAL_LN2_LO, 1.428606765330187045e-6f);
-	constant_set(words, GPGPU_EVAL_LOG2E, 1.4426950408889634074f);
-	constant_set(words, GPGPU_EVAL_C2, 1.0f / 2.0f);
-	constant_set(words, GPGPU_EVAL_C3, 1.0f / 6.0f);
-	constant_set(words, GPGPU_EVAL_C4, 1.0f / 24.0f);
-	constant_set(words, GPGPU_EVAL_C5, 1.0f / 120.0f);
-	constant_set(words, GPGPU_EVAL_C6, 1.0f / 720.0f);
-	constant_set(words, GPGPU_EVAL_EXP_LO, -80.0f);
-	constant_set(words, GPGPU_EVAL_EXP_HI, 80.0f);
-	constant_set(words, GPGPU_EVAL_ZERO, 0.0f);
-	constant_set(words, GPGPU_EVAL_NEGONE, -1.0f);
-	constant_set(words, GPGPU_EVAL_NEGINF, -INFINITY);
-	constant_set(words, GPGPU_EVAL_TWO, 2.0f);
-	constant_set(words, GPGPU_EVAL_INV_TWO_PI, 0.15915494309189533577f);
-	constant_set(words, GPGPU_EVAL_TWO_PI_HI, 6.28125f);
-	constant_set(words, GPGPU_EVAL_TWO_PI_LO, 0.0019353071795864769253f);
-	constant_set(words, GPGPU_EVAL_PI, 3.14159265358979323846f);
-	constant_set(words, GPGPU_EVAL_HALF_PI, 1.57079632679489661923f);
-	constant_set(words, GPGPU_EVAL_INV_FACT7, 1.0f / 5040.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT8, 1.0f / 40320.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT9, 1.0f / 362880.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT10, 1.0f / 3628800.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT11, 1.0f / 39916800.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT12, 1.0f / 479001600.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT13, 1.0f / 6227020800.0f);
-	constant_set(words, GPGPU_EVAL_INV_FACT14, (float)(1.0 / 87178291200.0));
 }
 
 /* 小端 INT64 原始位，供 token 值域和精确比较使用。 */
@@ -1251,24 +880,11 @@ static int upload_input(EvalRun *run, unsigned int index)
 	return 0;
 }
 
-/* tile 的硬上界只来自共享执行能力，不复制设备数值。 */
+/* tile 的能力上限与组对齐由所有模型执行入口共用。 */
 static int select_tile(EvalRun *run)
 {
-	uint64_t blocks, limit, wanted;
-
-	if (!EVAL_BLOCK_THREADS || EVAL_BLOCK_THREADS > GPGPU_MAX_BLOCK_THREADS)
-		return eval_error(run, "工作组大小超过共享执行能力");
-	blocks = GPGPU_MAX_TOTAL_THREADS / EVAL_BLOCK_THREADS;
-	if (blocks > GPGPU_MAX_BLOCKS)
-		blocks = GPGPU_MAX_BLOCKS;
-	if (blocks > UINT32_MAX)
-		blocks = UINT32_MAX;
-	if (!blocks || !multiply_ok(blocks, EVAL_BLOCK_THREADS, &limit))
-		return eval_error(run, "共享执行能力不能容纳一个工作组");
-	wanted = run->options.tile < limit ? run->options.tile : limit;
-	blocks = wanted / EVAL_BLOCK_THREADS + !!(wanted % EVAL_BLOCK_THREADS);
-	if (!multiply_ok(blocks, EVAL_BLOCK_THREADS, &run->tile) || run->tile > limit)
-		return eval_error(run, "tile 工作组取整超过执行上限");
+	if (!gpgpu_model_tile_valid(run->options.tile, &run->tile))
+		return eval_error(run, "tile 工作组取整超过共享执行上限");
 	return 0;
 }
 
@@ -1287,7 +903,7 @@ static int select_tile(EvalRun *run)
 static int prepare_memory(EvalRun *run)
 {
 	EvalJob *job = &run->job;
-	uint64_t start, allocated, duration, bytes;
+	uint64_t start, allocated, duration;
 
 	/* 1. 所有 RT 参数、Ring 和 Signal 仍使用现有实现。 */
 	run->allocation_role = "notify";
@@ -1325,21 +941,12 @@ static int prepare_memory(EvalRun *run)
 	    allocate_buffer(run, "command", GPGPU_EVAL_PARAM_BYTES, &run->command))
 		return -1;
 
-	/* 3. stats 跨归约步骤复用，最多使用共享 ABI 的三个 scratch 槽。 */
-	if (job->op == GPGPU_EVAL_SOFTMAX || job->op == GPGPU_EVAL_RMSNORM ||
-	    job->op == GPGPU_EVAL_DFL) {
-		if (!multiply_ok(job->rows, sizeof(float), &bytes) ||
-		    allocate_buffer(run, "scratch_stats", bytes, &run->scratch[0]))
+	/* 3. 分配长度只采用公共布局结果，零长度槽不分配。 */
+	for (unsigned int i = 0; i < EVAL_SCRATCHES; i++)
+		if (job->scratch_bytes[i] &&
+		    allocate_buffer(run, eval_scratch_roles[i], job->scratch_bytes[i],
+				    &run->scratch[i]))
 			return -1;
-	}
-	if (job->op == GPGPU_EVAL_SOFTMAX || job->op == GPGPU_EVAL_DFL) {
-		if (!multiply_ok(job->work_count, sizeof(float), &bytes) ||
-		    allocate_buffer(run, "scratch_exp", bytes, &run->scratch[1]))
-			return -1;
-	}
-	if (job->op == GPGPU_EVAL_DFL &&
-	    allocate_buffer(run, "scratch_prob", bytes, &run->scratch[2]))
-		return -1;
 	for (unsigned int i = 0; i < EVAL_INPUTS; i++)
 		command_set(job->words, GPGPU_EVAL_IN0 + i * GPGPU_EVAL_SLOT_BYTES,
 			    run->inputs[i] ? run->inputs[i]->gpu_address : 0);
@@ -1347,12 +954,7 @@ static int prepare_memory(EvalRun *run)
 		command_set(job->words, GPGPU_EVAL_AUX0 + i * GPGPU_EVAL_SLOT_BYTES,
 			    run->scratch[i] ? run->scratch[i]->gpu_address : 0);
 	command_set(job->words, GPGPU_EVAL_OUT, run->output->gpu_address);
-	if (job->backend == GPGPU_EVAL_BACKEND_BLOCK) {
-		/* 仅块基本算子复用这两个槽，复合算子仍保存 scratch。 */
-		command_set(job->words, GPGPU_EVAL_AUX1, job->count);
-		command_set(job->words, GPGPU_EVAL_AUX2, GPGPU_EVAL_BACKEND_BLOCK);
-	}
-	initialize_constants(job->words);
+	gpgpu_model_constants(job->words);
 	if (run->stats_error)
 		return eval_error(run, "无法完整记录 BO 分配统计");
 	return 0;
@@ -1398,117 +1000,43 @@ static int prepare_queue(EvalRun *run)
 }
 
 /*
- * dispatch_step() - 执行一个 lowering 步骤的全部工作项
+ * run_operator() - 将公共执行结果交回原回放统计和资源寿命管理
  *
- * 1. 只改 OP、COUNT 和本步输入输出，原始 DIMS 与完整数组地址保持不变；
- * 2. 上传一次命令，再让 RT 参数 BASE 逐 tile 前进；
- * 3. 每个 tile 同步完成后才发布下一个，尾部 Lane 由 COUNT 排除。
+ * 1. 借用本用例的 RT、Kernel 和命令 BO，同步执行完整算子；
+ * 2. 将本次统计复制到原样本，失败时保守保留可能仍在使用的对象。
  *
- * 例：tile=128、COUNT=300，BASE 依次为 0、128、256；最后一个工作组
- * 覆盖到 319，但 300..319 不访存。不能把数组指针也加上 BASE。
+ * 不改变 JSON 字段、参考比较或回收入口。
  *
- * Return: 0 或 -1；失败前已完成的 tile 不回退。
+ * Return: 0 或 -1；计时失败同样不能报告成功。
  */
-static int dispatch_step(EvalRun *run, EvalSample *sample, uint64_t op, uint64_t count,
-			 uint64_t in0, uint64_t in1, uint64_t in2, uint64_t output)
-{
-	uint64_t words[EVAL_WORDS];
-	uint64_t args[EVAL_RT_ARGS] = { 0 };
-
-	/* 1. 未被覆盖的输入槽仍来自原始命令。 */
-	memcpy(words, run->job.words, sizeof(words));
-	command_set(words, GPGPU_EVAL_OP, op);
-	command_set(words, GPGPU_EVAL_COUNT, count);
-	command_set(words, GPGPU_EVAL_IN0, in0);
-	command_set(words, GPGPU_EVAL_IN1, in1);
-	command_set(words, GPGPU_EVAL_IN2, in2);
-	command_set(words, GPGPU_EVAL_OUT, output);
-
-	/* 2. 命令块复用，但从不覆盖未知完成的上一条命令。 */
-	if (upload_command(run, words, sample))
-		return -1;
-	args[GPGPU_EVAL_RT_COMMAND / GPGPU_EVAL_SLOT_BYTES] = run->command->gpu_address;
-	for (uint64_t base = 0; base < count;) {
-		uint64_t length = count - base > run->tile ? run->tile : count - base;
-		uint64_t blocks = length / EVAL_BLOCK_THREADS + !!(length % EVAL_BLOCK_THREADS);
-		uint64_t start = clock_ns(run);
-		GpgpuKmtStatus status;
-
-		/* 3. BASE 是全局编号，不能在每块从 0 重新开始。 */
-		args[GPGPU_EVAL_RT_BASE / GPGPU_EVAL_SLOT_BYTES] = base;
-		/* 记录派发尝试，不把补齐线程计入工作项。 */
-		sample->work_items += length;
-		sample->tile_dispatches++;
-		status = gpgpu_rt_dispatch(run->rt, &run->kernel, args, EVAL_RT_ARGS,
-					  (GpgpuRtDim3) { blocks, 1, 1 },
-					  (GpgpuRtDim3) { EVAL_BLOCK_THREADS, 1, 1 },
-					  run->options.timeout_ms);
-		sample->dispatch_ns += elapsed_ns(run, start);
-		if (kmt_result(run, status, "算子 tile 派发失败")) {
-			/* RT 的发布失败也可能留下未确认的参数访问。 */
-			run->uncertain = true;
-			return -1;
-		}
-		base += length;
-	}
-	return 0;
-}
-
-/* Softmax 的 max 与 sum 复用同一个 stats BO，不额外申请对象。 */
-static int softmax_steps(EvalRun *run, EvalSample *sample, uint64_t output)
-{
-	uint64_t input = run->inputs[0]->gpu_address;
-	uint64_t stats = run->scratch[0]->gpu_address;
-	uint64_t exponentials = run->scratch[1]->gpu_address;
-
-	if (dispatch_step(run, sample, GPGPU_EVAL_REDUCE_MAX, run->job.rows,
-			  input, 0, 0, stats) ||
-	    dispatch_step(run, sample, GPGPU_EVAL_EXP_SHIFT, run->job.work_count,
-			  input, stats, 0, exponentials) ||
-	    dispatch_step(run, sample, GPGPU_EVAL_REDUCE_SUM, run->job.rows,
-			  exponentials, 0, 0, stats) ||
-	    dispatch_step(run, sample, GPGPU_EVAL_DIV_ROW, run->job.work_count,
-			  exponentials, stats, 0, output))
-		return -1;
-	return 0;
-}
-
-/* 完整算子计时包含所有参数上传、步骤与同步派发，不含验证回读。 */
 static int run_operator(EvalRun *run, EvalSample *sample)
 {
-	uint64_t start = clock_ns(run);
-	uint64_t input[EVAL_INPUTS];
-	int result;
+	GpgpuModelExecutor executor = {
+		.rt = run->rt,
+		.kernel = &run->kernel,
+		.command = run->command,
+		.tile = run->tile,
+		.timeout_ms = run->options.timeout_ms,
+	};
+	GpgpuModelOpStats stats;
+	GpgpuKmtStatus status;
 
-	for (unsigned int i = 0; i < EVAL_INPUTS; i++)
-		input[i] = run->inputs[i] ? run->inputs[i]->gpu_address : 0;
-	switch (run->job.op) {
-	case GPGPU_EVAL_SOFTMAX:
-		result = softmax_steps(run, sample, run->output->gpu_address);
-		break;
-	case GPGPU_EVAL_RMSNORM:
-		result = dispatch_step(run, sample, GPGPU_EVAL_REDUCE_RMS, run->job.rows,
-				       input[0], 0, 0, run->scratch[0]->gpu_address);
-		if (!result)
-			result = dispatch_step(run, sample, GPGPU_EVAL_RMS_APPLY, run->job.count,
-					       input[0], input[1], run->scratch[0]->gpu_address,
-					       run->output->gpu_address);
-		break;
-	case GPGPU_EVAL_DFL:
-		result = softmax_steps(run, sample, run->scratch[2]->gpu_address);
-		if (!result)
-			result = dispatch_step(run, sample, GPGPU_EVAL_DFL_PROJECT, run->job.count,
-					       run->scratch[2]->gpu_address, 0, 0,
-					       run->output->gpu_address);
-		break;
-	default:
-		result = dispatch_step(run, sample, run->job.op, run->job.launch_count,
-				       input[0], input[1], input[2], run->output->gpu_address);
-		break;
-	}
-	sample->operator_ns = elapsed_ns(run, start);
-	sample->complete = !result;
-	return result;
+	/* 1. 公共入口只借用资源，失败时也不自行销毁。 */
+	status = gpgpu_model_execute(&executor, run->job.words, run->job.rows, run->job.work_count,
+				     run->options.backend, &stats);
+
+	/* 2. 保持已有样本字段和完整算子计时口径。 */
+	sample->operator_ns = stats.operator_ns;
+	sample->params_ns = stats.params_ns;
+	sample->params_bytes = stats.params_bytes;
+	sample->dispatch_ns = stats.dispatch_ns;
+	sample->tile_dispatches = stats.tile_dispatches;
+	sample->work_items = stats.work_items;
+	run->clock_error |= stats.clock_error;
+	sample->complete = status == GPGPU_KMT_SUCCESS;
+	if (status != GPGPU_KMT_SUCCESS)
+		run->uncertain = true;
+	return kmt_result(run, status, "算子执行失败");
 }
 
 /* 小端 FP32 原始位解码，与 CPU 本机字节序无关。 */

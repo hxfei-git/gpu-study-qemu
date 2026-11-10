@@ -23,7 +23,8 @@
  *
  * LINEAR_F32 / LINEAR_W8：
  *   IN0=X[M,K]，IN1=W[N,K]；W8 的 IN2=scales[N]；IN3=可空 bias[N]。
- *   D0=M，D1=N，D2=K。W8 每个 q 先转 FP32、乘所属行 scale，再参与乘加。
+ *   D0=M，D1=N，D2=K。W8 每个 q 先转 FP32、乘所属行 scale，再按 TILE_K
+ *   做 FP32 TwoProduct/TwoSum 补偿；指数预筛不通过的块从原 seed 逐 K FMA。
  * BMM：IN0=A[B,M,K]，IN1=B[B,K,N]；D0=B，D1=M，D2=N，D3=K。
  *   D10=1 时，D4..D6=A 的三个元素 stride，D7..D9=B 的三个元素 stride；
  *   D10=0 时按逻辑 C 紧凑布局读取。Host 不替 Kernel 完成重排。
@@ -238,7 +239,7 @@ model_store_i64:
 	sd t0, 0(t1)
 	ebreak
 
-/* 仅这些基本算子读取后端标志；标量主体的寻址与乘加顺序保持不变。 */
+/* 仅这些基本算子读取后端标志；W8 两路共用固定 K 块和补偿公式。 */
 model_linear:
 	ld t0, GPGPU_EVAL_AUX2(s11)
 	addi t1, zero, GPGPU_EVAL_BACKEND_BLOCK
@@ -280,8 +281,69 @@ model_linear_w8_setup:
 	slli t0, s3, 2
 	add s7, s7, t0
 	flw f4, 0(s7)
+	fmv.x.w a5, f4
+	srli a5, a5, 23
+	andi a5, a5, 255
+	flw f14, GPGPU_EVAL_NEGONE(s11)
 	beq s2, zero, model_linear_bias
-model_linear_w8_loop:
+/* 同一 K 边界内先检查整数指数，不用浮点试算补偿是否安全。 */
+model_linear_w8_block:
+	sub t0, s2, a0
+	addi a1, zero, GPGPU_TENSOR_TILE_K
+	bgeu t0, a1, model_linear_w8_block_full
+	add a1, s2, zero
+	jal zero, model_linear_w8_block_ready
+model_linear_w8_block_full:
+	add a1, a0, a1
+model_linear_w8_block_ready:
+	addi t1, zero, GPGPU_TENSOR_W8_SAFE_EXP_MAX
+	bltu t1, a5, model_linear_w8_strict_loop
+	fmv.x.w t0, f0
+	srli t0, t0, 23
+	andi t0, t0, 255
+	bltu t1, t0, model_linear_w8_strict_loop
+	add a2, s5, zero
+	add a3, a0, zero
+model_linear_w8_check:
+	lw t0, 0(a2)
+	srli t0, t0, 23
+	andi t0, t0, 255
+	addi t1, zero, 255
+	beq t0, t1, model_linear_w8_strict_loop
+	add t0, t0, a5
+	addi t1, zero, GPGPU_TENSOR_W8_SAFE_PRODUCT_EXP_SUM
+	bltu t1, t0, model_linear_w8_strict_loop
+	addi a2, a2, 4
+	addi a3, a3, 1
+	bltu a3, a1, model_linear_w8_check
+	flw f5, GPGPU_EVAL_ZERO(s11)
+/* f5=低位；TwoProduct 恢复乘法低位，TwoSum 恢复 sum+product 的低位。 */
+model_linear_w8_compensated_loop:
+	lb t0, 0(s6)
+	fcvt.s.w f2, t0
+	fmul.s f2, f2, f4
+	flw f1, 0(s5)
+	fmul.s f3, f1, f2
+	fmul.s f11, f3, f14
+	fmadd.s f10, f1, f2, f11
+	fadd.s f6, f0, f3
+	fsub.s f7, f6, f0
+	fsub.s f8, f6, f7
+	fsub.s f8, f0, f8
+	fsub.s f9, f3, f7
+	fadd.s f8, f8, f9
+	fadd.s f8, f8, f10
+	fadd.s f5, f5, f8
+	fmv.x.w t0, f6
+	fmv.w.x f0, t0
+	addi s5, s5, 4
+	addi s6, s6, 1
+	addi a0, a0, 1
+	bltu a0, a1, model_linear_w8_compensated_loop
+	fadd.s f0, f0, f5
+	jal zero, model_linear_w8_block_next
+/* 极值、NaN、Inf 从原 seed 直接逐 K FMA；不产生补偿试算的额外异常。 */
+model_linear_w8_strict_loop:
 	lb t0, 0(s6)
 	fcvt.s.w f2, t0
 	fmul.s f2, f2, f4
@@ -290,7 +352,9 @@ model_linear_w8_loop:
 	addi s5, s5, 4
 	addi s6, s6, 1
 	addi a0, a0, 1
-	bltu a0, s2, model_linear_w8_loop
+	bltu a0, a1, model_linear_w8_strict_loop
+model_linear_w8_block_next:
+	bltu a0, s2, model_linear_w8_block
 model_linear_bias:
 	beq s9, zero, model_linear_finish
 	slli t0, s3, 2
@@ -474,7 +538,7 @@ model_reduce:
 	beq s4, t0, model_reduce_max_setup
 	flw f0, GPGPU_EVAL_ZERO(s11)
 	addi t0, zero, GPGPU_EVAL_REDUCE_RMS
-	beq s4, t0, model_reduce_rms_loop
+	beq s4, t0, model_reduce_rms_setup
 	addi t0, zero, GPGPU_EVAL_DFL_PROJECT
 	beq s4, t0, model_reduce_dfl_loop
 model_reduce_sum_loop:
@@ -493,10 +557,28 @@ model_reduce_max_loop:
 	addi a0, a0, 1
 	bltu a0, s1, model_reduce_max_loop
 	jal zero, model_store_f32
+/* 平方仍独立舍入；f2 保存 Kahan 低位，避免大平方掩盖后续小项。 */
+model_reduce_rms_setup:
+	flw f2, GPGPU_EVAL_ZERO(s11)
 model_reduce_rms_loop:
 	flw f1, 0(s3)
 	fmul.s f1, f1, f1
-	fadd.s f0, f0, f1
+	fsub.s f1, f1, f2
+	fadd.s f3, f0, f1
+	fmv.x.w t0, f3
+	srli t1, t0, 23
+	andi t1, t1, 255
+	addi t2, zero, 255
+	beq t1, t2, model_reduce_rms_nonfinite
+	fsub.s f2, f3, f0
+	fsub.s f2, f2, f1
+	fmv.w.x f0, t0
+	jal zero, model_reduce_rms_next
+/* Inf/NaN 不参与误差恢复，避免 Inf-Inf 把原本的无穷平方和变成 NaN。 */
+model_reduce_rms_nonfinite:
+	fmv.w.x f0, t0
+	flw f2, GPGPU_EVAL_ZERO(s11)
+model_reduce_rms_next:
 	add s3, s3, s2
 	addi a0, a0, 1
 	bltu a0, s1, model_reduce_rms_loop

@@ -985,7 +985,7 @@ def add_export_subcommands(subparsers):
 
 def eval_abi():
     """按依赖顺序读取共用头的数值及别名，不执行 C 表达式。"""
-    include = ROOT / "software/gpgpu/include/gpgpu"
+    include = Path(__file__).resolve().parents[1] / "include/gpgpu"
     values = {}
     for header in ("gpgpu_tensor_abi.h", "gpgpu_eval_abi.h"):
         for name, value in re.findall(r"^#define[ \t]+(GPGPU_(?:TENSOR|EVAL)_\w+)[ \t]+(\S+)[ \t]*$",
@@ -1228,7 +1228,7 @@ def source_snapshot(output):
     records = {}
     for directory in (ROOT / "hw/gpgpu", ROOT / "software/gpgpu"):
         for path in directory.rglob("*"):
-            if path.is_file() and (path.suffix in (".c", ".h", ".S", ".inc", ".py", ".ld")
+            if path.is_file() and (path.suffix in (".c", ".h", ".S", ".inc", ".py", ".sh", ".ld")
                                    or path.name == "Makefile"):
                 relative = path.relative_to(ROOT)
                 target = output / "source" / relative

@@ -55,7 +55,7 @@
 | WB     | Write-Back | 写回；本实验指页属性允许进入数据缓存的访问类型 |
 | MTYPE  | Memory Type | AMDGPU 页表项中的内存类型字段 |
 
-本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 7，升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。
+本文保留 GPUVM 第一版的固定存储设计，沿用统一访存方案，当前为协议版本 8，升级差异见 [PROTOCOL_V8.md](<../software/gpgpu/PROTOCOL_V8.md>)。应用统一使用 DRM/GEM、AQL Queue、Doorbell、RV64 CP 和 Signal/IH；RV64 Kernel 的访存模式只由设备属性 `gpuvm=on/off` 决定，默认开启。实现入口和实际运行记录见[软件栈说明第 5 节](<../software/gpgpu/README.md#build-and-validation>)。
 
 **[DESIGN]** 开启 GPUVM 时按页表翻译，对象的 GPUVA 就是它在应用进程中的 CPU 地址；关闭时直接解释 GPU 物理地址。两者最终使用同一个 VRAM／Outbound 物理入口。开启时，数据读写在翻译和权限检查之后按叶子项的缓存属性决定是否经过设备的数据缓存；关闭时没有页表给出属性，数据访问都不进入缓存。缓存行为见 [dcache 第一版规格](<./dcache 第一版规格.md#dcache-paths>)。线程启动信息改为只读 CSR，`a0` 保存真实参数地址。旧控制页、参数窗口、SYSTEM 直接指向 Host DMA 的页表编码和三模式接口均已移除。
 

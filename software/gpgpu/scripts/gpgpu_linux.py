@@ -457,13 +457,29 @@ def stack_test(output, device_qemu):
     })
 
 
-def run_interactive(output, device_qemu, iommu, gpuvm):
-    """启动远端设备与开发客体，串口直接交给当前终端。"""
-    remote = RemoteDevice(device_qemu, output / "interactive", gpuvm=gpuvm)
+def run_interactive(output, device_qemu, iommu, gpuvm, models=None,
+                    inputs=None, results=None):
+    """串口交给当前终端；模型模式只共享材料，不代做客体请求。"""
+    extra = []
+    if models:
+        if (device_qemu.parent / "build.ninja").is_file():
+            subprocess.run(["ninja", "-C", str(device_qemu.parent), "-j4",
+                            "qemu-system-riscv64"], check=True)
+        subprocess.run(["make", "-C", str(STACK),
+                        f"BUILD_DIR={output / 'stack'}", "kernels"], check=True)
+        extra = ["-global", "gpgpu.shared_fetch=on",
+                 "-global", "gpgpu.tensor_native=on"]
+    remote = RemoteDevice(device_qemu, output / "interactive", gpuvm=gpuvm,
+                          extra_args=extra)
     try:
         remote.start()
         command = [remote.device_option() if arg == "@GPGPU_DEVICE@" else arg
                    for arg in developer_command(output, iommu, remote=True)]
+        if models:
+            command += shared_directory(models, "gpgpu_models", True)
+            command += shared_directory(inputs, "gpgpu_input", True)
+            command += shared_directory(results, "gpgpu_output", False)
+            print("客体就绪后运行：sh /mnt/gpgpu-src/model-shell.sh", flush=True)
         subprocess.run(command, check=True)
     finally:
         remote.close()
@@ -485,6 +501,12 @@ def main():
                         help="交互运行的系统 IOMMU 配置；核心计算固定 none")
     parser.add_argument("--gpuvm", choices=("on", "off"), default="on",
                         help="交互运行的设备属性；核心计算自动运行两种状态")
+    parser.add_argument("--models-dir", type=Path,
+                        help="交互模型模式：只读模型资产目录")
+    parser.add_argument("--input-dir", type=Path,
+                        help="模型模式只读输入目录")
+    parser.add_argument("--results-dir", type=Path,
+                        help="模型模式结果目录，读写共享")
     args = parser.parse_args()
     if args.command == "configure":
         configure_qemu((args.qemu_dir or QEMU_DIRECTORY).resolve())
@@ -493,6 +515,17 @@ def main():
         parser.error("--qemu-dir 只用于 configure 子命令")
     if args.command == "stack-test" and (args.iommu != "none" or args.gpuvm != "on"):
         parser.error("stack-test 固定运行 IOMMU=none、GPUVM=on/off")
+    if any((args.models_dir, args.input_dir, args.results_dir)):
+        if args.command != "run" or not all((args.models_dir, args.input_dir, args.results_dir)):
+            parser.error("模型共享参数仅用于 run，三个目录必须同时提供")
+        args.models_dir = args.models_dir.resolve()
+        args.input_dir = args.input_dir.resolve()
+        args.results_dir = args.results_dir.resolve()
+        if not args.models_dir.is_dir() or not args.input_dir.is_dir():
+            parser.error("模型或输入目录不存在")
+        if not args.results_dir.is_relative_to(ROOT / "build"):
+            parser.error("模型共享结果目录必须位于本仓库 build 下")
+        args.results_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir.resolve()
     device_qemu = args.device_qemu.resolve()
     def interrupted(signum, frame):
@@ -513,7 +546,8 @@ def main():
             stack_test(output, device_qemu)
         elif args.command == "run":
             prepare_firmware(output)
-            run_interactive(output, device_qemu, args.iommu, args.gpuvm == "on")
+            run_interactive(output, device_qemu, args.iommu, args.gpuvm == "on",
+                            args.models_dir, args.input_dir, args.results_dir)
 
 
 if __name__ == "__main__":

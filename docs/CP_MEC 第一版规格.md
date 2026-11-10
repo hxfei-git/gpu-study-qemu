@@ -59,11 +59,11 @@
 
 本文集中保存本实验已经确认的架构、行为与接口约束。寄存器名称参考 AMD，实验语义以本文的 `[DESIGN]` 为准，不声明兼容 AMD 的完整硬件协议。
 
-**[DESIGN]** 当前接口为协议版本 7。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其旧固件布局、VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
+**[DESIGN]** 当前接口为协议版本 8。第 1～8 节说明现行队列与执行约定；[第 9 节](#spec-open-interfaces)保留原确认时点的方案，其旧固件布局、VMID 0、Host 物理地址、旧参数窗口和同步回归只描述当时版本，不再作为执行要求。
 
-设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。当前升级差异见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)，更早的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)、[PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>) 与 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
+设备、固件、驱动、用户库和 Kernel 描述对象的版本号均从 `software/gpgpu/include/gpgpu/gpgpu_version.h` 的 `GPGPU_PROTOCOL_VERSION` 派生，组件必须一起更新。当前升级差异见 [PROTOCOL_V8.md](<../software/gpgpu/PROTOCOL_V8.md>)，显存与固件布局见 [PROTOCOL_V7.md](<../software/gpgpu/PROTOCOL_V7.md>)，更早的差异见 [PROTOCOL_V6.md](<../software/gpgpu/PROTOCOL_V6.md>)、[PROTOCOL_V5.md](<../software/gpgpu/PROTOCOL_V5.md>) 与 [PROTOCOL_V4.md](<../software/gpgpu/PROTOCOL_V4.md>)；协议常量以共享头文件为准。
 
-> **[SOURCE]** 当前工作树（协议版本 7）：[gpgpu_version.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>) [第 17～22 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>)定义统一协议版本，Kernel ABI 版本也引用该定义。
+> **[SOURCE]** 当前工作树（协议版本 8）：[gpgpu_version.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>) [第 17～22 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_version.h:17:1>)定义统一协议版本，Kernel ABI 版本也引用该定义。
 
 <a id="spec-overview"></a>
 
@@ -719,7 +719,7 @@ QEMU 提供显存存储和设备访问接口；应用、运行时和 CP 使用�
 
 固件保留区不进入普通显存分配池。这块保留区属于设备，应用退出、队列销毁或 CP 暂时复位都不释放它。更新固件前先停止 CP，并确认相关设备访问已经结束；CP 单独复位的影响见第 3.3 节。
 
-> **[SOURCE] 固定布局与使用方**，当前工作树（协议版本 7）：
+> **[SOURCE] 固定布局与使用方**，当前工作树（协议版本 8）：
 >
 > - 唯一布局定义：[gpgpu_cp_map.h](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_cp_map.h:18:1>) [第 18～31 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/include/gpgpu/gpgpu_cp_map.h:18:1>)；设备拒绝其他容量，见 [gpgpu.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:163:1>) [第 163～169 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/hw/gpgpu/gpgpu.c:163:1>)。
 > - 链接与预处理：[link.ld](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:8:1>) [第 8～26 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/link.ld:8:1>)引用共享宏并限制代码、数据上界；[firmware/Makefile](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/Makefile:23:1>) [第 23～26 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/firmware/Makefile:23:1>)先生成预处理后的链接脚本。

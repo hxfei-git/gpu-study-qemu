@@ -8,8 +8,13 @@
  *   rs2：线性块号       rs3：K 起点（矩阵）       └─计算/重排─▶ GPU 输出
  *
  * 所有字段为小端 u64，地址与派发参数同域；参数地址按 8 字节对齐。
- * 前缀不含模型名称，也不使用评估程序的操作编号。数学指令固定 RNE，
- * 每个输出按 K 递增逐次 FP32 FMA，W8 先逐项 FP32 乘 scale；末块加 bias。
+ * 前缀不含模型名称，也不使用评估程序的操作编号。数学指令固定 RNE。
+ * FP32 Linear/BMM/Conv 按 K 递增逐次 FP32 FMA。W8 先逐项 FP32 乘 scale，
+ * 在每条指令的 K 块内用 FP32 TwoProduct/TwoSum 补偿乘积与加法低位，
+ * 块末将 sum+correction 舍入为一个 FP32；各块不另存低位，末块独立加 bias。
+ * W8 的逐位结果依赖 K 块边界；重新切块不保证逐位一致。
+ * W8 的整数指数预筛不通过时，该输出从原 seed 按 K 逐次 FMA，不试算补偿，
+ * 因而 NaN/Inf 和有限极值沿用原数值及异常路径。筛选界限见下方共享宏。
  * 所有输入先读完再算，输出逐行发布；后行故障不回退先前的写入。
  *
  * 指令采用 custom-0 的 R4 编码：rd 必须为 0，funct3 选择类别，
@@ -64,6 +69,19 @@
 #define GPGPU_TENSOR_TILE_N 32
 /* 每条矩阵指令最多处理的归约元素数。 */
 #define GPGPU_TENSOR_TILE_K 32
+/*
+ * W8 补偿只接收 seed、scale 的 FP32 编码指数不超过 246 的块。
+ * 编码指数 E 的有限数满足 |x|<2^(E-126)，故二者均小于 2^120；
+ * |q|<=128 保证反量化权重不超过 2^127，不会在独立乘法中溢出。
+ */
+#define GPGPU_TENSOR_W8_SAFE_EXP_MAX 246
+/*
+ * W8 补偿要求每个 A 的指数不是 255，且 E_A+E_scale<=364。
+ * 舍入后的 |A*W| 不超过 2^119，最多 TILE_K=32 项连同 seed 的和小于
+ * 2^125；TwoSum 的差分与低位累加也保持有限。更大值预先走严格 FMA，
+ * 不能先执行可能溢出的 TwoProduct/TwoSum 再丢弃其异常。
+ */
+#define GPGPU_TENSOR_W8_SAFE_PRODUCT_EXP_SUM 364
 /* 每条布局指令最多处理的逻辑元素数。 */
 #define GPGPU_TENSOR_BLOCK_ELEMENTS 32
 /* 布局输入允许的最大秩。 */

@@ -7,9 +7,11 @@
 | GPU | Graphics Processing Unit | 图形处理器 |
 | CUDA | Compute Unified Device Architecture | 统一计算设备架构 |
 | ARM64 | Arm 64-bit Architecture | Arm 64 位架构 |
+| WSL | Windows Subsystem for Linux | Windows 的 Linux 子系统 |
 | RISC-V / RV32 | Reduced Instruction Set Computer V / 32-bit RISC-V | 精简指令集／协议版本 5 之前计算执行器使用的 32 位模型 |
 | RV64 | 64-bit RISC-V | 本实验原生 CP 与计算执行器使用的 64 位 RISC-V 模型 |
 | API / ABI | Application Programming Interface / Application Binary Interface | 应用编程／二进制接口 |
+| CLI | Command-Line Interface | 命令行接口 |
 | PCI / BAR | Peripheral Component Interconnect / Base Address Register | 外设互连／基址寄存器 |
 | DMA | Direct Memory Access | 直接内存访问 |
 | IOMMU | Input/Output Memory Management Unit | 输入输出内存管理单元 |
@@ -24,7 +26,12 @@
 | BF16 | Brain Floating Point 16-bit | 16 位浮点格式 |
 | INT8 / W8 | 8-bit Integer / 8-bit Weight Storage | 8 位有符号整数／8 位权重存储 |
 | RMSNorm | Root Mean Square Normalization | 均方根归一化 |
+| Conv | Convolution | 卷积 |
+| BN | Batch Normalization | 批量归一化 |
+| SiLU | Sigmoid Linear Unit | Sigmoid 线性激活函数 |
+| RoPE | Rotary Position Embedding | 旋转位置编码 |
 | KV | Key / Value | 注意力的键和值 |
+| EOS | End of Sequence | 序列结束标记 |
 | DFL | Distribution Focal Loss | 分布焦点损失；本文指检测头的分布投影 |
 | RSS / PSS | Resident Set Size / Proportional Set Size | 常驻内存量／按比例分摊共享映射的常驻内存量 |
 | SIMD | Single Instruction, Multiple Data | 单指令多数据 |
@@ -32,6 +39,15 @@
 | FLOP / GFLOP/s | Floating-Point Operation / Giga Floating-Point Operations per Second | 浮点运算次数／每秒十亿次浮点运算 |
 | INT64 | 64-bit Integer | 64 位整数 |
 | NMS | Non-Maximum Suppression | 非极大值抑制 |
+| IoU | Intersection over Union | 交并比 |
+| RGB | Red, Green, Blue | 红、绿、蓝颜色通道 |
+| NCHW | Number, Channels, Height, Width | 批次数、通道、高度、宽度的张量布局 |
+| JPEG | Joint Photographic Experts Group | 联合图像专家组；本文指其图像格式 |
+| BPE | Byte Pair Encoding | 字节对编码 |
+| YOLO | You Only Look Once | 单阶段目标检测模型系列 |
+| COCO | Common Objects in Context | 常见物体场景数据集 |
+| mAP | Mean Average Precision | 平均精度均值 |
+| BMM | Batched Matrix Multiplication | 批次矩阵乘法 |
 | ReLU | Rectified Linear Unit | 线性整流函数 |
 | CP / MEC | Command Processor / Micro Engine Compute | 命令处理器／计算命令处理微引擎 |
 | ACK | Acknowledgment | 确认；本版用于确认已经读取执行结果 |
@@ -78,7 +94,10 @@
 
 ```text
 demos/gpgpu-demo.c          小型计算示例
-或 gpgpu-model-eval.c       真实算子输入、派发与完整结果比较
+或 gpgpu-model-eval.c       真实算子回放 → model_ops.c
+或客体模型应用              gpgpu_model_apps.py → libgpgpu-model.so
+                           model_runtime.c → model_ops.c
+或 gpgpu-model-run.c        离线验证 CLI → 同一个 model_runtime.c
   │ gpgpu_rt_*()
 lib/rt/                     装载 Kernel、组 AQL 包、准备 Signal、等待完成
   │ gpgpuKmt*()
@@ -105,7 +124,7 @@ CP 固件 `firmware/` 中，`main.c` 是启动检查与调度循环，`ring.c` �
 
 Linux 驱动 `linux/` 按对象分文件：`gpgpu_main.c`（PCI）、`gpgpu_dev.c`（设备生命周期与固件）、`gpgpu_mgmt.c`、`gpgpu_ih.c`、`gpgpu_drm.c`（ioctl 与会话）、`gpgpu_bo.c`、`gpgpu_vram.c`、`gpgpu_vm.c`、`gpgpu_queue.c`、`gpgpu_event.c`。对象关系、寿命与锁的顺序写在 `gpgpu_drv.h` 文件头。
 
-协议当前为版本 7，组件升级见 [PROTOCOL_V7.md](./PROTOCOL_V7.md)；缓存接口的变化见 [PROTOCOL_V6.md](./PROTOCOL_V6.md)，更早的差异见同目录的历史版本。
+协议当前为版本 8，组件升级见 [PROTOCOL_V8.md](./PROTOCOL_V8.md)；显存与固件布局的变化见 [PROTOCOL_V7.md](./PROTOCOL_V7.md)，缓存接口见 [PROTOCOL_V6.md](./PROTOCOL_V6.md)。
 
 ## 1. 应用提交与统一访存
 
@@ -237,7 +256,53 @@ YOLO 进程：装载与建队列 → ready ─┴→ 主机发布 start
 
 准备与回收不插入另一进程的长任务中；共同运行期间仍沿 CP 的整 Dispatch 串行调度。每个正式算子的 `operator_ns` 和共同回放区间的宿主墙钟分别保存。后者包含预热、回读验证及屏障观察，不是纯计算时间；先完成的进程等待共同收尾，有限样本的后段可能已解除竞争，不能作为持续饱和负载的稳态吞吐。
 
-**[BOUNDARY]** 当前是独立算子回放。Qwen 的输入和已有 KV 来自原权重 FP32 网络，W8 算子另与同一份 INT8/scale 的 FP32 参考比较；设备误差与量化误差分开记录，不代表完整量化模型的生成质量。数学近似针对材料中的有限输入范围，不是完整 libm；实际覆盖、运行命令、性能估算与日志均见下一节。
+**[BOUNDARY]** 上述回放入口只执行独立算子。Qwen 的输入和已有 KV 来自原权重 FP32 网络，W8 算子另与同一份 INT8/scale 的 FP32 参考比较；设备误差与量化误差分开记录，不代表完整量化模型的生成质量。数学近似针对材料中的有限输入范围，不是完整 libm；实际覆盖、运行命令、性能估算与日志均见下一节。
+
+<a id="full-model-runtime"></a>
+
+### 4.1 完整模型的常驻数据与请求执行
+
+用户在 ARM64 Linux 客体中运行 `gpgpu-qwen-chat` 或 `gpgpu-yolo`，由客体 CPU 接收问题、读取 JPEG，并处理设备返回的结果。WSL 只在运行前导出固定模型材料、构建和启动 QEMU；每次请求不经过 WSL 分词或图像处理。应用包不含 CPU 参考激活、KV 或最终输出，独立参考不挂载给客体。
+
+```text
+WSL：离线导出固定权重、配置与官方 tokenizer；启动 QEMU
+                    │ 只读共享固定材料和原始 JPEG
+                    ▼
+ARM64 客体 Linux：gpgpu_model_apps.py
+  ├─ gpgpu-qwen-chat：终端输入 → 官方模板与分词 → 按实际历史构图
+  └─ gpgpu-yolo：读取 JPEG → LetterBox、RGB/NCHW、归一化
+                    ↓ ctypes 同步调用，不启动 WSL 请求服务
+  libgpgpu-model.so：model_runtime.c → model_ops.c
+                    ↓
+  RT/KMT → DRM 驱动 → AQL/CP → RV64 Kernel／张量块指令
+                    ├─ Qwen：全部层、RoPE、设备写 KV → logits
+                    │        客体 argmax → 实际 token → 下一次设备 decode
+                    └─ YOLO：完整网络、DFL 与检测头 → pre-NMS
+                    ↓
+客体 CPU：中文解码与历史维护，或 NMS、坐标还原、绘框和结果保存
+                    ↓ 读写共享结果目录
+WSL：可查看客体生成的文本、检测 JSON 与 annotated.jpg
+```
+
+`scripts/gpgpu_model_apps.py export` 只导出固定材料，不把用户文本或图片编进模型包。聊天程序在会话开始时打开一次 C 后端，上传权重并保留 RT、Kernel 与各类 BO。之后客体按实际问题生成新图，后端先校验权重合同，再在 idle 状态按需扩大非权重 BO；换图不重新读取或上传权重。同步请求失败后停止使用本会话；设备访问未确认结束时保留资源，只能继续收尾。
+
+`model_graph.py` 记录张量的 BO 类别、字节偏移、shape 和元素 stride。具名权重只装一份，激活在最后一个消费者完成后复用；有别名或残差依赖的存储继续保留。非连续输入只有在算子支持对应 stride 时直接使用，否则由设备 Copy 重排。`model_ops.c` 同时供原算子回放器和完整模型使用，基本算子选择现有块后端，Softmax、RMSNorm 等拆成软件 Kernel 的归约与逐元素步骤。这里没有 CPU 网络 fallback，也没有增加 Dispatch 级取指或译码缓存。
+
+Qwen 使用逐输出行 INT8 权重和 FP32 计算，embedding 与 lm_head 共用同一量化矩阵。每层 K/V 分别保存 `[capacity,2,64]` 的 FP32 token-major 数据；新 K 在 RoPE 后写入，V 不旋转。两个 KV head 各供七个 Q head 使用，BMM 以零 batch stride 共享对应历史前缀，不扩成十四份 KV。
+
+设 prompt 有 `L` 个 token。设备完成分块 prefill 后，KV 保存 `L` 个已执行输入位置，最后位置的 logits 产生第一个新 token。只有把这个 token 再送入 decode，KV 才增长到 `L+1` 并产生下一个 token。因 EOS 或预算停止时，最后选出的 token 尚未作为输入执行，不能把它计入 KV 长度。每个新请求从本次 prompt 重建可读前缀，未使用的容量不参与 attention。
+
+聊天程序读取固定的官方 tokenizer 资产与原聊天模板，采用从官方纯 Python 实现提取的 byte-level BPE，支持中文编码和解码；客体不安装 Torch、Transformers 或 CPU 模型。一次回答按有界前向窗口构图，序列化后释放 Python 节点对象；窗口间保留相同容量、布局与绝对位置的设备 KV，避免按整个生成预算常驻重复的网络元数据。客体把实际已生成的 token 填入下个窗口的 INPUT，设备接着消费尚未执行的末 token。每个新的对话轮把此前真实的 user／assistant 文本与新问题重新编码，设备完整重算这段前缀；首版不跨对话轮复用 KV 内容。`/clear` 只清除 CPU 对话历史，下一问从新前缀开始，权重仍常驻；`/exit` 关闭会话并回收。超出容量明确拒绝，不自动截断。回答在本轮生成结束后显示，尚未实现流式输出。
+
+YOLO 保持原版 YOLO11n 的 FP32、未融合 Conv/BN 路径，完整展开多分支、C2PSA/Attention 和三尺度检测头。DFL、框解码、stride 缩放及类别 sigmoid 在设备完成；CPU 只做图像预处理、NMS、坐标还原和结果保存。生成与检测命令、实际结果和边界统一见[完整模型运行记录](#model-e2e-results)。
+
+> **[SOURCE] 可选源码索引**：当前工作区，基线 `8a435ac`；实际运行的源码散列随第 5 节结果保存。
+>
+> - 设备逐轮执行、实际 token 检查与写回：[model_runtime.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/demos/model_runtime.c:1166:1>)，[第 1166～1290 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/demos/model_runtime.c:1166:1>)。
+> - 常驻资源与换图调用：[model_runtime.c](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/demos/model_runtime.c:1613:1>)，[第 1613～1730 行](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/demos/model_runtime.c:1613:1>)。
+> - 客体输入、窗口推进与后处理：[gpgpu_model_apps.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_model_apps.py:255:1>)，[第 255 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/gpgpu_model_apps.py:255:1>)。
+> - 激活最后消费者规划：[model_graph.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_graph.py:440:1>)，[第 440 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_graph.py:440:1>)。
+> - 完整模型编排：[model_qwen.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_qwen.py:213:1>) 的[第 213 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_qwen.py:213:1>)；[model_yolo.py](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_yolo.py:209:1>) 的[第 209 行起](<vscode://vscode-remote/wsl+Ubuntu/home/book/1.project/gpu_study/4.experiments/gpu-study-qemu/software/gpgpu/scripts/model_yolo.py:209:1>)。
 
 <a id="build-and-validation"></a>
 
@@ -291,6 +356,81 @@ CP QTest 和 Linux 全栈都以双进程运行设备。设备实例 `gpu0` 位�
 
 Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt`，包含 DRM/GEM 与 `GPU_BUDDY`；缺少该环境时按[第 5.1 节](#offline-materials)准备。核心计算固定使用 ARM virt、A57、1 GiB RAM、IOMMU=none 与双进程设备。每次运行都会覆盖以下输出：QTest 写入 `build/gpgpu-qtest.log`；全栈两种状态分别写入 `build/gpgpu-kernel-gpuvm/core/on/` 和 `core/off/`，其中 `compute.log` 保存逐元素比较结果，`console.log` 保存客体日志，`result.json` 保存实际结果与组件散列，两种状态都通过后另写 `core/summary.json`。
 
+<a id="model-e2e-results"></a>
+
+**客体模型应用（协议 8）。** 应用在 QEMU Linux 内接收文本或 JPEG、调用设备并保存结果，分层见[第 4.1 节](#full-model-runtime)。模型包复用下方[冻结材料](#model-eval-results)，不重复下载权重；更换问题或图片不需要重新导出包。
+
+客体需要 Python、NumPy、OpenCV、Pillow、regex 和 Jinja2，不需要 Torch、Transformers 或 Ultralytics。当前开发盘已用原 APK 签名验证安装这些依赖，并实际导入；版本和安装日志见[客体依赖记录](../../build/gpgpu-guest-apps/installation-v2/result.json)，离线包清单见[依赖缓存](../../build/gpgpu-guest-apps/dependencies-v2/manifest.json)。构建需要支持共同目标规则的 GNU make 4.3 或更新版本。这里只确认现有开发盘，不据此宣称从零引导已通过。
+
+已有普通交互客体时，先在该客体退出应用并关机，再从 WSL 启动模型模式；不要把协议 7 的已加载驱动继续配给新设备。当前默认固定包为 `build/gpgpu-model-apps/default/`：
+
+```sh
+# WSL：使用 O2 远端设备，开启 shared_fetch、tensor_native 和 GPUVM。
+# 只读共享模型和原始图片；结果目录读写共享。
+make -C software/gpgpu/linux run-models
+```
+
+进入 QEMU Linux 后运行：
+
+```sh
+sh /mnt/gpgpu-src/model-shell.sh
+
+# 以下输出目录必须尚不存在；也可省略 --output，使用自动生成的新目录。
+gpgpu-qwen-chat --max-new-tokens 16 --output /mnt/gpgpu-output/chat-manual-new
+# 在“你：”后输入问题；/clear 清历史，/exit 退出模型会话。
+
+gpgpu-yolo --image /mnt/gpgpu-input/bus.jpg --output /mnt/gpgpu-output/yolo-manual-new
+```
+
+聊天的 `session.json`、各轮 `generated.txt`／`generated.json` 和有界窗口的程序、结果与 `model.log` 均由客体写入。YOLO 生成 `result.json`、`postprocess/detections.json` 和 `postprocess/annotated.jpg`；WSL 可在 `build/gpgpu-model-results/` 的对应目录查看，WSL 不执行本次请求的图像处理。检测先绑定原 JPEG 的内容指纹，推理期间原路径若被替换，后处理会拒绝，不把旧图的框画到新图上。
+
+需要重新导出固定包时，使用新的目录，并把同一目录传给启动入口；导出不执行 CPU 网络前向，也不绑定用户输入：
+
+```sh
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_apps.py export \
+  --output build/gpgpu-model-apps/user-new
+make -C software/gpgpu/linux run-models MODEL_DIR="$PWD/build/gpgpu-model-apps/user-new"
+```
+
+`MODEL_DIR`、`INPUT_DIR`、`RESULT_DIR` 分别决定只读模型、只读原图与读写结果目录；`MODEL_DEVICE_QEMU` 指定远端设备。启动脚本重建所选设备、检查驱动并同步固件；模型 shell 在客体编译共享库和入口，然后装载驱动。应用退出时确认 RT/KMT 收尾；打开失败或访问未确认结束时，不记录为正常回收。
+
+**W8 数值定位。** 原 2048 容量失败记录与 `atol=rtol=2e-4` 保持不变。同输入逐位重放已复现旧设备的 11 个超差值，误差在第 21 层 MLP 的大值残差抵消中放大：RMSNorm 原串行平方和为 `2,976,165.0`，补偿结果为 `2,976,168.75`；一个 down 通道的旧逐项 FMA 为 `-1630.0787353515625`，固定块 FP32 补偿为 `-1630.07666015625`，CPU128 为 `-1630.0767822265625`。这些差异经残差抵消传播，不能只凭“FP32 误差”关闭失败项。
+
+协议 8 的 W8 块规则见[硬件手册](<../../docs/GPGPU_硬件手册.html#tensor-block>)；软件 RMSNorm 的平方和使用 Kahan 累加，并保留非有限值处理。WSL 上的真实源码重放已把原 hidden23 首位置的超差从 11 个降为零，三条数学路径及异常核对通过。该重放只覆盖首位置，设备首块与完整容量结果分别如下。根因、原数值和定向复核见[数值定位记录](../../build/guest-apps-numeric/root-cause-v1/validation-summary.json)。当前协议 8 的[QTest 日志](../../build/gpgpu-guest-apps/qtest-v8-attempt2/gpgpu-qtest.log)通过退出状态和 TAP 计划／结果核对，两版验证分别保留。
+
+设备端的[128-token 严格诊断](../../build/gpgpu-guest-apps/prefix128-v8-attempt2/result.json)通过全部 40 项张量检查，退出与资源回收正常，请求为 `218.368 s`，仅作诊断耗时。首块另直接使用原容量用例的黄金参考核对，三层 hidden、K/V 的九项检查全部通过；hidden23 的超差值为零，最大绝对差为 `0.0004348755`，相对 L2 为 `3.27734e-6`。这项[原容量参考对照](../../build/gpgpu-guest-apps/prefix128-v8-attempt2/original-capacity-first-chunk.json)只覆盖首块，完整 2048 容量结果单独判断。
+
+**原容量边界已通过完整复验。** 原 2041-token 前缀加八个生成 token 的诊断请求完成全部 23 轮，215 项张量检查全部满足原 `atol=rtol=2e-4`，实际 KV 前缀到 2048 个位置，应用退出码为零，资源回收和内核日志正常。八个生成 token 与原参考一致。原输入、原 CPU 参考和旧失败结果未改；本次只提高保护性等待上限，未把等待上限当作性能门槛。完整请求为 `6443.182 s`，约 `107.4 min`，开启检查点，仅作诊断耗时。
+
+**客体聊天与图片请求。** 同一聊天进程依次完成“记住名字”、根据历史回答名字、`/clear` 后重新问候，实际输出为“记住了。”“小明。”“你好。”，均以 EOS 停止。三问分别为 44、65、35 个 prompt token，生成四、四、三个 token；前两问各跨两个前向窗口，第三问使用一个窗口。独立官方 tokenizer 与完整 W8 CPU 参考分别核对了模板、token、文本、停止原因、历史、窗口连续性和 KV 长度，全部通过；参考在客体退出后生成，不向客体提供参考 token。
+
+两张 JPEG 都由客体读取、预处理并调用同一份固定 YOLO 包：原图得到一辆公交车和四个人，客体生成的水平镜像得到一辆公交车和三个人。两图的预处理输入均与独立参考逐字节一致，完整 `[1,84,2100]` 预测和最终检测都满足原容差；最终框最大差约 `0.000122` 像素，类别匹配。标注图由客体保存，已实际打开查看；更换图片没有重新导出模型。
+
+**客体应用性能。** 下列均为本机非隔离系统的单次功能测量，不构造稳态吞吐或置信区间。完整命令墙钟由 WSL 同一计时器记录，包含应用启动、最终输出保存与关闭；客体的 `request_ns` 截止解码或检测后处理，最终状态文件和关闭在其后。两个计时域分别报告，不直接相减。
+
+YOLO 两次完整应用墙钟为 `75.340 s`、`70.377 s`；客体网络前向为 `17.309 s`、`17.136 s`。客体模型准备约 `15.5 s`，预处理与材料校验区间约 `26.6～27.4 s`，其中图像数值预处理仅约 `0.25～0.28 s`；后处理约 `1.68～2.71 s`，NMS 约 `0.02～0.06 s`。因此应用等待还包含材料校验和 CPU 处理，不能只报网络前向。设备算子时间中，SiLU 约占 `39.1%`、未融合 BN 占 `34.3～34.6%`、卷积占 `14.5～14.6%`；按网络阶段划分，backbone 约占 `50%`、Detect 占 `27.5%`、neck 占 `18.4%`、attention 占 `4.1～4.2%`。
+
+Qwen 三问完整会话墙钟为 `1093.977 s`。首次应用准备为 `395.242 s`，其中 C 资源与权重准备为 `215.638 s`：BO 分配约 `63.703 s`、权重读取约 `117.705 s`、权重 H2D 约 `24.843 s`，另有应用包校验、官方 tokenizer 初始化与库装载等开销。权重只上传一次，后续各问的 INPUT H2D 总量约 `4～13 KiB`。本次生成预算为八个 token、prefill chunk 为八，与默认配置不同；三问从输入后到解码完成分别为 `233.211 s`、`287.339 s`、`154.089 s`，不宣称实时交互。
+
+三问的设备 prefill 前向分别为 `98.779 s`、`147.694 s`、`80.332 s`；之后三、三、两次 decode 前向累计为 `33.182 s`、`33.927 s`、`22.185 s`。客体构图和程序落盘另占 `93.116 s`、`98.887 s`、`47.880 s`，是明显的应用层成本。有界窗口限制常驻元数据，不减少完整网络计算。设备算子时间中，W8 投影约占 `41%`、Softmax 占 `11.5～11.8%`、RMSNorm 占 `8%`；参数上传约占算子时间的 `17%`，已包含在上述分类里，不再叠加。这些分解不能证明未单独计量的驱动锁或队列等待占比。
+
+运行仍使用 1 GiB 客体和 2 GiB VRAM；Qwen 窗口的模型逻辑 arena 峰值约 `522.23 MiB`，不含页表、RT 控制对象和对齐。设备进程与 ARM64 客体进程的 RSS 高水位约为 `2070 MiB`、`1009 MiB`，不是可直接相加的模型显存量。相关进程采样交换量为零，全局交换使用量前后无净增加；非连续采样不证明全程没有交换。
+
+**回归与代码评审。** 完整算子回放通过全部 250 个数值签名，共比较 `18,398,447` 个输出，失败值为零，各进程退出正常且未保留在途资源。标准全栈在 GPUVM 开、关下都通过计算与生命周期示例，内核日志核对通过；两套 QEMU、用户态 `all check` 和接口 `kernel-doc` 通过。独立 code review 及窗口／资源寿命复核已完成，已确认的本次问题已修复，覆盖 token 值域、文件边界、跨文件系统导出、成对构建产物、图像身份、形状来源、有界构图和中断后的实际回收状态。既有 Conv 非有限 padding 差异经基线核对不属于本次引入，未扩大修复范围。
+
+Linux checkpatch 按本项目 typedef 约定核对，中文行宽另按 8 列制表符、宽字符两列检查真实的 100 显示列；最终无错误、无告警。末次 C 换行调整重新构建后，WSL 侧与 ARM64 客体侧 CLI、共享库的 `.text` 摘要均不变。公开的 `make -C software/gpgpu/linux run-models` 入口也已实际启动，通过基础计算和真实图片检测；这次入口核对不混入上述性能样本。
+
+> **[SOURCE] 协议 8 实际结果与范围**：源码快照、组件散列、输入和实际命令随结果保存。
+>
+> - 公开启动入口：[run-models 实跑与 ARM64 代码段核对](../../build/gpgpu-guest-apps/launcher-v8-attempt2/result.json)。
+> - 客体应用：[运行与内核记录](../../build/gpgpu-guest-apps/device-v8-attempt4/result.json)、[三轮会话](../../build/gpgpu-guest-apps/device-v8-attempt4/qwen-chat/session.json)、[原图标注](../../build/gpgpu-guest-apps/device-v8-attempt4/yolo/postprocess/annotated.jpg)、[镜像标注](../../build/gpgpu-guest-apps/device-v8-attempt4/yolo-mirror/postprocess/annotated.jpg)、[独立参考核对](../../build/gpgpu-guest-apps/cpu-reference-v8/result.json)。
+> - 两模型性能：[应用与算子分解](../../build/gpgpu-guest-apps/performance-v8/performance.json)。它只汇总实际样本，不外推未测输入。
+> - 原容量边界：[完整复验](../../build/gpgpu-guest-apps/regression-v8-attempt2/capacity/result.json)，与[旧版失败](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-capacity/result.json)分开保留。
+> - 回归：[完整算子汇总](../../build/gpgpu-guest-apps/regression-v8-attempt2/operators-summary.json)、[GPUVM 开／关全栈](../../build/gpgpu-guest-apps/regression-v8-attempt2/core/summary.json)、[各阶段命令与结果](../../build/gpgpu-guest-apps/regression-v8-attempt2/result.json)。
+> - 评审与风格：[问题处理和复验范围](../../build/gpgpu-guest-apps/code-review-v8.json)、[最终风格与代码段核对](../../build/gpgpu-guest-apps/style-final-v8-corrected/result.json)。沙箱 socket 失败与旧固件副本导致的 probe 失败另存，均不计为通过。
+
+**[BOUNDARY]** 当前支持分别离线运行、batch=1、Qwen 容量不超过 2048、YOLO11n 固定 320×320 FP32。聊天只支持纯文本与 greedy 生成，不支持流式、工具调用或跨对话轮 KV 复用；旧离线固定程序入口不具有客体聊天的有界窗口内存保证。未验证更长上下文、实时检测或 COCO mAP。协议 7 的完整模型数值、正式性能和原始容量失败记录保留在[历史验收](#model-v7-history)，不作为当前组件的性能或通过结论。
+
 <a id="model-eval-results"></a>
 
 **真实模型算子评估（协议 7）。** 基线为 `17a00fd99de65c2b4fe0255c2f2d621385a26014` 加工作区改动。各阶段的代码快照、组件散列、实际命令、原始样本、错误和日志保存在 `build/gpgpu-validation/model-ops/run-20261108/`；以下目录名均相对于该位置。显存和组件升级见 [PROTOCOL_V7.md](./PROTOCOL_V7.md)。
@@ -311,9 +451,9 @@ Linux 全栈使用 `build/gpgpu-kernel-gpuvm/`，内核为 `6.18.57-0-gpgpu-virt
 
 **模型时间与空间预算。** `block-full-v2/estimate.json` 全部使用已测完整数值签名，算子和约为：prefill128 150.44 s；decode 的既有上下文 128／512／2048 分别为 11.57／13.61／20.51 s；YOLO 320×320 单图为 18.81 s。加必要输入和最终输出 COPY 的常驻估算约为 150.48、11.60／13.65／20.55、18.90 s；冷启动准备外推后约为 400.05、215.07／229.29／284.93、31.61 s。这里的冷启动指设备数据尚未驻留，未强制清空宿主文件缓存，也不包含客体启动或材料散列核对。全签名组每例只有一个正式样本，不能把相同上下界称作置信区间或稳定性证明；旧代表组的未测签名与相容类外推均在各自估算文件中显式记录。
 
-预算统计完整去重权重：Qwen 约 496 MB，YOLO 约 10.6 MB。保留全部数值输出到网络结束、不复用输出，仅复用最大 scratch 时，Qwen 各场景规划数据量约 529～964 MB，YOLO 约 76.9 MB；页表、对齐碎片和控制对象不含在这些数值内，尚未实测完整网络同时分配。运行记录中的两套 QEMU 分别采样 PSS，不能把共享映射的 RSS 简单相加；全签名组各次采样均无交换。
+预算统计完整去重权重：Qwen 约 496 MB，YOLO 约 10.6 MB。保留全部数值输出到网络结束、不复用输出，仅复用最大 scratch 时，Qwen 各场景规划数据量约 529～964 MB，YOLO 约 76.9 MB；页表、对齐碎片和控制对象不含在这些数值内。这是独立回放阶段的空间规划，完整网络采用的激活寿命复用与实际分配见[完整模型运行记录](#model-e2e-results)。运行记录中的两套 QEMU 分别采样 PSS，不能把共享映射的 RSS 简单相加；全签名组各次采样均无交换。
 
-当前常驻估算约为 decode 11.6～20.6 s/token、YOLO 18.9 s/图，建议暂缓交互生成与实时检测应用集成。后续若推进，范围宜限定为离线功能原型：先解决 RT 最多登记 32 个对象时的权重打包、缓冲区复用和 KV 生命周期，再实测完整网络同时分配、逐层误差累积与检测结果。独立算子比较通过尚不能证明完整量化模型或检测应用可用。
+独立算子估算用于安排运行预算。完整离线推理的实际输出、逐层数值、常驻分配和请求耗时以[完整模型运行记录](#model-e2e-results)为准；交互生成与实时检测仍未验证。
 
 大对象准备也单列记录：decode embedding 上传 136,742,408 B，使用 64 KiB staging、2,089 个块，覆盖大于旧单 BO 上限及非整块尾部。`vram_clear_dma=1` 使用驱动私有零源加速未发布 BO 的清零，默认仍关闭；页表页保持锁内 BAR 清零。按叶表范围复用 PTE 定位后，同一大表的 `buffer_setup_ns` 从约 23.37 s 降到 9.33 s；实际分配清零约 5.65 s、文件读取约 33.48 s、H2D 约 6.39 s。数据读取仍是冷启动的重要成本。DMA 清零的正常路径、非零偏移、尾块及同址复用后全零已核对，超时／移除竞争尚未做定向注入。
 
@@ -687,3 +827,91 @@ MSI-X 和无完成通知；只清错误后使用原映射成功搬运。失败�
 版本 3 的核心计算记录对应代码版本 `b8bad67`：QTest 11/11，教学汇编器 7/7，基础环境引导回归 6/6；Linux 全栈在 GPUVM 开、关两种状态都完成向量加法 17,003/17,003、矩阵乘法 437/437、ReLU 513/513，客体退出码为 0。两种模式的组件 SHA-256 相同：固件 `6d9251e744f6924f5b8859b95bd316033bfb99a0bf3194bf59d0ba0b88243acb`，模块 `ad0591f863710f27a7e92c4468227d1be8e9b795ff9a799cb0d087f02b54fca7`，示例 `828c05a5db9e6cc21bb13e57a2b92abf0b94b0723d03b4c66acd8c98905bc987`。升级到版本 4 之前，在 `087ea56` 上重跑的 QTest、汇编器和全栈结果与此一致，记录在版本 4 第一个提交的说明中。版本 3 到 4 的差异见 [PROTOCOL_V4.md](./PROTOCOL_V4.md)。
 
 > **[SOURCE]** 版本 3 的本地运行记录移到 `build/gpgpu-validation/v3/`：[命令与结果汇总](../../build/gpgpu-validation/v3/runtime-verification.json)、[QTest 输出](../../build/gpgpu-validation/v3/qtest-build.log)、[全栈输出](../../build/gpgpu-validation/v3/stack-validation.log)、[两种模式汇总](../../build/gpgpu-validation/v3/core/summary.json)。
+
+<a id="model-v7-history"></a>
+
+### 6.5 完整模型自动验收（协议 7，历史）
+
+**旧版完整模型自动验收（协议 7，历史基线）。** 以下数值、性能与回归只描述 `reviewed-v1` 保存的组件，不是协议 8 客体应用成绩。旧入口为 `scripts/gpgpu_model_run.py` 的 `prepare/run/report`，保留用于独立参考比较与历史复现。每次准备和运行都要求新的输出目录；运行包只读挂载，CPU 参考不进入客体。
+
+`prepare` 从真实文本或图像产生本次输入，生成完整模型程序及独立 CPU 参考。Qwen 的参考从 W8 embedding 开始，使用同一份 `q/scales` 逐层传播并连续维护 KV；`--original-reference` 另做串行的原 FP32 质量对照。模型包和参考都记录实际解析的权重清单散列，`run` 拒绝来源缺失或不一致的参考。运行包固定本次输入、执行形状与生成预算；每个请求重新预处理并核对输入散列，客体从只读包重新上传对应数据。更换文本或图像时需重新 `prepare`，权重 raw 文件仍可复用。
+
+默认包不保留诊断中间值。需要检查 hidden、KV 或 raw heads 时，`prepare` 和 `run` 都要加 `--checkpoints`；两端设置不一致会在启动设备前被拒绝。诊断包即使不需要重新生成 CPU 参考，也必须单独准备，可用 `--no-reference`，运行时再用 `--reference` 指向同源参考。
+
+`run` 在同一设备会话内保留权重和 BO，每请求重新上传输入。WSL 单调时钟记录真实预处理、输入读取与 H2D、全部设备前向、必要 D2H、argmax 或 NMS，以及文本／检测结果保存。客体先写本次 `sample.json` 并发布 `done`，宿主完成必要后处理后截止请求计时；参考比较另计。宿主随后发布 `release`，客体才输出完整节点遥测，全部落盘并发布 `idle` 后才开始下一请求，历史日志解析不进入请求时间。`--case-timeout` 保护请求与宿主屏障，`--timeout-ms` 只限制单次 Dispatch；两者都不是性能通过门槛。
+
+```sh
+# 使用现有独立环境；prepare 默认同时生成完整 CPU 参考。
+# qwen-user-new、yolo-user-new 和结果目录都必须尚不存在。
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_run.py prepare \
+  --model qwen --prompt '请只回复“你好”。' \
+  --output build/gpgpu-model-eval/qwen-user-new
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_run.py prepare \
+  --model yolo --image build/gpgpu-model-eval/material/yolo-input-complete/bus.jpg \
+  --output build/gpgpu-model-eval/yolo-user-new
+
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_run.py run \
+  --package build/gpgpu-model-eval/qwen-user-new \
+  --output build/gpgpu-validation/model-e2e/qwen-user-new
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_run.py run \
+  --package build/gpgpu-model-eval/yolo-user-new \
+  --output build/gpgpu-validation/model-e2e/yolo-user-new
+build/gpgpu-model-eval/venv/bin/python -I software/gpgpu/scripts/gpgpu_model_run.py report \
+  build/gpgpu-validation/model-e2e/qwen-user-new \
+  build/gpgpu-validation/model-e2e/yolo-user-new \
+  --output build/gpgpu-validation/model-e2e/user-report-new.json
+```
+
+结果目录的 `result.json` 保存实际命令、源码与组件散列、每个请求的验证和耗时。`inference/sample-*/generated.txt`、`generated.json` 是 Qwen 的真实设备生成文本与 token；YOLO 的 `postprocess/detections.json`、`annotated.jpg` 保存设备检测张量经过 CPU NMS 后的原图坐标结果。模型包、程序与权重的散列核对另计，不称为设备计算性能。
+
+整网数值核对使用 GPUVM 开启、WB 数据页、O2 远端设备、共享取指、块后端和 `tensor_native=on`，开启检查点回读；这些诊断样本不作为正式性能成绩。
+
+- YOLO 的三个 raw head、完整 `[1,84,2100]` pre-NMS 及最终检测均满足既定比较标准；真实 `bus.jpg` 得到一辆公交车和四个人。pre-NMS 最大相对 L2 约 `2.75e-7`，最终框最大绝对差约 `0.000122` 原图像素，类别与置信度核对通过。
+- Qwen 的真实指令为“请用一句话介绍你自己。”，prompt 为 35 tokens，以 16-token 块 prefill 并继续生成 8 tokens。设备与完整 W8 参考的 token 完全相同，输出“我是来自阿里云的超大规模语言”，因预算结束而不是 EOS 停止。logits、三处层 hidden 和对应 KV 的检查全部满足 `atol=rtol=2e-4`，这些检查的最大相对 L2 约 `8.12e-6`；最后一个生成 token 没有再送入前向，KV 保存 42 个已执行位置。
+
+额外文本请求 `请只回复“你好”。` 实际生成“你好。”并以 EOS 停止，三个 token 与完整 W8 参考一致。真实 Alice 正文的 128／512-token 前缀各继续生成四个 token，也与参考一致；两次完整请求分别为 `179.106 s`、`770.950 s`，设备 prefill 前向分别为 `145.792 s`、`735.410 s`，decode 速率约 `0.0935`、`0.0881 token/s`。这两项各只有一次测量，只报告实测样本。
+
+**[BOUNDARY] 容量边界未通过全部数值检查。** 2041-token 前缀加八个生成 token 的请求已完成，设备实际维护到 2048 个 KV 位置，生成的八个 token 与参考一致；应用退出和资源回收正常。但 215 个张量检查只有 214 项通过，首个 128-token 块的第 23 层 hidden 有 11 个值超出 `atol=rtol=2e-4`，全部位于位置 0，不能记为完整验收通过。该 hidden 张量的最大绝对差为 `0.0021343`、相对 L2 为 `7.912e-6`；例如一个值为设备 `0.0923038`、参考 `0.0925392`，绝对差约 `0.0002353`，大于该元素约 `0.0002185` 的组合容差。
+
+该容量请求开启检查点，实际宿主请求为 `5804.375 s`，约 `96.7 min`，仅保留为失败边界的诊断耗时，不纳入正式性能。其算子时间中 Softmax 约占 `38.4%`、mask 等 ADD 占 `14.8%`、缩放占 `11.7%`，W8 投影约占 `15.5%`。较长历史使注意力矩阵及其归约、mask 和缩放成为主要成本。当前不放宽数值阈值，也不以 token 相同代替 hidden 检查通过。
+
+早期短定位保留了同一首 token 的 CPU 单 token 参考：CPU128 与 CPU1 的第 23 层 hidden 存在差异，但没有元素超过原阈值；旧设备与 CPU1 相比仍有一个超差。这组对照只说明不能直接把失败归为正常 FP32 误差；完整根因与协议 8 修复见[当前数值定位与复验](#model-e2e-results)。CPU1 只用于诊断，不替代原 CPU128 黄金参考。
+
+> **[SOURCE] 短定位记录**：[三组同位置数值比较](../../build/gpgpu-validation/model-e2e/reviewed-v1/numeric-short-v1/result.json)、[11 个超差通道的设备／CPU128／CPU1 原值与预算](../../build/gpgpu-validation/model-e2e/reviewed-v1/numeric-short-v1/failing-channels.json)。该定位没有再次运行设备长前向。
+
+> **[SOURCE] 扩展输入与边界**：[EOS 请求](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-eos/result.json)、[128-token 前缀](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-prefix128/result.json)、[512-token 前缀](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-prefix512/result.json)、[容量边界原始失败结果](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-capacity/result.json)、[分阶段实测汇总](../../build/gpgpu-validation/model-e2e/reviewed-v1/extended-performance.json)。容量结果的 `status=failed`、`performance_eligible=false`，原始输入、全部设备输出和参考均保留。
+
+完整 W8 与原 FP32 属于另一项质量对照：上述短样例的八个 token 相同，但全部已保存 logits 的相对 L2 约 `0.0471`，第 23 层 hidden 汇总约 `0.1115`。这是量化在整个网络中传播的差异，不是设备实现误差，也不能由这一短样例推断其他文本的生成质量。
+
+**完整请求的正式计时。** 两模型分别运行，配置与上方功能核对一致，但关闭 profile、trace 和检查点。权重装载一次后预热一个请求，Qwen 记录两个正式请求，YOLO 记录三个；下列数据来自实际请求，不使用旧独立算子估算。没有清空宿主文件缓存，模型准备时间不能称为磁盘冷缓存时间。
+
+Qwen 的宿主模型准备为 `195.945 s`，其中客体权重文件读取为 `110.343 s`、BO 分配为 `54.496 s`、权重 H2D 为 `23.388 s`。真实指令的两个正式请求为 `128.520 s` 和 `127.764 s`，中位数 `128.142 s`。35-token prompt 的设备 prefill 前向中位数为 `54.774 s`，约 `0.637～0.641 token/s`；首 token ID 在客体请求开始后约 `55.159 s` 可用。之后七次 decode 的每步间隔为 `10.273～10.584 s`，实际速率约 `0.0958～0.0962 token/s`，不重复计入 prefill 产生的首 token。文本在整次生成结束后才写入宿主文件，没有把客体 ID 可用时间写成流式文本延迟。
+
+Qwen 的算子累计时间中，W8 线性投影占 `39.4%`、Softmax 占 `12.7%`、RMSNorm 占 `8.0%`。单独分解时，参数上传约占算子时间的 `18.7%`，已包含在上述分类中。当前开销既有矩阵计算和标量归约，也有参数上传与同步；同步派发区间包含设备计算和等待，未单独计量的驱动锁等待不能给出精确占比。
+
+YOLO 的宿主模型准备为 `13.004 s`，常驻权重后的三个正式请求为 `17.779 s`、`17.756 s`、`17.835 s`，中位数 `17.779 s`。设备完整网络前向中位数为 `17.156 s`，必要结果 D2H 及文件写入为 `0.200 s`，输入 H2D 为 `0.056 s`。宿主真实图像预处理约 `0.004 s`，NMS、坐标还原与结果保存约 `0.014 s`。按每个完整请求折算约 `0.0562 图/s`，不包含请求之间的可选验证和遥测区间，不作为持续服务吞吐。
+
+YOLO 的算子累计时间中，SiLU 占 `39.0%`、BN 占 `34.5%`、卷积占 `14.5%`。按网络阶段划分，backbone、neck、attention、Detect 分别约占 `49.9%`、`18.6%`、`4.3%`、`27.1%`；这些比例使用算子时间作分母，不混入模型装载。该实现的主耗时是激活和未融合 BN，不能按通常的网络计算量直接认定卷积占主导。
+
+独立 profile 运行相同的完整请求：Qwen 完成 `16,167,079,936` 次矩阵 MAC，YOLO 完成 `812,052,800` 次；两者的 `tensor_soft_tiles` 均为零，只说明块矩阵路径没有记录 SoftFloat 回退。按各自 hit＋miss 计数计算，Qwen 的 TLB／dcache 未命中比例约为 `7.74%／35.00%`，YOLO 为 `0.060%／3.26%`。这些计数反映本次模拟执行，不能当作实体显存总线流量，也没有将未命中逐次折算为延迟。诊断请求不混入上面的正式样本。
+
+Qwen 短请求的五类 arena 共 `522.25 MiB`，其中 KV 容量占 `48 MiB`；YOLO 共 `16.47 MiB`，均不含页表和 RT 控制对象。模拟器仍保留 `2 GiB` VRAM，模型逻辑存储与进程常驻量分开记录。两次正式运行中，远端设备进程 RSS 高水位约 `2070 MiB`，ARM64 客体约 `505～508 MiB`，宿主 Python 约 `356～360 MiB`；这些数值包含各自的运行环境，不能直接相加作为模型内存峰值。
+
+WSL 总内存约 `7.76 GiB`，两次运行退出前的可用内存均约 `2 GiB`。按运行前后采样比较，Qwen 的全局交换使用量净值未增加；YOLO 净增加约 `102.4 MiB`，而相关三进程的采样交换量均为零。机器未完全隔离，这组数据不能归因到某个模型页，也不能宣称全机无交换。每进程 RSS 高水位、PSS 采样和完整 `/proc/meminfo` 保留在结果中，没有用非连续采样冒充全机峰值。
+
+> **[SOURCE] 独立剖析**：[Qwen 计数汇总](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-diagnostic-report.json)、[YOLO 计数汇总](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-diagnostic-report.json)。这些文件的 `diagnostic=true`、`performance_eligible=false`；原始 Dispatch 与客体日志随各自结果保存。
+
+> **[SOURCE] 正式性能记录**：实际命令、逐样本数据、同一时钟的区间及源码快照均在结果目录；原始统计见 [Qwen](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-formal/result.json) 和 [YOLO](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-formal/result.json)，阶段／算子汇总见 [Qwen 性能](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-performance.json) 和 [YOLO 性能](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-performance.json)，量化质量另见[完整 W8 与原 FP32 对照](../../build/gpgpu-validation/model-e2e/reviewed-v1/quantization-quality.json)。
+
+> **[SOURCE] 整网数值与输出记录**：均为 `8a435ac` 后的工作区，组件和源码快照随结果保存；实际比较、退出码、正常回收及内核日志核对均通过。
+>
+> - YOLO：[完整数值诊断](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-diagnostic/result.json)、[检测 JSON](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-formal/inference/sample-0003/postprocess/detections.json)、[标注图](../../build/gpgpu-validation/model-e2e/reviewed-v1/yolo-formal/inference/sample-0003/postprocess/annotated.jpg)。
+> - Qwen：[hidden／KV／logits 诊断](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-diagnostic/result.json)、[生成文本](../../build/gpgpu-validation/model-e2e/reviewed-v1/qwen-formal/inference/sample-0002/generated.txt)、[完整 W8 CPU 参考](../../build/gpgpu-model-eval/e2e-reviewed-v1/qwen-chat/reference/metadata.json)、[原 FP32 对照](../../build/gpgpu-model-eval/e2e-reviewed-v1/qwen-chat/reference/original-fp32/metadata.json)。
+
+独立 code review 已完成初审、修复复核和残留路径复核，已报告的静态评审问题均已关闭；上文的容量数值检查仍有未通过项。修复覆盖真实算子访问范围、协调期限、参考来源、正式计时、诊断模式配对及重复编码。Host 定向核对确认不足输出跨度、错误来源和两种诊断模式不匹配都会被拒绝；屏障期限独立于 Dispatch。用户态 `all check`、接口与结构体 `kernel-doc` 通过，Linux checkpatch 在遵守本仓库 typedef／新增文件约定后为 `0 errors / 0 warnings`。
+
+修复后的完整算子回归通过 250 个数值签名、18,398,447 个输出元素，逐项退出码为零，失败值为零，均正常回收。标准 `test-gpgpu-stack` 也在 GPUVM 开、关下通过全部计算和生命周期示例，退出码均为零，内核日志检查通过。这些回归不替代上文仍未全通过的完整模型边界检查。该协议 7 验收未修改设备或指令实现，没有重跑 QTest；其 QTest 历史数字不用于证明协议 8。
+
+> **[SOURCE] 评审与复验**：[评审闭合记录](../../build/gpgpu-validation/model-e2e/reviewed-v1/code-review.json)、[范围与屏障核对](../../build/gpgpu-validation/model-e2e/reviewed-v1/host-guards/runner-guards.log)、[参考来源拒绝](../../build/gpgpu-validation/model-e2e/reviewed-v1/host-guards/reference-admission.json)、[诊断模式双向拒绝](../../build/gpgpu-validation/model-e2e/reviewed-v1/host-guards/checkpoint-modes.json)、[风格与接口检查](../../build/gpgpu-validation/model-e2e/reviewed-v1/style-final/result.json)、[完整算子回归汇总](../../build/gpgpu-validation/model-e2e/reviewed-v1/ops-core/summary.json)、[标准全栈汇总](../../build/gpgpu-validation/model-e2e/reviewed-v1/core-regression/summary.json)。标准入口原日志另存在同目录 `core-before/`，沙箱 socket 失败也保留，没有作为数值通过。
+
+**[BOUNDARY]** 当前范围是分别离线运行、batch=1、Qwen 容量不超过 2048、YOLO11n 固定 320×320 FP32。Qwen 超出容量会明确拒绝，不截断或滚动覆盖；未验证官方更长上下文、交互吞吐或实时检测。YOLO 固定照片核对不代表 COCO mAP 验证。详细 profile、trace 和检查点运行与正式计时分开；样本有限，不构造置信区间。Unix socket 被沙箱禁止时，启动会明确失败，不能记成设备数值通过。
